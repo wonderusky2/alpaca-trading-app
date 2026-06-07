@@ -8,8 +8,9 @@ from pathlib import Path
 
 
 STATE_DIR = Path(os.environ.get("STATE_DIR") or (Path.home() / ".robinhood-trader" / "state"))
-MODEL_STATE_PATH = STATE_DIR / "strategy_model.json"
-POSITION_MEMORY_PATH = STATE_DIR / "position_memory.json"
+MODEL_STATE_PATH      = STATE_DIR / "strategy_model.json"
+POSITION_MEMORY_PATH  = STATE_DIR / "position_memory.json"
+VARIANT_HISTORY_PATH  = STATE_DIR / "variant_history.json"
 
 DEFAULT_MODEL = {
     "version": 1,
@@ -24,6 +25,7 @@ DEFAULT_MODEL = {
     "exit_on_regime_flip": True,
     "daily_loss_kill_pct": -2.0,
     "learning_mode": "paper_safe",
+    "active_variant": "current",
     "updated_at": None,
     "last_backtest": None,
 }
@@ -56,6 +58,7 @@ def sanitize_model(model: dict) -> dict:
     clean["daily_loss_kill_pct"] = round(float(_clamp(float(clean["daily_loss_kill_pct"]), *BOUNDS["daily_loss_kill_pct"])), 2)
     clean["exit_on_regime_flip"] = bool(clean.get("exit_on_regime_flip", True))
     clean["generation"] = int(clean.get("generation") or 0)
+    clean["active_variant"] = str(clean.get("active_variant") or "current")
     return clean
 
 
@@ -159,6 +162,7 @@ def candidate_models(base: dict) -> list[dict]:
     return candidates
 
 
+# ── Position memory ────────────────────────────────────────────────────────────
 def load_position_memory() -> dict:
     try:
         data = json.loads(POSITION_MEMORY_PATH.read_text(encoding="utf-8"))
@@ -195,3 +199,65 @@ def update_position_memory(positions: dict) -> dict:
             memory.pop(sym, None)
 
     return save_position_memory(memory)
+
+
+# ── Variant history ────────────────────────────────────────────────────────────
+def load_variant_history() -> dict:
+    """
+    Return {date_str: {winner, scores, recorded_at}} for the last 90 days.
+    scores is a dict mapping variant_name → objective float.
+    """
+    try:
+        data = json.loads(VARIANT_HISTORY_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def record_variant_result(date: str, winner: str, scores: dict) -> None:
+    """
+    Persist the winning variant and per-variant objective scores for `date`.
+    Keeps the last 90 days; older entries are pruned automatically.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    history = load_variant_history()
+    history[date] = {
+        "winner": winner,
+        "scores": {k: round(float(v), 4) for k, v in scores.items()},
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # Prune to last 90 days
+    if len(history) > 90:
+        for old_key in sorted(history.keys())[:-90]:
+            history.pop(old_key, None)
+    VARIANT_HISTORY_PATH.write_text(
+        json.dumps(history, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
+
+def variant_win_rates(history: dict | None = None) -> dict[str, dict]:
+    """
+    Return per-variant win statistics across all recorded days.
+    {variant_name: {wins, total, win_rate, avg_objective}}
+    """
+    if history is None:
+        history = load_variant_history()
+    tallies: dict[str, dict] = {}
+    for entry in history.values():
+        winner = str(entry.get("winner") or "current")
+        scores = entry.get("scores") or {}
+        for variant, obj in scores.items():
+            t = tallies.setdefault(variant, {"wins": 0, "total": 0, "objective_sum": 0.0})
+            t["total"] += 1
+            t["objective_sum"] += float(obj)
+            if variant == winner:
+                t["wins"] += 1
+    return {
+        v: {
+            "wins": t["wins"],
+            "total": t["total"],
+            "win_rate": round(t["wins"] / t["total"], 3) if t["total"] else 0.0,
+            "avg_objective": round(t["objective_sum"] / t["total"], 4) if t["total"] else 0.0,
+        }
+        for v, t in tallies.items()
+    }

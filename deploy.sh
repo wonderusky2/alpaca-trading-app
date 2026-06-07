@@ -61,6 +61,23 @@ if $APPLY; then
 
   echo "✓ Manifests applied."
 
+  # ── Seed K8s secret from Conjur (Conjur init-container not installed) ──────
+  CONJUR_DIR="${HOME}/Code/conjur-secret-manager"
+  if [ -d "${CONJUR_DIR}" ]; then
+    echo "→ Seeding K8s secret from Conjur..."
+    eval "$(cd "${CONJUR_DIR}" && npm run --silent export 2>/dev/null)"
+    kubectl create secret generic alpaca-trader-secrets \
+      --from-literal=ALPACA_PAPER_KEY="${ALPACA_PAPER_KEY:-}" \
+      --from-literal=ALPACA_PAPER_SECRET="${ALPACA_PAPER_SECRET:-}" \
+      --from-literal=GEMINI_API_KEY="${GEMINI_API_KEY:-}" \
+      --from-literal=NOTIFY_WEBHOOK_URL="${NOTIFY_WEBHOOK_URL:-}" \
+      -n alpaca-trader \
+      --dry-run=client -o yaml | kubectl apply -f -
+    echo "✓ Secret seeded."
+  else
+    echo "⚠ Conjur dir not found — secret NOT updated. Run manually if keys changed."
+  fi
+
   # Wait for the server deployment to roll out
   echo "→ Waiting for rollout..."
   kubectl rollout status deployment/alpaca-server \

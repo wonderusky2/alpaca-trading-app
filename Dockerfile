@@ -11,7 +11,7 @@
 
 FROM python:3.11-slim
 
-# System deps for yfinance (lxml) and alpaca-py
+# System deps for alpaca-py and pandas wheels on slim images
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libxml2-dev \
@@ -27,6 +27,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application source
 COPY alpaca_client.py \
+     backtest.py \
      config.py \
      logger.py \
      notify.py \

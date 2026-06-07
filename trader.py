@@ -9,9 +9,9 @@ Orders placed via Alpaca paper API — no real money.
 from __future__ import annotations
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+import json
 
-import yfinance as yf
-
+import backtest as bt
 import signals as sg
 import notify
 import strategy_model
@@ -27,7 +27,7 @@ EOD_FLAT_HOUR,   EOD_FLAT_MIN   = 15, 40   # 3:40 PM ET — flatten before close
 MARKET_OPEN_HOUR, MARKET_OPEN_MIN = 9, 30
 
 POSITION_SIZE_PCT = 0.05   # 5% of equity per position
-MAX_POSITIONS     = sg.MAX_POSITIONS  # 3 — matches signal engine cap
+MAX_POSITIONS     = sg.MAX_POSITIONS  # matches signal engine cap
 TRAILING_STOP_PCT = 3.0    # sell if position is down >3% from entry
 DAILY_LOSS_KILL   = -2.0   # halt trading if daily P&L < -2%
 
@@ -54,23 +54,28 @@ def is_eod() -> bool:
 
 
 # ── Quote fetcher ─────────────────────────────────────────────────────────────
-def fetch_quotes(symbols: list[str]) -> dict[str, dict]:
-    """Returns {sym: {price, prev_close, change_pct}} via yfinance fast_info."""
-    tickers = yf.Tickers(" ".join(symbols))
-    out = {}
-    for sym in symbols:
-        try:
-            info       = tickers.tickers[sym].fast_info
-            price      = float(info.last_price or 0)
-            prev_close = float(info.previous_close or price)
-            change_pct = (price - prev_close) / prev_close * 100 if prev_close else 0
-            out[sym]   = {
-                "price":      round(price, 4),
-                "prev_close": round(prev_close, 4),
-                "change_pct": round(change_pct, 4),
-            }
-        except Exception as e:
-            log.warning("Quote fetch failed for %s: %s", sym, e)
+def fetch_quotes(
+    symbols: list[str],
+    client: "AlpacaClient | None" = None,
+) -> dict[str, dict]:
+    """Returns {sym: {price, prev_close, change_pct}} for a symbol basket.
+
+    Uses Alpaca snapshots only. Missing symbols are skipped instead of mixing
+    data vendors in the trading loop.
+    """
+    if not symbols:
+        return {}
+
+    client = client or AlpacaClient()
+    try:
+        out = client.get_snapshots(symbols)
+    except Exception as e:
+        log.warning("Alpaca get_snapshots failed: %s", e)
+        return {}
+    missing = [s for s in symbols if s.upper() not in out]
+    if missing:
+        log.warning("Alpaca snapshots missing %d/%d symbols: %s", len(missing), len(symbols), missing)
+    log.info("fetch_quotes: resolved %d/%d symbols", len(out), len(symbols))
     return out
 
 
@@ -91,10 +96,10 @@ def _check_kill_switch(account: dict, model: dict) -> bool:
 
 
 # ── Position sizing ───────────────────────────────────────────────────────────
-def _calc_qty(price: float, equity: float, model: dict) -> int:
+def _calc_qty(price: float, equity: float, model: dict, size_mult: float = 1.0) -> int:
     if price <= 0 or equity <= 0:
         return 0
-    position_size_pct = float(model.get("position_size_pct", POSITION_SIZE_PCT))
+    position_size_pct = float(model.get("position_size_pct", POSITION_SIZE_PCT)) * size_mult
     return max(1, int(equity * position_size_pct / price))
 
 
@@ -157,9 +162,10 @@ def _holding_days(memory_row: dict) -> int:
 
 
 def _regime_against_position(symbol: str, regime: str) -> bool:
+    """Exit a position only when the regime flips against the instrument direction.
+    CHOPPY no longer forces exits — we just hold at reduced size.
+    """
     symbol = symbol.upper()
-    if regime == "CHOPPY":
-        return True
     if regime == "BULL" and symbol in sg.BEAR_UNIVERSE:
         return True
     if regime == "BEAR" and symbol in sg.BULL_UNIVERSE:
@@ -196,6 +202,67 @@ def run_eod_flat(client: AlpacaClient, positions: dict, quotes: dict) -> None:
         pass
 
 
+# ── Daily optimization ────────────────────────────────────────────────────────
+_LAST_OPT_PATH = strategy_model.STATE_DIR / "last_optimization.json"
+
+
+def _run_daily_optimization() -> None:
+    """Run variant backtest once per trading day; apply winner params to strategy model."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    try:
+        prev = json.loads(_LAST_OPT_PATH.read_text(encoding="utf-8")) if _LAST_OPT_PATH.exists() else {}
+        if prev.get("date") == today:
+            log.info("Daily optimization already ran today (%s); skipping.", today)
+            return
+    except Exception:
+        pass
+
+    log.info("Running daily variant optimization for %s …", today)
+    try:
+        result = bt.run_variants(period="1M")
+        if not result.get("ok"):
+            log.warning("run_variants returned ok=False: %s", result.get("error"))
+            return
+
+        winner = result.get("winner") or "current"
+        obj = float(result.get("winner_objective") or 0.0)
+        ranked = result.get("ranked") or []
+
+        # Apply winner's position-param overrides to strategy model
+        profile = sg.VARIANT_PROFILES.get(winner, {})
+        param_overrides = {k: v for k, v in profile.items() if k in sg._PROFILE_PARAM_KEYS}
+        model = strategy_model.load_model()
+        updated = dict(model)
+        updated["active_variant"] = winner
+        if "conviction_override" in param_overrides:
+            updated["min_conviction"] = int(param_overrides["conviction_override"])
+        if "max_pos_override" in param_overrides:
+            updated["max_positions"] = int(param_overrides["max_pos_override"])
+        if "hold_days_override" in param_overrides:
+            updated["max_holding_days"] = int(param_overrides["hold_days_override"])
+        if "stop_pct_override" in param_overrides:
+            updated["trailing_stop_pct"] = float(param_overrides["stop_pct_override"])
+        if "lock_trigger_override" in param_overrides:
+            updated["profit_lock_trigger_pct"] = float(param_overrides["lock_trigger_override"])
+        strategy_model.save_model(updated)
+        if param_overrides:
+            log.info("Applied variant '%s' param overrides: %s", winner, param_overrides)
+
+        # Persist to prevent re-run same day
+        _LAST_OPT_PATH.write_text(
+            json.dumps({"date": today, "winner": winner, "objective": obj, "ranked": ranked}, indent=2),
+            encoding="utf-8",
+        )
+
+        # iMessage alert
+        ranked_str = ", ".join(f"{n}={o:.2f}" for n, o in (ranked or [])[:4])
+        notify.send(f"RHT optimize: winner={winner} obj={obj:.2f} [{ranked_str}]")
+        log.info("Daily optimization done: winner=%s obj=%.3f", winner, obj)
+
+    except Exception as e:
+        log.error("Daily optimization failed: %s", e)
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def main() -> None:
     now = _now_et()
@@ -204,11 +271,14 @@ def main() -> None:
 
     client = AlpacaClient()
 
-    # Fetch quotes for full universe
-    quotes = fetch_quotes(sg.ALL_SYMBOLS)
+    # ── Daily variant optimization (once per day) ──────────────────────────
+    _run_daily_optimization()
+
+    # Fetch quotes for full universe from Alpaca snapshots.
+    quotes = fetch_quotes(sg.ALL_SYMBOLS, client=client)
     if not quotes:
         log.error("No quotes fetched — aborting."); return
-    quotes = sg.enrich_quotes_with_indicators(quotes, sg.ALL_SYMBOLS)
+    quotes = sg.enrich_quotes_with_indicators(quotes, sg.ALL_SYMBOLS, alpaca_client=client)
 
     # ── EOD: flatten everything ────────────────────────────────────────────
     if is_eod():
@@ -248,10 +318,10 @@ def main() -> None:
              regime, len(positions), max_positions, equity,
              model.get("generation"), min_conviction, float(model.get("position_size_pct", POSITION_SIZE_PCT)) * 100)
 
-    if regime == "CHOPPY":
-        log.info("CHOPPY — holding cash, no new entries."); return
-
     # ── Signal scoring ─────────────────────────────────────────────────────
+    # CHOPPY no longer blocks — signals come back at 50% size_mult
+    if regime == "CHOPPY":
+        log.info("CHOPPY — scanning for high-conviction setups at half size.")
     trade_signals = [sig for sig in sg.get_signals(quotes) if sig.score >= min_conviction]
     log.info("Signals: %s", [(s.symbol, s.score) for s in trade_signals])
 
@@ -270,7 +340,8 @@ def main() -> None:
         if price <= 0:
             log.warning("No price for %s — skipping.", sig.symbol); continue
 
-        qty = _calc_qty(price, equity, model)
+        # Apply regime size_mult (0.5 in CHOPPY, 1.0 in BULL/BEAR)
+        qty = _calc_qty(price, equity, model, size_mult=sig.size_mult)
         if qty <= 0:
             continue
 

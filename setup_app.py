@@ -40,7 +40,6 @@ OPTIONS = {
         "scipy",
         "numpy",
         "pandas",
-        "yfinance",
         "filelock",
         "requests",
         "google",

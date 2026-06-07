@@ -17,7 +17,10 @@ from alpaca.trading.enums import (
 from alpaca.common.enums import Sort
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.historical.news import NewsClient
-from alpaca.data.requests import StockBarsRequest, NewsRequest
+from alpaca.data.requests import (
+    StockBarsRequest, NewsRequest,
+    StockLatestQuoteRequest, StockSnapshotRequest,
+)
 from alpaca.data.enums import DataFeed
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
@@ -98,6 +101,7 @@ class AlpacaClient:
         acct = self.trading.get_account()
         return {
             "equity":         float(acct.equity),
+            "last_equity":    float(getattr(acct, "last_equity", 0) or 0),
             "cash":           float(acct.cash),
             "buying_power":   float(acct.buying_power),
             "daytrade_count": int(acct.daytrade_count),
@@ -322,3 +326,128 @@ class AlpacaClient:
         except Exception as e:
             log.debug(f"{symbol}: latest trade lookup failed — {e}")
             return None
+
+    def get_snapshots(self, symbols: list[str]) -> dict[str, dict]:
+        """Return {sym: {price, prev_close, change_pct, vwap}} for a symbol basket.
+
+        Uses Alpaca's snapshot endpoint — works 24/7, returns last known prices
+        even on weekends and after hours. No alternate market-data vendor.
+        """
+        clean = sorted({str(s).upper() for s in (symbols or []) if str(s).strip()})
+        if not clean:
+            return {}
+        feed = _make_data_feed(config.ALPACA_DATA_FEED)
+        out: dict[str, dict] = {}
+        # Batch in groups of 100 (Alpaca limit)
+        for i in range(0, len(clean), 100):
+            batch = clean[i:i + 100]
+            try:
+                req = StockSnapshotRequest(
+                    symbol_or_symbols=batch,
+                    feed=feed,
+                )
+                resp = self.data.get_stock_snapshot(req)
+                for sym, snap in (resp or {}).items():
+                    sym = sym.upper()
+                    try:
+                        # latest_trade has current price; daily_bar has vwap
+                        latest_trade = getattr(snap, "latest_trade", None)
+                        daily_bar    = getattr(snap, "daily_bar", None)
+                        prev_bar     = getattr(snap, "prev_daily_bar", None)
+
+                        price = None
+                        if latest_trade:
+                            price = float(getattr(latest_trade, "price", 0) or 0)
+                        if not price and daily_bar:
+                            price = float(getattr(daily_bar, "close", 0) or 0)
+
+                        prev_close = None
+                        if prev_bar:
+                            prev_close = float(getattr(prev_bar, "close", 0) or 0)
+                        if not prev_close and daily_bar:
+                            prev_close = float(getattr(daily_bar, "open", 0) or 0)
+                        if not prev_close:
+                            prev_close = price
+
+                        vwap = 0.0
+                        if daily_bar:
+                            vwap = float(getattr(daily_bar, "vwap", 0) or 0)
+
+                        if price and price > 0:
+                            change_pct = (price - prev_close) / prev_close * 100 if prev_close else 0
+                            out[sym] = {
+                                "price":      round(price, 4),
+                                "prev_close": round(prev_close, 4),
+                                "change_pct": round(change_pct, 4),
+                                "vwap":       round(vwap, 4),
+                            }
+                    except Exception as se:
+                        log.debug("Snapshot parse failed for %s: %s", sym, se)
+            except Exception as e:
+                log.warning("get_snapshots batch failed (%s): %s", batch, e)
+        log.info("get_snapshots: got data for %d/%d symbols", len(out), len(clean))
+        return out
+
+    def get_historical_bars(
+        self,
+        symbols: list[str],
+        timeframe: str = "15min",
+        limit: int = 200,
+    ) -> dict[str, "pd.DataFrame"]:
+        """Return {sym: DataFrame(open,high,low,close,volume,vwap)} for indicator computation.
+
+        timeframe: '1min'|'5min'|'15min'|'1hour'|'1day'
+        Works 24/7 — returns last N bars regardless of whether market is open.
+        """
+        import pandas as pd
+
+        clean = sorted({str(s).upper() for s in (symbols or []) if str(s).strip()})
+        if not clean:
+            return {}
+
+        _tf_map = {
+            "1min":  TimeFrame(1,  TimeFrameUnit.Minute),
+            "5min":  TimeFrame(5,  TimeFrameUnit.Minute),
+            "15min": TimeFrame(15, TimeFrameUnit.Minute),
+            "1hour": TimeFrame(1,  TimeFrameUnit.Hour),
+            "1day":  TimeFrame(1,  TimeFrameUnit.Day),
+        }
+        tf = _tf_map.get(timeframe.lower(), TimeFrame(15, TimeFrameUnit.Minute))
+        feed = _make_data_feed(config.ALPACA_DATA_FEED)
+        out: dict[str, pd.DataFrame] = {}
+
+        for i in range(0, len(clean), 50):
+            batch = clean[i:i + 50]
+            try:
+                req = StockBarsRequest(
+                    symbol_or_symbols=batch,
+                    timeframe=tf,
+                    limit=limit,
+                    feed=feed,
+                    adjustment="raw",
+                )
+                resp = self.data.get_stock_bars(req)
+                bars_dict = resp.data if hasattr(resp, "data") else (resp if isinstance(resp, dict) else {})
+                for sym, bars in bars_dict.items():
+                    sym = sym.upper()
+                    if not bars:
+                        continue
+                    rows = []
+                    for b in bars:
+                        ts = getattr(b, "timestamp", None)
+                        rows.append({
+                            "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else ts,
+                            "open":   float(getattr(b, "open",   0) or 0),
+                            "high":   float(getattr(b, "high",   0) or 0),
+                            "low":    float(getattr(b, "low",    0) or 0),
+                            "close":  float(getattr(b, "close",  0) or 0),
+                            "volume": float(getattr(b, "volume", 0) or 0),
+                            "vwap":   float(getattr(b, "vwap",   0) or 0),
+                        })
+                    if rows:
+                        out[sym] = pd.DataFrame(rows)
+            except Exception as e:
+                log.warning("get_historical_bars batch failed (%s): %s", batch, e)
+
+        log.info("get_historical_bars: got bars for %d/%d symbols", len(out), len(clean))
+        return out

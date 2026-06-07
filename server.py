@@ -28,12 +28,12 @@ from pathlib import Path
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
+import backtest as bt
 import config
 import notify
 import signals as sg
 import strategy_model
 import trader
-import yfinance as yf
 from alpaca_client import AlpacaClient
 from logger import get_logger
 
@@ -142,6 +142,14 @@ _news_cache:         dict = {"ts": 0.0, "data": {}, "symbols": set()}   # symbol
 _OVERVIEW_TTL   = 30
 _LIVE_SCORE_TTL = 300
 _NEWS_TTL       = 600
+
+# ── Portfolio event detection state ────────────────────────────────────────────
+_last_event_state: dict = {
+    "regime":        "",
+    "exit_symbols":  set(),
+    "news_symbols":  set(),
+    "risk_action":   "",
+}
 
 # ── Events log ─────────────────────────────────────────────────────────────────
 def _append_event(event_type: str, payload: dict) -> None:
@@ -439,11 +447,61 @@ def _build_accounting(
     }
 
 
-def _exit_recommendations(positions: dict, accounting: dict, live_scores: dict | None, model: dict) -> list[dict]:
+def _signal_exit_reason(sym: str, live_scores: dict | None, held_score_map: dict) -> str | None:
+    """Return an exit reason based on technical signal deterioration, or None."""
+    # Use pre-scored held positions (from _score_held_positions called by overview)
+    entry = held_score_map.get(sym.upper()) or {}
+    score = int(float(entry.get("score") or 0))
+    breakdown = entry.get("signal_breakdown") or {}
+    technicals = entry.get("technicals") or {}
+
+    # If score has collapsed to bearish territory, signal deterioration
+    if score > 0 and score < 35:
+        return "signal_deterioration"
+
+    price_action = breakdown.get("price_action", {}) or {}
+    pa_status = str(price_action.get("status") or "")
+    pa_label = str(price_action.get("label") or "").lower()
+    if pa_status == "bearish":
+        if "shooting star" in pa_label or "bearish engulfing" in pa_label:
+            return "bearish_reversal_candle"
+        if "failed breakout" in pa_label or "breakdown" in pa_label:
+            return "price_action_breakdown"
+        if breakdown.get("macd", {}).get("status") != "bullish":
+            return "price_action_bearish"
+
+    # RSI overbought (>78): likely exhaustion, consider taking profits
+    rsi = float(technicals.get("rsi14") or 0)
+    if rsi > 78:
+        return "rsi_overbought"
+
+    # MACD histogram turned negative: momentum reversal
+    macd_hist = float(technicals.get("macd_hist") or 0)
+    if macd_hist < -0.05:
+        return "macd_bearish_cross"
+
+    # EMA death cross (EMA9 < EMA21): short-term trend against position
+    if breakdown.get("ema", {}).get("status") == "bearish":
+        # Only flag if MACD also not bullish (two indicators agree)
+        if breakdown.get("macd", {}).get("status") != "bullish":
+            return "ema_death_cross"
+
+    # Price fallen back below AVWAP: volume-weighted support lost
+    if breakdown.get("avwap", {}).get("status") == "bearish":
+        # Only flag if trend also bearish (not just a brief dip)
+        if breakdown.get("trend", {}).get("status") == "bearish":
+            return "avwap_breakdown"
+
+    return None
+
+
+def _exit_recommendations(positions: dict, accounting: dict, live_scores: dict | None, model: dict,
+                           held_score_map: dict | None = None) -> list[dict]:
     memory = strategy_model.update_position_memory(positions)
     regime = (live_scores or {}).get("regime") or "UNKNOWN"
     rows = accounting.get("positions") or []
     recommendations: list[dict] = []
+    _held = held_score_map or {}
 
     for row in rows:
         sym = str(row.get("symbol") or "").upper()
@@ -461,6 +519,9 @@ def _exit_recommendations(positions: dict, accounting: dict, live_scores: dict |
             reason = "max_holding_days"
         elif bool(model.get("exit_on_regime_flip", True)) and _regime_against_position(sym, regime):
             reason = "regime_flip"
+        elif _held:
+            # Technical signal checks (only run when we have fresh scores)
+            reason = _signal_exit_reason(sym, live_scores, _held)
 
         if reason:
             recommendations.append({
@@ -490,9 +551,8 @@ def _holding_days(memory_row: dict) -> int:
 
 
 def _regime_against_position(symbol: str, regime: str) -> bool:
+    """CHOPPY no longer forces exits — only directional flips do."""
     symbol = symbol.upper()
-    if regime == "CHOPPY":
-        return True
     if regime == "BULL" and symbol in sg.BEAR_UNIVERSE:
         return True
     if regime == "BEAR" and symbol in sg.BULL_UNIVERSE:
@@ -539,23 +599,26 @@ def _get_news_for_symbols(symbols: list[str]) -> dict[str, list[dict]]:
 def _run_live_scores() -> dict:
     """
     Full signal scoring pass:
-    1. yfinance quotes for all watchlist symbols
+    1. Alpaca snapshots and bars for all watchlist symbols
     2. Alpaca news for each candidate
     3. News delta applied on top of pure-Python score
     """
     try:
-        quotes   = trader.fetch_quotes(sg.ALL_SYMBOLS)
-        quotes   = sg.enrich_quotes_with_indicators(quotes, sg.ALL_SYMBOLS)
+        _cl      = get_client()
+        quotes   = trader.fetch_quotes(sg.ALL_SYMBOLS, client=_cl)
+        quotes   = sg.enrich_quotes_with_indicators(quotes, sg.ALL_SYMBOLS, alpaca_client=_cl)
         regime   = sg.detect_regime(quotes)
         news_map = _get_news_for_symbols(sg.ALL_SYMBOLS)
         universe = sg.BULL_UNIVERSE if regime in ("BULL", "CHOPPY") else sg.BEAR_UNIVERSE
         signals  = []
 
         for sym in universe:
-            base_score = sg.score_symbol(sym, quotes, regime)
+            base_score, breakdown = sg.score_symbol(sym, quotes, regime)
             if base_score < 50:
                 continue
-            _, technical_reasons = sg._technical_bias(sym, quotes, regime)
+
+            # Plain-English technical reasons from per-indicator breakdown
+            technical_reasons = [bd["label"] for bd in breakdown.values() if bd.get("label")]
 
             # Gemini borderline boost (only 60-74, already in signals.py)
             if 60 <= base_score < 75:
@@ -567,16 +630,17 @@ def _run_live_scores() -> dict:
             final_score = max(0, min(100, base_score + news_delta))
 
             signals.append({
-                "symbol":      sym,
-                "score":       final_score,
-                "base_score":  base_score,
-                "news_delta":  news_delta,
-                "news_terms":  news_terms,
-                "regime":      regime,
-                "side":        "buy",
-                "quote":       quotes.get(sym, {}),
-                "technicals":   (quotes.get(sym, {}) or {}).get("technicals") or {},
+                "symbol":            sym,
+                "score":             final_score,
+                "base_score":        base_score,
+                "news_delta":        news_delta,
+                "news_terms":        news_terms,
+                "regime":            regime,
+                "side":              "buy",
+                "quote":             quotes.get(sym, {}),
+                "technicals":        (quotes.get(sym, {}) or {}).get("technicals") or {},
                 "technical_reasons": technical_reasons,
+                "signal_breakdown":  breakdown,
                 "news":        (articles or [])[:3],   # top 3 headlines for UI
             })
 
@@ -595,6 +659,114 @@ def _run_live_scores() -> dict:
     _live_scores_cache["ts"]   = time.time()
     _live_scores_cache["data"] = result
     return result
+
+
+# ── Score held positions (always-on, even when market is closed) ───────────────
+def _score_held_positions(held_symbols: list[str], regime: str) -> list[dict]:
+    """Score currently held symbols using the same 6-signal engine as _run_live_scores.
+
+    Returns entries in the same shape as live_scores['top'] so the iOS app's
+    parseSignalInsights() can consume them without changes.
+    """
+    if not held_symbols:
+        return []
+    try:
+        _cl    = get_client()
+        quotes = trader.fetch_quotes(held_symbols, client=_cl)
+        quotes = sg.enrich_quotes_with_indicators(quotes, held_symbols, alpaca_client=_cl)
+        scored = []
+        for sym in held_symbols:
+            try:
+                score, breakdown = sg.score_symbol(sym, quotes, regime)
+                technical_reasons = [
+                    bd["label"] for bd in breakdown.values() if bd.get("label")
+                ]
+                q = quotes.get(sym) or {}
+                scored.append({
+                    "symbol":            sym,
+                    "score":             score,
+                    "base_score":        score,
+                    "news_delta":        0,
+                    "news_terms":        [],
+                    "regime":            regime,
+                    "side":              "hold",
+                    "quote":             q,
+                    "technicals":        (q.get("technicals") or {}),
+                    "technical_reasons": technical_reasons,
+                    "signal_breakdown":  breakdown,
+                    "news":              [],
+                })
+            except Exception as _se:
+                log.debug("held-position score failed for %s: %s", sym, _se)
+        return scored
+    except Exception as e:
+        log.warning("_score_held_positions failed: %s", e)
+        return []
+
+
+# ── Plain-English order reason ─────────────────────────────────────────────────
+def _plain_entry_reason(sig: dict) -> str:
+    """Convert a signal dict into a human-readable entry reason."""
+    regime    = str(sig.get("regime") or "").upper()
+    score     = int(float(sig.get("score") or 0))
+    news_delta = int(sig.get("news_delta") or 0)
+    symbol    = str(sig.get("symbol") or "")
+
+    strength = "strong" if score >= 85 else "good" if score >= 70 else "moderate"
+
+    regime_phrase = {
+        "BULL": "market trending up",
+        "BEAR": "hedging against a down market",
+        "CHOP": "range-bound market",
+        "CHOPPY": "range-bound market",
+    }.get(regime, "current market conditions")
+
+    reason = f"{strength.capitalize()} momentum signal — {regime_phrase}"
+
+    if news_delta >= 5:
+        reason += ", positive news tailwind"
+    elif news_delta <= -5:
+        reason += ", but watch the recent headlines"
+
+    return reason
+
+
+def _plain_exit_reason(rec: dict) -> str:
+    """Convert an exit recommendation into a human-readable reason."""
+    raw    = str(rec.get("reason") or "").lower()
+    sym    = str(rec.get("symbol") or "")
+    pnl    = float(rec.get("unrealized_pnl_pct") or 0)
+    days   = int(rec.get("holding_days") or 0)
+    pnl_str = f"{pnl:+.1f}%"
+
+    if "loss_stop" in raw:
+        return f"Down {abs(pnl):.1f}% — cut the loss"
+    if "giveback" in raw:
+        return f"Gave back gains, now {pnl_str} — lock in what's left"
+    if "max_hold" in raw:
+        return f"Held {days}d without moving — free up the capital"
+    if "regime_flip" in raw or "bear" in raw:
+        return f"Market turned against this position ({pnl_str})"
+    if "rsi_overbought" in raw:
+        return f"RSI overbought — momentum exhausted ({pnl_str})"
+    if "macd_bearish" in raw:
+        return f"MACD turned negative — momentum reversing ({pnl_str})"
+    if "ema_death" in raw:
+        return f"EMA crossover bearish — short-term trend flipped ({pnl_str})"
+    if "avwap_breakdown" in raw:
+        return f"Price broke below AVWAP + trend bearish ({pnl_str})"
+    if "bearish_reversal_candle" in raw:
+        return f"Bearish reversal candle confirmed ({pnl_str})"
+    if "price_action_breakdown" in raw:
+        return f"Price action broke support / failed breakout ({pnl_str})"
+    if "price_action_bearish" in raw:
+        return f"Price action turned bearish ({pnl_str})"
+    if "signal_deterioration" in raw:
+        return f"Signal score collapsed — conviction lost ({pnl_str})"
+    if "news" in raw:
+        return f"Bad news hit this stock ({pnl_str}) — exit to be safe"
+    return f"Exit signal triggered ({pnl_str})"
+
 
 # ── Preview order builder ──────────────────────────────────────────────────────
 _POSITION_SIZE_PCT = 0.05   # 5% of equity per position
@@ -675,7 +847,7 @@ def _build_preview_orders(
             "side":            "buy",
             "qty":             qty,
             "estimated_value": round(cost, 2),
-            "reason":          f"Score {sig['score']} ({sig['regime']}) news_delta={sig.get('news_delta',0):+d}",
+            "reason":          _plain_entry_reason(sig),
             "score":           sig["score"],
             "news":            (sig.get("news") or [])[:2],
             "model_generation": model.get("generation"),
@@ -688,7 +860,8 @@ def _build_preview_orders(
 class PortfolioAgent:
     """Owns broker state, accounting, and portfolio history."""
 
-    def snapshot(self, live_scores: dict | None = None, recent_limit: int = 50) -> dict:
+    def snapshot(self, live_scores: dict | None = None, recent_limit: int = 50,
+                 held_score_map: dict | None = None) -> dict:
         client      = get_client()
         account     = client.get_account()
         positions   = client.get_positions()
@@ -696,7 +869,7 @@ class PortfolioAgent:
         recent      = client.get_recent_orders(limit=recent_limit)
         accounting  = _build_accounting(positions, open_orders, recent, account, live_scores)
         model = strategy_model.load_model()
-        exit_recs = _exit_recommendations(positions, accounting, live_scores, model)
+        exit_recs = _exit_recommendations(positions, accounting, live_scores, model, held_score_map)
         accounting["exit_recommendations"] = exit_recs
         return {
             "account": account,
@@ -971,205 +1144,22 @@ class BacktestAgent:
         }
 
     def _daily_profit_optimizer(self, model: dict, period: str = "3M") -> dict:
-        candidates = strategy_model.candidate_models(model)
-        data = self._load_daily_replay_data(period)
-        if len(data) < 3:
-            return {
-                "ok": False,
-                "best_model": None,
-                "confidence": "low",
-                "reasons": ["Not enough market data to replay daily candidates."],
-                "candidates": [],
-            }
+        """Delegate to backtest.py run_variants for variant-aware optimization."""
+        return bt.run_variants(period=period, base_model=model)
 
-        scored = [self._score_candidate(candidate, data) for candidate in candidates]
-        scored.sort(key=lambda row: row["objective"], reverse=True)
-        best = scored[0]
-        base_score = self._score_candidate(model, data)
-        improvement = best["objective"] - base_score["objective"]
-        confidence = "medium" if len(data) >= 20 and improvement > 0.05 else "low"
-        reasons = [
-            f"Best candidate objective {best['objective']:.2f} vs current {base_score['objective']:.2f}.",
-            f"Simulated daily return {best['daily_return_pct']:.2f}% with max drawdown {best['max_drawdown_pct']:.2f}%.",
-        ]
-        if improvement <= 0:
-            reasons.append("Current model remains competitive; no aggressive change recommended.")
-
-        return {
-            "ok": True,
-            "objective": "maximize_daily_profit",
-            "confidence": confidence,
-            "days": len(data),
-            "best_model": best["model"] if improvement > 0 else None,
-            "best": best,
-            "current": base_score,
-            "improvement": round(improvement, 4),
-            "top_candidates": scored[:8],
-            "reasons": reasons,
-        }
+    def run_variants(self, period: str = "1M") -> dict:
+        """Score all VARIANT_PROFILES over historical data and return ranked results."""
+        model = strategy_model.load_model()
+        return bt.run_variants(period=period, base_model=model)
 
     def _load_daily_replay_data(self, period: str) -> list[dict]:
-        try:
-            raw = yf.download(
-                tickers=" ".join(sg.ALL_SYMBOLS),
-                period=period,
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                group_by="ticker",
-                threads=True,
-            )
-        except Exception as e:
-            log.warning("optimizer market data fetch failed: %s", e)
-            return []
-
-        rows: list[dict] = []
-        for idx in range(1, len(raw.index)):
-            day_quotes: dict[str, dict] = {}
-            next_quotes: dict[str, dict] = {}
-            for sym in sg.ALL_SYMBOLS:
-                try:
-                    prev_close = float(raw[(sym, "Close")].iloc[idx - 1])
-                    close = float(raw[(sym, "Close")].iloc[idx])
-                    if idx + 1 < len(raw.index):
-                        next_close = float(raw[(sym, "Close")].iloc[idx + 1])
-                    else:
-                        next_close = close
-                    if prev_close <= 0 or close <= 0:
-                        continue
-                    bars = []
-                    for hist_idx in range(0, idx + 1):
-                        try:
-                            hist_close = float(raw[(sym, "Close")].iloc[hist_idx])
-                            if hist_close <= 0:
-                                continue
-                            bars.append({
-                                "open": float(raw[(sym, "Open")].iloc[hist_idx]),
-                                "high": float(raw[(sym, "High")].iloc[hist_idx]),
-                                "low": float(raw[(sym, "Low")].iloc[hist_idx]),
-                                "close": hist_close,
-                                "volume": float(raw[(sym, "Volume")].iloc[hist_idx]),
-                            })
-                        except Exception:
-                            continue
-                    day_quotes[sym] = {
-                        "price": round(close, 4),
-                        "prev_close": round(prev_close, 4),
-                        "change_pct": round((close - prev_close) / prev_close * 100, 4),
-                    }
-                    technicals = sg.compute_technicals(bars)
-                    if technicals:
-                        day_quotes[sym]["technicals"] = technicals
-                    next_quotes[sym] = {"price": round(next_close, 4)}
-                except Exception:
-                    continue
-
-            qqq_tech = (day_quotes.get("QQQ") or {}).get("technicals") or {}
-            qqq_return = qqq_tech.get("return_5d_pct")
-            if qqq_return is not None:
-                for sym, row in list(day_quotes.items()):
-                    tech = dict((row or {}).get("technicals") or {})
-                    if "return_5d_pct" in tech:
-                        tech["relative_strength_qqq"] = round(float(tech["return_5d_pct"]) - float(qqq_return), 3)
-                        row["technicals"] = tech
-
-            if "QQQ" in day_quotes and "SPY" in day_quotes:
-                rows.append({
-                    "date": str(raw.index[idx].date()),
-                    "quotes": day_quotes,
-                    "next_quotes": next_quotes,
-                })
-        return rows
+        return bt.load_daily_replay_data(period)
 
     def _score_candidate(self, model: dict, rows: list[dict]) -> dict:
-        model = strategy_model.sanitize_model(model)
-        equity = 100000.0
-        peak = equity
-        max_drawdown = 0.0
-        trades = 0
-        winning_days = 0
-        losing_days = 0
-        daily_returns: list[float] = []
-
-        for row in rows:
-            quotes = row["quotes"]
-            next_quotes = row["next_quotes"]
-            regime = sg.detect_regime(quotes)
-            day_pnl = 0.0
-            if regime != "CHOPPY":
-                universe = sg.BULL_UNIVERSE if regime == "BULL" else sg.BEAR_UNIVERSE
-                signals = []
-                for sym in universe:
-                    score = sg.score_symbol(sym, quotes, regime)
-                    if score >= int(model["min_conviction"]):
-                        signals.append((sym, score))
-                signals.sort(key=lambda item: item[1], reverse=True)
-                selected = signals[:int(model["max_positions"])]
-
-                for sym, score in selected:
-                    entry = float(quotes.get(sym, {}).get("price") or 0)
-                    if entry <= 0:
-                        continue
-                    exit_px = self._simulated_exit_price(sym, rows, row, entry, model)
-                    if exit_px <= 0:
-                        continue
-                    allocation = equity * float(model["position_size_pct"])
-                    raw_pnl = allocation * ((exit_px - entry) / entry)
-                    stop_loss = -allocation * (float(model["trailing_stop_pct"]) / 100)
-                    day_pnl += max(raw_pnl, stop_loss)
-                    trades += 1
-
-            equity += day_pnl
-            peak = max(peak, equity)
-            max_drawdown = max(max_drawdown, (peak - equity) / peak * 100 if peak else 0)
-            day_return = day_pnl / max(equity - day_pnl, 1) * 100
-            daily_returns.append(day_return)
-            if day_pnl > 0:
-                winning_days += 1
-            elif day_pnl < 0:
-                losing_days += 1
-
-        total_return_pct = (equity - 100000.0) / 100000.0 * 100
-        daily_return_pct = sum(daily_returns) / len(daily_returns) if daily_returns else 0.0
-        trade_penalty = max(0, trades - len(rows) * int(model["max_positions"]) * 0.55) * 0.01
-        drawdown_penalty = max_drawdown * 0.7
-        objective = daily_return_pct * 10 + total_return_pct - drawdown_penalty - trade_penalty
-
-        return {
-            "model": model,
-            "objective": round(objective, 4),
-            "total_return_pct": round(total_return_pct, 2),
-            "daily_return_pct": round(daily_return_pct, 3),
-            "max_drawdown_pct": round(max_drawdown, 2),
-            "trades": trades,
-            "winning_days": winning_days,
-            "losing_days": losing_days,
-        }
+        return bt.score_candidate(model, rows)
 
     def _simulated_exit_price(self, symbol: str, rows: list[dict], entry_row: dict, entry: float, model: dict) -> float:
-        try:
-            start_index = rows.index(entry_row)
-        except ValueError:
-            start_index = 0
-
-        max_days = int(model["max_holding_days"])
-        lock_trigger = float(model["profit_lock_trigger_pct"])
-        giveback_limit = float(model["profit_giveback_pct"])
-        peak_return = 0.0
-        last_price = entry
-
-        for offset in range(1, max_days + 1):
-            idx = min(start_index + offset, len(rows) - 1)
-            price = float((rows[idx].get("quotes") or {}).get(symbol, {}).get("price") or last_price)
-            ret_pct = (price - entry) / entry * 100 if entry else 0.0
-            peak_return = max(peak_return, ret_pct)
-            last_price = price
-            if peak_return >= lock_trigger and (peak_return - ret_pct) >= giveback_limit:
-                return price
-            if idx >= len(rows) - 1:
-                return price
-
-        return last_price
+        return bt.simulated_exit_price(symbol, rows, entry_row, entry, model)
 
 
 class DecisionCoordinator:
@@ -1184,19 +1174,41 @@ class DecisionCoordinator:
 
     def overview(self) -> dict:
         live_scores = self.market_news.live_scores(force=False)
-        snap = self.portfolio.snapshot(live_scores=live_scores)
+        # Score held positions FIRST so exit recommendations can use signal data
+        regime_str = str((live_scores or {}).get("regime") or "CHOPPY").upper()
+        # We need the position list — do a quick positions fetch first
+        try:
+            _pos_for_scoring = get_client().get_positions()
+            held_symbols = list((_pos_for_scoring or {}).keys())
+        except Exception:
+            held_symbols = []
+        held_scores = _score_held_positions(held_symbols, regime_str)
+        held_score_map = {s["symbol"]: s for s in held_scores}
+        snap = self.portfolio.snapshot(live_scores=live_scores, held_score_map=held_score_map)
         accounting = snap.get("accounting") or {}
         news_risk = self.market_news.position_risk(accounting)
         decision = _decision_from_state(accounting, live_scores, news_risk)
         model = self.model.current()
+        # Detect and emit portfolio-level events before building narrative
+        try:
+            _detect_and_emit_portfolio_events(
+                regime=str((live_scores or {}).get("regime") or "UNKNOWN").upper(),
+                news_risk=news_risk,
+                exits=accounting.get("exit_recommendations") or [],
+                risk_state=accounting.get("risk_state") or {},
+            )
+        except Exception as _ev_err:
+            log.debug("event detection error: %s", _ev_err)
         narrative = _portfolio_narrative(accounting, live_scores, news_risk, model, decision)
+        combined_scores = dict(live_scores or {})
+        combined_scores["held_scores"] = held_scores
         return {
             "ok": True,
             "paper": config.PAPER,
             "account": snap.get("account"),
             "clock": snap.get("clock"),
             "accounting": accounting,
-            "live_scores": live_scores,
+            "live_scores": combined_scores,
             "news_risk": news_risk,
             "market_sentiment": None,
             "portfolio_narrative": narrative,
@@ -1283,96 +1295,186 @@ def _portfolio_narrative(
     model: dict,
     decision: dict,
 ) -> dict:
-    """Translate raw agent state into a portfolio-level explanation."""
-    regime = str((live_scores or {}).get("regime") or "UNKNOWN").upper()
-    prev_regime = str((live_scores or {}).get("previous_regime") or "").upper()
-    top = ((live_scores or {}).get("top") or (live_scores or {}).get("signals") or [])[:5]
-    exits = accounting.get("exit_recommendations") or []
-    positions = accounting.get("positions") or []
+    """Portfolio-level narrative — describes the portfolio as a whole, not individual stocks."""
+    regime     = str((live_scores or {}).get("regime") or "UNKNOWN").upper()
+    prev_regime = _last_event_state.get("regime", "")
+    exits      = accounting.get("exit_recommendations") or []
+    positions  = accounting.get("positions") or []
+    risk_state = accounting.get("risk_state") or {}
+    top        = ((live_scores or {}).get("top") or [])[:5]
+
     gross_exposure = float(accounting.get("gross_exposure_pct") or 0)
-    open_pnl = float(accounting.get("broker_pnl") or accounting.get("unrealized_pnl") or 0)
+    cash_pct       = max(0.0, 100.0 - gross_exposure)
+    open_pnl       = float(accounting.get("broker_pnl") or accounting.get("unrealized_pnl") or 0)
+    pos_count      = len(positions)
+    winners        = sum(1 for p in positions if float(p.get("unrealized_pnl") or 0) > 0)
+    losers         = sum(1 for p in positions if float(p.get("unrealized_pnl") or 0) < 0)
 
-    sentiment_from = prev_regime if prev_regime and prev_regime != regime else "market"
-    sentiment_to = regime if regime != "UNKNOWN" else "unclear"
-
-    evidence: list[str] = []
-    for sig in top[:3]:
-        sym = str(sig.get("symbol") or "?").upper()
-        score = int(float(sig.get("score") or 0))
-        quote = sig.get("quote") or {}
-        tech = sig.get("technicals") or quote.get("technicals") or {}
-        reasons = sig.get("technical_reasons") or []
-        reason = str(reasons[0]) if reasons else ""
-        avwap = float(tech.get("price_vs_avwap_low_pct") or tech.get("price_vs_avwap_high_pct") or 0)
-        trend = str(tech.get("trend_direction") or "trend").replace("_", " ")
-        fib = str(tech.get("fib_position") or "").replace("_", " ")
-        detail = f"{sym} score {score}"
-        if reason:
-            detail += f", {reason}"
-        elif avwap:
-            detail += f", AVWAP {avwap:+.1f}%"
-        if trend and trend != "trend":
-            detail += f", {trend} trend"
-        if fib and fib != "unknown":
-            detail += f", fib {fib}"
-        evidence.append(detail)
-
-    sells: list[str] = []
-    for item in exits[:3]:
-        sym = str(item.get("symbol") or "?").upper()
-        reason = str(item.get("reason") or "exit").replace("_", " ")
-        pnl = float(item.get("unrealized_pnl_pct") or 0)
-        giveback = float(item.get("giveback_pct") or 0)
-        sells.append(f"Sell {sym}: {reason}, now {pnl:+.1f}%, giveback {giveback:.1f}%.")
-
-    held = {str(p.get("symbol") or "").upper() for p in positions}
-    buys: list[str] = []
+    top_scores     = [int(float(s.get("score") or 0)) for s in top if s.get("score")]
+    avg_score      = sum(top_scores) // len(top_scores) if top_scores else 0
     min_conviction = int(model.get("min_conviction") or 75)
-    for sig in top:
-        sym = str(sig.get("symbol") or "").upper()
-        score = int(float(sig.get("score") or 0))
-        if not sym or sym in held or score < min_conviction:
-            continue
-        quote = sig.get("quote") or {}
-        tech = sig.get("technicals") or quote.get("technicals") or {}
-        trend = str(tech.get("trend_direction") or "trend").replace("_", " ")
-        avwap = float(tech.get("price_vs_avwap_low_pct") or 0)
-        buys.append(f"Buy {sym}: score {score}, {trend} trend, AVWAP {avwap:+.1f}%.")
-        if len(buys) >= 3:
-            break
 
-    if not buys and not sells:
-        if decision.get("action") == "monitor":
-            next_actions = ["Monitor current exposure; no portfolio change until signal or risk state changes."]
-        elif decision.get("action") == "scan_ready":
-            next_actions = ["Scan is ready; wait for risk gate and market clock before adding exposure."]
-        else:
-            next_actions = [decision.get("summary") or "Wait for a clearer portfolio signal."]
+    sentiment_from = prev_regime.lower() if prev_regime and prev_regime != regime else "market"
+    sentiment_to   = regime.lower() if regime != "UNKNOWN" else "unclear"
+
+    # Plain-English regime description
+    regime_desc = {
+        "BULL":    "trending up",
+        "BEAR":    "trending down",
+        "CHOP":    "choppy — no clear direction",
+        "CHOPPY":  "choppy — no clear direction",
+        "UNKNOWN": "still loading",
+    }.get(regime, "still loading")
+
+    # ── Why — plain English, what's actually happening ────────────────────────
+    why: list[str] = []
+
+    if prev_regime and prev_regime != regime:
+        old_desc = {"BULL": "trending up", "BEAR": "trending down", "CHOP": "choppy", "CHOPPY": "choppy"}.get(prev_regime, "unclear")
+        why.append(f"The market just shifted from {old_desc} to {regime_desc}.")
+    elif regime in ("UNKNOWN", ""):
+        why.append("Market signals are still refreshing — check back in a moment.")
     else:
-        next_actions = sells + buys
+        why.append(f"The market is {regime_desc}.")
 
-    model_note = (
-        f"Model G{model.get('generation', 0)} is using min conviction {model.get('min_conviction')} "
-        f"and max hold {model.get('max_holding_days')}d; backtest agent can tighten/loosen these after recent trade evidence."
-    )
+    if pos_count > 0:
+        pnl_word = "up" if open_pnl >= 0 else "down"
+        pnl_abs  = abs(open_pnl)
+        if losers > 0 and winners > 0:
+            why.append(f"You have {winners} position{'s' if winners>1 else ''} making money and {losers} losing — portfolio is {pnl_word} ${pnl_abs:,.0f} overall.")
+        elif losers > 0:
+            why.append(f"All {losers} open position{'s are' if losers>1 else ' is'} losing money. Portfolio is down ${pnl_abs:,.0f}.")
+        else:
+            why.append(f"All {winners} open position{'s are' if winners>1 else ' is'} in the green. Portfolio is up ${pnl_abs:,.0f}.")
 
-    why = evidence or [decision.get("summary") or "No strong technical evidence is cached yet."]
     if news_risk:
-        nr = news_risk[0]
-        why.insert(0, f"News risk: {nr.get('symbol')} delta {nr.get('delta')}, {nr.get('headline')}")
+        syms = ", ".join(nr.get("symbol", "?") for nr in news_risk[:2])
+        extra = f" (and {len(news_risk)-2} more)" if len(news_risk) > 2 else ""
+        why.append(f"Bad news is hitting {syms}{extra} — those positions need a close look.")
 
-    summary = (
-        f"Sentiment is moving from {sentiment_from} to {sentiment_to}. "
-        f"Book exposure is {gross_exposure:.0f}% with open P&L ${open_pnl:,.0f}."
-    )
+    if risk_state.get("action") == "reduce_risk":
+        why.append("The portfolio has taken on too much risk. Time to pull back.")
+    elif exits:
+        why.append(f"{len(exits)} position{'s are' if len(exits)>1 else ' is'} triggering exit rules — acting on them protects what you've made.")
+
+    if not pos_count:
+        bias = "looking bullish" if avg_score >= 60 else "looking bearish" if avg_score <= 40 else "mixed"
+        why.append(f"You're fully in cash. Market signals are {bias}.")
+
+    # ── Next — what to do, in plain English ───────────────────────────────────
+    next_actions: list[str] = []
+
+    if risk_state.get("action") == "reduce_risk":
+        next_actions.append("Pull back — reduce positions and don't add new ones until conditions improve.")
+    elif exits:
+        n = len(exits)
+        next_actions.append(f"Sell the {n} position{'s' if n>1 else ''} that are triggering exit rules.")
+
+    if not next_actions:
+        if regime == "BULL" and cash_pct > 25 and avg_score >= min_conviction:
+            next_actions.append(f"Market is trending up and you have {cash_pct:.0f}% in cash — good time to look for new entries.")
+        elif regime == "BEAR" and pos_count > 0:
+            next_actions.append("Market is heading down — tighten your stops and consider reducing exposure.")
+        elif regime == "BEAR":
+            next_actions.append("Market is heading down. Stay in cash and wait for the trend to reverse.")
+        elif pos_count > 0:
+            next_actions.append("Market is choppy. Hold what you have and avoid adding new positions.")
+        else:
+            next_actions.append("Stay in cash. Wait for a clear market trend before investing.")
+
+    if news_risk and not any("bad news" in a.lower() or "news" in a.lower() for a in next_actions):
+        next_actions.append("Review the news-hit positions before making any moves.")
+
+    # ── Summary — one human sentence ──────────────────────────────────────────
+    pnl_word = "up" if open_pnl >= 0 else "down"
+    pnl_abs  = abs(open_pnl)
+    if pos_count > 0:
+        summary = (
+            f"{int(cash_pct)}% of your money is in cash, {int(gross_exposure)}% invested across "
+            f"{pos_count} position{'s' if pos_count>1 else ''}. You're {pnl_word} ${pnl_abs:,.0f}."
+        )
+    else:
+        summary = f"You're fully in cash. Market is {regime_desc}."
+
+    model_note = "Strategy auto-optimizes daily based on recent trade results."
 
     return {
         "sentiment_from": sentiment_from,
-        "sentiment_to": sentiment_to,
-        "summary": summary,
-        "why": why[:4],
-        "next_actions": next_actions[:5],
+        "sentiment_to":   sentiment_to,
+        "summary":        summary,
+        "why":            why[:4],
+        "next_actions":   next_actions[:4],
         "model_adjustment": model_note,
+    }
+
+
+def _detect_and_emit_portfolio_events(
+    regime: str,
+    news_risk: list[dict],
+    exits: list[dict],
+    risk_state: dict,
+) -> None:
+    """Emit events to lab_events.jsonl when significant portfolio-level changes occur."""
+    global _last_event_state
+    prev = _last_event_state
+
+    # Regime change
+    prev_regime = prev.get("regime", "")
+    if prev_regime and prev_regime != regime:
+        _append_event("regime_change", {
+            "from": prev_regime,
+            "to":   regime,
+            "reason": f"Market regime shifted from {prev_regime} to {regime}. Signal universe and weights updated.",
+        })
+
+    # New news risk symbols
+    news_syms  = {str(n.get("symbol") or "") for n in news_risk}
+    prev_news  = set(prev.get("news_symbols") or set())
+    new_news   = news_syms - prev_news
+    for sym in new_news:
+        nr = next((n for n in news_risk if n.get("symbol") == sym), {})
+        _append_event("news_risk_detected", {
+            "symbol":   sym,
+            "delta":    nr.get("delta", 0),
+            "headline": nr.get("headline", ""),
+            "reason":   f"Negative news detected on {sym} — sentiment delta {nr.get('delta', 0):+d}.",
+        })
+
+    # New exit recommendations
+    exit_syms  = {str(e.get("symbol") or "") for e in exits}
+    prev_exits = set(prev.get("exit_symbols") or set())
+    new_exits  = exit_syms - prev_exits
+    for sym in new_exits:
+        ex = next((e for e in exits if e.get("symbol") == sym), {})
+        reason = str(ex.get("reason") or "exit").replace("_", " ")
+        pnl    = float(ex.get("unrealized_pnl_pct") or 0)
+        _append_event("exit_triggered", {
+            "symbol": sym,
+            "reason": reason,
+            "pnl_pct": pnl,
+            "message": f"{sym} flagged for exit: {reason} ({pnl:+.1f}% P&L).",
+        })
+
+    # Risk gate state change
+    risk_action  = str(risk_state.get("action") or "")
+    prev_risk    = prev.get("risk_action", "")
+    if risk_action != prev_risk:
+        if risk_action == "reduce_risk":
+            _append_event("risk_gate_active", {
+                "action":  risk_action,
+                "message": risk_state.get("message", "Risk limit reached — exposure restricted."),
+            })
+        elif prev_risk == "reduce_risk":
+            _append_event("risk_gate_cleared", {
+                "message": "Risk gate cleared — exposure limits normalised.",
+            })
+
+    # Update tracked state
+    _last_event_state = {
+        "regime":       regime,
+        "exit_symbols": exit_syms,
+        "news_symbols": news_syms,
+        "risk_action":  risk_action,
     }
 
 
@@ -1438,7 +1540,7 @@ def _llm_explain_decision(decision: dict, overview: dict) -> str:
         import google.generativeai as genai  # type: ignore
         genai.configure(api_key=gemini_key)
         model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
+            model_name="gemini-2.5-flash",
             system_instruction=(
                 "Explain an automated paper-trading agent decision in one short paragraph. "
                 "Do not recommend trades. Explain only what the system is doing and why."
@@ -1503,6 +1605,7 @@ def api_lab_overview():
 
 
 @app.route("/api/lab/activity")
+@require_api_key
 def api_lab_activity():
     try:
         return jsonify(_coordinator.activity())
@@ -1592,6 +1695,40 @@ def api_lab_backtest():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/lab/variants")
+@require_api_key
+def api_lab_variants():
+    """Return ranked variant results + win-rate history.
+
+    ?period=1M  — Alpaca lookback period (default 1M)
+    ?force=1    — skip today's cache and re-run backtest
+    """
+    period = str(request.args.get("period") or "1M")
+    force = str(request.args.get("force") or "").lower() in {"1", "true", "yes"}
+    try:
+        history = strategy_model.load_variant_history()
+        today = datetime.now(timezone.utc).date().isoformat()
+        if not force and today in history:
+            return jsonify({
+                "ok": True,
+                "source": "cached",
+                "today": history[today],
+                "history": history,
+                "win_rates": strategy_model.variant_win_rates(history),
+            })
+        result = _coordinator.backtest.run_variants(period=period)
+        return jsonify({
+            "ok": True,
+            "source": "live",
+            "result": result,
+            "history": strategy_model.load_variant_history(),
+            "win_rates": strategy_model.variant_win_rates(),
+        })
+    except Exception as e:
+        log.warning("variants error: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/lab/model/learn", methods=["POST"])
 @require_api_key
 def api_lab_model_learn():
@@ -1677,6 +1814,7 @@ def api_lab_orders_place():
 
 
 @app.route("/api/lab/news")
+@require_api_key
 def api_lab_news():
     """Return news articles for watchlist symbols and held positions."""
     try:
@@ -1775,14 +1913,10 @@ def api_lab_chat_message():
     if not text:
         return jsonify({"ok": False, "error": "No text provided."}), 400
 
-    # ── Snapshot current state — read from the shared overview cache ─────────────
-    # The overview cache is always fresh (TTL 30s, polled by the UI every 30s).
-    # Avoids duplicate API calls and ensures the chat sees the same data the
-    # sidebar shows. If cache is empty, trigger a fresh fetch.
+    # ── Snapshot current state ────────────────────────────────────────────────
     cache_snap = _overview_cache.get("data")
     if not cache_snap:
         try:
-            # Force a fresh fetch by calling the singleton client directly
             _client_inst = get_client()
             _positions   = _client_inst.get_positions()
             _open_orders = _client_inst.get_open_orders()
@@ -1802,7 +1936,6 @@ def api_lab_chat_message():
     acctg_snap  = cache_snap.get("accounting") or {}
     scores_snap = (cache_snap.get("live_scores") or {})
 
-    # account fields may be strings (Alpaca returns strings for monetary values)
     def _flt(d, key, default=0.0):
         v = d.get(key, default)
         try:
@@ -1815,83 +1948,171 @@ def api_lab_chat_message():
     cash      = _flt(acct_snap, "cash")
     daily_pnl = equity - last_eq
 
-    # Positions come from accounting["positions"] — all broker positions regardless of order status
-    raw_positions = acctg_snap.get("positions") or []
-    positions     = raw_positions   # include pending-order positions too
-    pos_lines     = []
+    positions = acctg_snap.get("positions") or []
+    pos_lines = []
     for p in positions:
-        sym = p.get("symbol", "?")
-        qty = p.get("qty") or "?"
-        pnl = float(p.get("unrealized_pnl") or 0)
-        val = float(p.get("current_value") or 0)
-        pos_lines.append(f"{sym} qty={qty} val=${val:,.0f} P&L=${pnl:+.0f}")
+        sym  = p.get("symbol", "?")
+        qty  = p.get("qty") or "?"
+        pnl  = float(p.get("unrealized_pnl") or 0)
+        val  = float(p.get("current_value") or 0)
+        days = p.get("holding_days") or ""
+        pos_lines.append(f"{sym} qty={qty} val=${val:,.0f} P&L=${pnl:+.0f}{f' {days}d' if days else ''}")
+
+    exit_recs   = acctg_snap.get("exit_recommendations") or []
+    exit_lines  = [
+        f"{r.get('symbol')} reason={r.get('reason')} pnl_pct={r.get('unrealized_pnl_pct')}%"
+        for r in exit_recs
+    ]
+    risk_state  = acctg_snap.get("risk_state") or {}
+
+    model_state = strategy_model.load_model()
+    variant     = model_state.get("active_variant", "current")
+    generation  = model_state.get("generation", 0)
+    conviction  = model_state.get("min_conviction", 75)
+    max_hold    = model_state.get("max_holding_days", 2)
 
     regime      = scores_snap.get("regime", "UNKNOWN")
-    top_signals = scores_snap.get("top") or scores_snap.get("top_signals") or []
-    sig_lines   = [
-        f"{s.get('symbol')} score={s.get('score')} ({s.get('action','?')})"
-        for s in top_signals[:5]
-    ]
+    top_signals = scores_snap.get("top") or []
 
-    # ── Intent: "exit all" ────────────────────────────────────────────────────
+    # Rich signal breakdown for Gemini — include per-indicator status
+    sig_lines = []
+    for s in top_signals[:8]:
+        sym   = s.get("symbol", "?")
+        score = s.get("score", 0)
+        bd    = s.get("signal_breakdown") or {}
+        indicators = []
+        for ind_name in ("rsi", "macd", "avwap", "ema", "trend", "price_action"):
+            ind = bd.get(ind_name) or {}
+            status = ind.get("status", "?")
+            label  = ind.get("label", "")
+            if label:
+                indicators.append(f"{ind_name.upper()}({status}): {label}")
+        ind_str = " | ".join(indicators) if indicators else "no breakdown"
+        sig_lines.append(f"{sym} score={score}: {ind_str}")
+
+    # Technicals for held positions
+    pos_tech_lines = []
+    all_scores = {s.get("symbol", "?"): s for s in (scores_snap.get("all") or [])}
+    for p in positions:
+        sym  = p.get("symbol", "?")
+        tech = (all_scores.get(sym) or {}).get("technicals") or {}
+        if tech:
+            rsi = tech.get("rsi14", "?")
+            ema = tech.get("ema_trend", "?")
+            macd_h = tech.get("macd_hist", "?")
+            avwap  = tech.get("price_vs_avwap_low_pct", "?")
+            atr_pct = tech.get("atr_pct", "?")
+            pos_tech_lines.append(
+                f"{sym}: RSI={rsi} EMA={ema} MACD_hist={macd_h} AVWAP_low%={avwap} ATR%={atr_pct}"
+            )
+
     text_low = text.lower()
+
+    # ── Fast-path: "exit all" intent ──────────────────────────────────────────
     exit_keywords = {"exit all", "close all", "sell everything", "flatten", "get out", "liquidate"}
     if any(k in text_low for k in exit_keywords):
         if not positions:
             return jsonify({"ok": True, "reply": "No open positions to close."})
         orders = [
-            {"symbol": p["symbol"],
-             "qty": str(p.get("qty") or 1),
-             "side": "sell",
-             "estimated_value": float(p.get("current_value") or 0)}
+            {"symbol": p["symbol"], "qty": str(p.get("qty") or 1),
+             "side": "sell", "estimated_value": float(p.get("current_value") or 0)}
             for p in positions
         ]
-        return jsonify({
-            "ok": True,
-            "trade_proposal": {
-                "orders": orders,
-                "context": f"Close all {len(orders)} position(s) — paper trade only"
-            }
-        })
+        return jsonify({"ok": True, "trade_proposal": {
+            "orders": orders,
+            "summary": f"Close all {len(orders)} position(s) — paper trade only",
+        }})
 
-    # ── Build system + user prompt ────────────────────────────────────────────
-    system_prompt = (
-        "You are an agentic day-trading assistant for an Alpaca paper trading account. "
-        "Speak concisely in 1–3 sentences. Format numbers with $ and commas. "
-        "Never recommend real trades — everything here is paper/simulated. "
-        "Do not create order JSON. Do not directly decide position size. "
-        "Explain current portfolio, risk, signals, news, and agent decisions from the provided state."
-    )
+    # ── System prompt ─────────────────────────────────────────────────────────
+    system_prompt = """\
+You are an algorithmic trading analyst for an Alpaca PAPER trading account (no real money at risk).
+Your job: tell the user in plain English what the market is doing, what the portfolio is doing, and what the signals say.
 
+The strategy uses 6 technical indicators scored 0-100:
+  RSI(14) — momentum zone (sweet: 52-70 bull, <45 bear)
+  MACD histogram — direction and slope (positive+rising = bullish)
+  AVWAP — anchored VWAP from swing low/high (price above = institutional support)
+  EMA 9/21 — trend direction (EMA9>EMA21 = uptrend)
+  Trendline — slope + price position (up + price above = trend intact)
+  Price action — reversal candles, swing breakouts/breakdowns, gaps, and volume confirmation
+
+Entry: score ≥ 65. Position size scales with regime (BULL=100%, CHOPPY=50%). Stops are ATR-based.
+Regime: BULL when QQQ ≥+0.4%, BEAR when QQQ ≤-0.5%, CHOPPY otherwise.
+
+Be concise and direct — talk like a prop trader, not a financial advisor. Use plain numbers.
+Dollar amounts with $ and commas. Percentages with one decimal.
+
+When user asks to BUY or SELL (e.g. "buy 10 NVDA", "sell my TSLA"):
+  Respond with ONLY this JSON (no markdown, no extra text):
+  {"trade_proposal": {"orders": [{"symbol": "NVDA", "side": "buy", "qty": 10}], "summary": "Brief reason"}}
+  - qty must be a positive integer; side must be "buy" or "sell"
+
+For all other queries respond in plain text. Never fabricate data not in context. This is paper trading."""
+
+    # ── Context block ─────────────────────────────────────────────────────────
+    pos_tech_str = "\n".join(pos_tech_lines) if pos_tech_lines else "no technicals available"
     context_block = (
-        f"Account: equity=${equity:,.0f}, cash=${cash:,.0f}, daily P&L=${daily_pnl:+,.0f}\n"
-        f"Regime: {regime}\n"
-        f"Open positions: {', '.join(pos_lines) if pos_lines else 'none'}\n"
-        f"Top signals: {', '.join(sig_lines) if sig_lines else 'none'}\n"
+        f"=== Portfolio State ===\n"
+        f"Equity: ${equity:,.0f} | Cash: ${cash:,.0f} | Daily P&L: ${daily_pnl:+,.0f}\n"
+        f"Market regime: {regime}\n"
+        f"Open positions ({len(positions)}): {', '.join(pos_lines) if pos_lines else 'none'}\n"
+        f"Position technicals:\n{pos_tech_str}\n"
+        f"Exit recommendations: {', '.join(exit_lines) if exit_lines else 'none'}\n"
+        f"Risk: {risk_state.get('status','?')} — {risk_state.get('message','')}\n"
+        f"\n=== Strategy Model ===\n"
+        f"Generation {generation} | Active variant: {variant} | Min conviction: {conviction}/100 | Max hold: {max_hold}d\n"
+        f"\n=== Top Signal Candidates (with indicator breakdown) ===\n"
+        f"{chr(10).join(sig_lines) if sig_lines else 'No signals cached — run live scores first.'}\n"
     )
 
-    # ── Try Gemini ────────────────────────────────────────────────────────────
+    # ── Gemini ────────────────────────────────────────────────────────────────
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if gemini_key:
-        try:
-            import google.generativeai as genai  # type: ignore
-            genai.configure(api_key=gemini_key)
-            model = genai.GenerativeModel(
-                model_name="gemini-2.0-flash",
-                system_instruction=system_prompt,
-            )
-            full_user = f"{context_block}\nUser: {text}"
-            response  = model.generate_content(full_user)
-            raw = (response.text or "").strip()
+    if not gemini_key:
+        reply = _simple_chat_response(text_low, equity, daily_pnl, cash, regime, pos_lines, sig_lines)
+        return jsonify({"ok": True, "reply": reply, "variant": "keyword_fallback"})
 
-            return jsonify({"ok": True, "reply": raw})
-        except Exception as e:
-            log.warning("Gemini chat error: %s", e)
-            # fall through to simple fallback
+    try:
+        import google.generativeai as genai  # type: ignore
+        genai.configure(api_key=gemini_key)
+        gmodel = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            system_instruction=system_prompt,
+        )
+        full_user = f"{context_block}\nUser: {text}"
+        response  = gmodel.generate_content(full_user)
+        raw = (response.text or "").strip()
 
-    # ── Simple keyword fallback ───────────────────────────────────────────────
-    reply = _simple_chat_response(text_low, equity, daily_pnl, cash, regime, pos_lines, sig_lines)
-    return jsonify({"ok": True, "reply": reply})
+        # Try to parse as trade_proposal JSON
+        if raw.startswith("{") and "trade_proposal" in raw:
+            try:
+                parsed = json.loads(raw)
+                proposal = parsed.get("trade_proposal") or {}
+                orders = proposal.get("orders") or []
+                # Sanitize orders
+                clean_orders = []
+                for o in orders:
+                    sym  = str(o.get("symbol") or "").upper().strip()
+                    side = str(o.get("side") or "buy").lower()
+                    qty  = int(float(o.get("qty") or 0))
+                    if sym and side in {"buy", "sell"} and qty > 0:
+                        clean_orders.append({"symbol": sym, "side": side, "qty": qty,
+                                             "estimated_value": 0})
+                if clean_orders:
+                    return jsonify({"ok": True, "trade_proposal": {
+                        "orders": clean_orders,
+                        "summary": proposal.get("summary") or f"Agent proposal: {len(clean_orders)} order(s)",
+                    }})
+            except (json.JSONDecodeError, Exception) as parse_err:
+                log.debug("trade_proposal parse failed: %s", parse_err)
+                # Fall through to return as plain reply
+
+        return jsonify({"ok": True, "reply": raw})
+
+    except Exception as e:
+        log.warning("Gemini chat error: %s", e)
+        reply = _simple_chat_response(text_low, equity, daily_pnl, cash, regime, pos_lines, sig_lines)
+        return jsonify({"ok": True, "reply": f"(LLM unavailable: {type(e).__name__}) {reply}",
+                        "variant": "keyword_fallback"})
 
 
 def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_lines):
@@ -1908,15 +2129,17 @@ def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_
     if any(k in text for k in ("signal", "scan", "score", "what to buy", "entry")):
         if sig_lines:
             return "Top signals: " + "; ".join(sig_lines) + "."
-        return "No signals cached yet. Trigger a scan via the button or wait for the next run."
+        return "No signals cached yet. Trigger a scan or wait for next run."
 
     if any(k in text for k in ("regime", "market", "bull", "bear", "choppy")):
         desc = {
-            "BULL":   "bullish — momentum strategies are eligible.",
-            "BEAR":   "bearish — short/inverse ETFs eligible.",
-            "CHOPPY": "choppy — no new entries, holding cash.",
-        }.get(regime, "unknown.")
-        return f"Current regime is {regime} — {desc}"
+            "BULL":    "trending up — momentum strategies active.",
+            "BEAR":    "trending down — hedges and exits favored.",
+            "CHOP":    "choppy — no new entries, staying in cash.",
+            "CHOPPY":  "choppy — no new entries, staying in cash.",
+            "UNKNOWN": "still loading — signals refreshing.",
+        }.get(regime, "still loading.")
+        return f"Current market is {desc}"
 
     if any(k in text for k in ("cash", "buying power", "available")):
         return f"Cash available: ${cash:,.0f}."

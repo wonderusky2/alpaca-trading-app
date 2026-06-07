@@ -18,7 +18,7 @@ echo "==> Setting up server venv (system Python)…"
 "$SYSTEM_PYTHON" -m venv "$VENV_SERVER"
 "$VENV_SERVER/bin/pip" install --quiet --upgrade pip
 "$VENV_SERVER/bin/pip" install --quiet \
-  yfinance filelock requests google-generativeai \
+  filelock requests google-generativeai pandas \
   alpaca-py flask flask-cors
 
 # ── venv_app — py2app build env (menu bar only, no heavy deps) ───────────────

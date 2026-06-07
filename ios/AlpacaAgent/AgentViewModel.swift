@@ -10,8 +10,9 @@ class AgentViewModel: ObservableObject {
     @Published var inputText  = ""
     @Published var pendingTrade: PendingTradeProposal?
     @Published var isPlacingOrder = false
-    @Published var autoExecuteOrders = true
+    @Published var autoExecuteOrders = false
     @Published var lastOverviewAt: Date?
+    @Published var overviewError: String?
     @Published var selectedPortfolioRange: PortfolioRange = .day
     @Published var portfolioPoints: [PortfolioPoint] = []
     @Published var portfolioRangePnl: Double = 0
@@ -24,12 +25,18 @@ class AgentViewModel: ObservableObject {
     @Published var portfolioNarrative = PortfolioNarrative()
     @Published var strategyModel = StrategyModelState()
     @Published var signalInsights: [SignalInsight] = []
+    @Published var heldInsights: [String: SignalInsight] = [:]
     @Published var activityItems: [ActivityLogItem] = []
     @Published var isRefreshingActivity = false
+    @Published var activityError: String?
+    @Published var variantWinRates: [VariantWinRate] = []
+    @Published var todayVariantWinner: String = ""
+    @Published var lastOptimizedAt: String = ""
 
     private var pollTask: Task<Void, Never>?
     private var prevRegime: String = ""
     private var prevPosCount: Int  = -1
+    private var prevVariant: String = ""
     private var initialized        = false
 
     init() {
@@ -37,6 +44,7 @@ class AgentViewModel: ObservableObject {
         Task {
             await fetchPortfolioHistory(for: selectedPortfolioRange)
             await fetchActivity()
+            await fetchVariants()
         }
     }
 
@@ -78,9 +86,16 @@ class AgentViewModel: ObservableObject {
 
     private func fetchOverview() async {
         do {
-            let (data, _) = try await URLSession.shared.data(for: Config.request("/api/lab/overview"))
+            let (data, response) = try await URLSession.shared.data(for: Config.request("/api/lab/overview"))
+            if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+                overviewError = "Overview \(http.statusCode)"
+                return
+            }
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let ok = json["ok"] as? Bool, ok else { return }
+                  let ok = json["ok"] as? Bool, ok else {
+                overviewError = "Overview unavailable"
+                return
+            }
 
             let acct   = json["account"]    as? [String: Any] ?? [:]
             let acctg  = json["accounting"] as? [String: Any] ?? [:]
@@ -118,27 +133,38 @@ class AgentViewModel: ObservableObject {
             decision = parseDecision(decisionJson)
             strategyModel = parseStrategyModel(modelJson)
             signalInsights = parseSignalInsights(scores)
+            // Parse held-position scores keyed by symbol (always populated, even on weekends)
+            let heldRows = scores["held_scores"] as? [[String: Any]] ?? []
+            heldInsights = Dictionary(
+                uniqueKeysWithValues: parseHeldInsights(heldRows).map { ($0.symbol, $0) }
+            )
             portfolioNarrative = parsePortfolioNarrative(narrativeJson)
             lastOverviewAt = Date()
+            overviewError = nil
 
             if !initialized {
+                let greetingPnl = overview.hasDailyPnl ? overview.dailyPnl : openPnl
                 postGreeting(regime: regime, isOpen: isOpen, equity: eq,
-                             pnl: eq - lastEq, posCount: posCount, newsRisks: newsRisks)
+                             pnl: greetingPnl, posCount: posCount, newsRisks: newsRisks)
                 prevRegime   = regime
                 prevPosCount = posCount
                 initialized  = true
             } else {
                 detectChanges(regime: regime, posCount: posCount,
-                              openPnl: openPnl, newsRisks: newsRisks)
+                              openPnl: openPnl, newsRisks: newsRisks,
+                              variant: strategyModel.activeVariant)
             }
-        } catch { /* silent retry */ }
+        } catch {
+            overviewError = error.localizedDescription
+        }
     }
 
     private func postGreeting(regime: String, isOpen: Bool, equity: Double,
                                pnl: Double, posCount: Int, newsRisks: [[String: Any]]) {
         let mktStr  = isOpen ? "open" : "closed"
         let pnlSign = pnl >= 0 ? "+" : ""
-        var text = "Agent online. Market \(mktStr). Equity \(fmt$(equity)), daily P&L \(pnlSign)\(fmt$(abs(pnl))). Regime: \(regime). "
+        let pnlLabel = overview.hasDailyPnl ? "daily P&L" : "open P&L"
+        var text = "Agent online. Market \(mktStr). Equity \(fmt$(equity)), \(pnlLabel) \(pnlSign)\(fmt$(abs(pnl))). Regime: \(regime). "
         text += posCount > 0 ? "\(posCount) holding\(posCount > 1 ? "s" : "") open." : "No exposure — cash ready."
         addMessage(ChatMessage(text, role: .agent))
 
@@ -157,7 +183,8 @@ class AgentViewModel: ObservableObject {
     }
 
     private func detectChanges(regime: String, posCount: Int,
-                                openPnl: Double, newsRisks: [[String: Any]]) {
+                                openPnl: Double, newsRisks: [[String: Any]],
+                                variant: String) {
         if regime != prevRegime && !prevRegime.isEmpty {
             let msgs: [String: String] = [
                 "BULL":   "Regime → BULL. Momentum active — running signal scan.",
@@ -186,6 +213,47 @@ class AgentViewModel: ObservableObject {
             }
             prevPosCount = posCount
         }
+
+        if !prevVariant.isEmpty && variant != prevVariant && variant != "current" {
+            let msg = "Strategy optimized → \(variant). Indicator weights adjusted for today."
+            addMessage(ChatMessage(msg, role: .agent, variant: .alert))
+            notify(title: "Strategy Updated", body: msg)
+        }
+        prevVariant = variant
+    }
+
+    private func fetchVariants() async {
+        do {
+            let (data, _) = try await URLSession.shared.data(for: Config.request("/api/lab/variants"))
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let ok = json["ok"] as? Bool, ok else { return }
+
+            // Today's winner
+            let todayJson = json["today"] as? [String: Any] ?? [:]
+            todayVariantWinner = anyString(todayJson["winner"], fallback: "")
+
+            // Last optimized timestamp
+            if let recordedAt = todayJson["recorded_at"] as? String,
+               let date = ISO8601DateFormatter().date(from: recordedAt) {
+                let fmt = DateFormatter()
+                fmt.dateFormat = "MMM d, h:mm a"
+                lastOptimizedAt = fmt.string(from: date)
+            }
+
+            // Win rates
+            let winRatesJson = json["win_rates"] as? [String: Any] ?? [:]
+            variantWinRates = winRatesJson.map { name, val -> VariantWinRate in
+                let d = val as? [String: Any] ?? [:]
+                return VariantWinRate(
+                    name: name,
+                    wins: anyInt(d["wins"]),
+                    total: anyInt(d["total"]),
+                    winRate: anyDouble(d["win_rate"]),
+                    avgObjective: anyDouble(d["avg_objective"])
+                )
+            }
+            .sorted { $0.winRate > $1.winRate }
+        } catch { /* silent */ }
     }
 
     func send() {
@@ -208,6 +276,7 @@ class AgentViewModel: ObservableObject {
             await fetchOverview()
             await fetchPortfolioHistory(for: selectedPortfolioRange)
             await fetchActivity()
+            await fetchVariants()
         }
     }
 
@@ -277,12 +346,20 @@ class AgentViewModel: ObservableObject {
 
     private func fetchActivity() async {
         isRefreshingActivity = true
+        activityError = nil
         defer { isRefreshingActivity = false }
 
         do {
-            let (data, _) = try await URLSession.shared.data(for: Config.request("/api/lab/activity"))
+            let (data, response) = try await URLSession.shared.data(for: Config.request("/api/lab/activity"))
+            if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+                activityError = "Activity \(http.statusCode)"
+                return
+            }
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let ok = json["ok"] as? Bool, ok else { return }
+                  let ok = json["ok"] as? Bool, ok else {
+                activityError = "Activity unavailable"
+                return
+            }
 
             let orders = json["recent_orders"] as? [[String: Any]] ?? []
             let events = json["events"] as? [[String: Any]] ?? []
@@ -291,7 +368,9 @@ class AgentViewModel: ObservableObject {
                 (lhs.time ?? .distantPast) > (rhs.time ?? .distantPast)
             }
             activityItems = Array(items.prefix(30))
+            activityError = nil
         } catch {
+            activityError = error.localizedDescription
             let item = ActivityLogItem(
                 title: "Activity refresh failed",
                 detail: error.localizedDescription,
@@ -492,46 +571,82 @@ class AgentViewModel: ObservableObject {
     }
 
     private func fallbackPortfolioNarrative() -> PortfolioNarrative {
-        let firstExit = exitRecommendations.first
-        let topSignal = signalInsights.first
+        let regime = overview.regime
+        let positions = positions
+        let posCount = positions.count
+        let openPnl = positions.reduce(0.0) { $0 + $1.unrealizedPnl }
+        let winners = positions.filter { $0.unrealizedPnl > 0 }.count
+        let losers  = positions.filter { $0.unrealizedPnl < 0 }.count
+        let exitCount = exitRecommendations.count
+        let riskAction = decision.riskAction == "--" ? "" : decision.riskAction
+        let totalValue = positions.reduce(0.0) { $0 + $1.currentValue }
+        let equity = overview.equity
+        let grossExposure = equity > 0 ? min(100.0, totalValue / equity * 100.0) : 0.0
+        let cashPct = max(0.0, 100.0 - grossExposure)
+
+        let regimeDesc: String
+        switch regime {
+        case "BULL":   regimeDesc = "trending up"
+        case "BEAR":   regimeDesc = "trending down"
+        case "CHOP", "CHOPPY": regimeDesc = "choppy — no clear direction"
+        default:       regimeDesc = "unclear"
+        }
+
+        // Summary — plain English
         let summary: String
-        if let firstExit {
-            summary = "Market posture is \(overview.regime). The agent is prioritizing capital protection because \(firstExit.symbol) hit \(cleanReason(firstExit.reason).lowercased())."
-        } else if let topSignal {
-            summary = "Market posture is \(overview.regime). The agent is scanning for portfolio rotation because \(topSignal.symbol) is the strongest current setup."
+        if posCount > 0 {
+            let pnlWord = openPnl >= 0 ? "up" : "down"
+            let pnlAbs  = Int(abs(openPnl)).formatted()
+            summary = "\(Int(cashPct))% in cash, \(Int(grossExposure))% invested across \(posCount) position\(posCount == 1 ? "" : "s"). You're \(pnlWord) $\(pnlAbs)."
         } else {
-            summary = decision.summary
+            summary = "You're fully in cash. Market is \(regimeDesc)."
         }
 
-        var why: [String] = []
-        if let firstExit {
-            why.append("\(firstExit.symbol): \(cleanReason(firstExit.reason)), now \(signedPercentText(firstExit.unrealizedPnlPct)), peak \(signedPercentText(firstExit.peakUnrealizedPnlPct)), giveback \(String(format: "%.1f", firstExit.givebackPct))%.")
+        // Why — plain English
+        var why: [String] = ["The market is \(regimeDesc)."]
+        if posCount > 0 {
+            let pnlWord = openPnl >= 0 ? "up" : "down"
+            let pnlAbs  = Int(abs(openPnl)).formatted()
+            if winners > 0 && losers > 0 {
+                why.append("You have \(winners) position\(winners == 1 ? "" : "s") making money and \(losers) losing — portfolio is \(pnlWord) $\(pnlAbs) overall.")
+            } else if losers > 0 {
+                why.append("All \(losers) open position\(losers == 1 ? " is" : "s are") losing money. Portfolio is down $\(pnlAbs).")
+            } else {
+                why.append("All \(winners) open position\(winners == 1 ? " is" : "s are") in the green. Portfolio is up $\(pnlAbs).")
+            }
         }
-        if let topSignal {
-            let reasons = topSignal.reasons.prefix(2).joined(separator: " | ")
-            let detail = reasons.isEmpty
-                ? "\(topSignal.symbol): score \(topSignal.score), \(topSignal.trendDirection) trend, AVWAP \(signedPercentText(topSignal.priceVsAvwapLowPct))."
-                : "\(topSignal.symbol): score \(topSignal.score), \(reasons)."
-            why.append(detail)
+        if riskAction == "reduce_risk" {
+            why.append("The portfolio has taken on too much risk. Time to pull back.")
+        } else if exitCount > 0 {
+            why.append("\(exitCount) position\(exitCount == 1 ? " is" : "s are") triggering exit rules — acting on them protects what you've made.")
         }
-        if why.isEmpty {
-            why.append(decision.summary)
-        }
+        if posCount == 0 { why.append("You're fully in cash.") }
 
+        // Next — plain English
         var next: [String] = []
-        if let firstExit {
-            next.append("Sell \(formatQuantity(firstExit.quantity)) \(firstExit.symbol) if the risk gate allows; do not let the loser sit.")
-        }
-        if let topSignal, firstExit == nil {
-            next.append("Prepare buy candidate \(topSignal.symbol) only if conviction stays above \(strategyModel.minConviction) and price confirms trend.")
+        if riskAction == "reduce_risk" {
+            next.append("Pull back — reduce positions and don't add new ones until conditions improve.")
+        } else if exitCount > 0 {
+            next.append("Sell the \(exitCount) position\(exitCount == 1 ? "" : "s") that are triggering exit rules.")
         }
         if next.isEmpty {
-            next.append(decision.action.replacingOccurrences(of: "_", with: " ").capitalized)
+            switch (regime, posCount) {
+            case ("BULL", _) where cashPct > 25:
+                next.append("Market is trending up and you have \(Int(cashPct))% in cash — good time to look for new entries.")
+            case ("BEAR", let n) where n > 0:
+                next.append("Market is heading down — tighten your stops and consider reducing exposure.")
+            case ("BEAR", _):
+                next.append("Market is heading down. Stay in cash and wait for the trend to reverse.")
+            case (_, let n) where n > 0:
+                next.append("Market is choppy. Hold what you have and avoid adding new positions.")
+            default:
+                next.append("Stay in cash. Wait for a clear market trend before investing.")
+            }
         }
 
         return PortfolioNarrative(
             sentimentFrom: "market",
-            sentimentTo: overview.regime,
+            sentimentTo: regime.lowercased(),
             summary: summary,
             why: why,
             nextActions: next,
@@ -540,7 +655,7 @@ class AgentViewModel: ObservableObject {
     }
 
     private var modelLine: String {
-        "Model G\(strategyModel.generation): conviction \(strategyModel.minConviction)+, max hold \(strategyModel.maxHoldingDays)d, giveback stop \(String(format: "%.1f", strategyModel.profitGivebackPct))%."
+        "G\(strategyModel.generation) · \(strategyModel.activeVariant.isEmpty ? "current" : strategyModel.activeVariant) · conviction \(strategyModel.minConviction)+ · hold ≤\(strategyModel.maxHoldingDays)d · giveback ≤\(String(format: "%.0f", strategyModel.profitGivebackPct))%"
     }
 
     private func cleanReason(_ value: String) -> String {
@@ -563,16 +678,32 @@ class AgentViewModel: ObservableObject {
             profitLockTriggerPct: row["profit_lock_trigger_pct"] == nil ? defaults.profitLockTriggerPct : anyDouble(row["profit_lock_trigger_pct"]),
             profitGivebackPct: row["profit_giveback_pct"] == nil ? defaults.profitGivebackPct : anyDouble(row["profit_giveback_pct"]),
             maxHoldingDays: row["max_holding_days"] == nil ? defaults.maxHoldingDays : anyInt(row["max_holding_days"]),
-            exitOnRegimeFlip: row["exit_on_regime_flip"] as? Bool ?? true
+            exitOnRegimeFlip: row["exit_on_regime_flip"] as? Bool ?? true,
+            activeVariant: anyString(row["active_variant"], fallback: "current")
         )
     }
 
     private func parseSignalInsights(_ row: [String: Any]) -> [SignalInsight] {
         let rows = (row["top"] as? [[String: Any]]) ?? (row["signals"] as? [[String: Any]]) ?? []
-        return rows.prefix(5).map { item in
+        return rows.prefix(8).map { item in
             let quote = item["quote"] as? [String: Any] ?? [:]
             let technicals = (item["technicals"] as? [String: Any]) ?? (quote["technicals"] as? [String: Any]) ?? [:]
-            return SignalInsight(
+
+            // Parse per-indicator signal_breakdown
+            var breakdown: [String: SignalIndicator] = [:]
+            if let bd = item["signal_breakdown"] as? [String: Any] {
+                for (key, val) in bd {
+                    guard let indDict = val as? [String: Any] else { continue }
+                    breakdown[key] = SignalIndicator(
+                        status: anyString(indDict["status"], fallback: "neutral"),
+                        label:  anyString(indDict["label"],  fallback: ""),
+                        points: anyInt(indDict["points"]),
+                        weight: anyInt(indDict["weight"])
+                    )
+                }
+            }
+
+            var insight = SignalInsight(
                 symbol: anyString(item["symbol"], fallback: "?"),
                 score: anyInt(item["score"]),
                 regime: anyString(item["regime"], fallback: overview.regime),
@@ -588,21 +719,65 @@ class AgentViewModel: ObservableObject {
                 fibPosition: anyString(technicals["fib_position"], fallback: "--"),
                 reasons: item["technical_reasons"] as? [String] ?? []
             )
+            insight.signalBreakdown = breakdown
+            return insight
         }
     }
 
+    private func parseHeldInsights(_ rows: [[String: Any]]) -> [SignalInsight] {
+        // Same shape as live_scores top entries — reuse the same parsing logic
+        let wrapper: [String: Any] = ["top": rows]
+        return parseSignalInsights(wrapper)
+    }
+
     private func parseOrder(_ order: [String: Any]) -> ActivityLogItem {
-        let side = anyString(order["side"], fallback: "").uppercased()
-        let symbol = anyString(order["symbol"], fallback: "?")
+        let side = anyString(order["side"], fallback: "").lowercased()
+        let symbol = anyString(order["symbol"], fallback: "?").uppercased()
         let qty = anyDouble(order["qty"])
         let filledQty = anyDouble(order["filled_qty"])
-        let status = anyString(order["status"], fallback: "unknown")
+        let status = anyString(order["status"], fallback: "unknown").lowercased()
         let price = anyDouble(order["filled_avg_price"])
-        let title = "\(side) \(formatQuantity(filledQty > 0 ? filledQty : qty)) \(symbol) \(status)"
-        let detail = price > 0 ? "Filled at \(fmt$(price))" : "Order status \(status)"
-        let variant: MessageVariant = status.lowercased() == "filled" ? .trade : .alert
+        let useQty = filledQty > 0 ? filledQty : qty
+        let value = useQty * price
+
+        // Human title: "Bought NVDA" / "Sold NVDA" / "Pending buy NVDA"
+        let verb: String
+        switch (side, status) {
+        case ("buy", "filled"):   verb = "Bought"
+        case ("sell", "filled"):  verb = "Sold"
+        case ("buy", _):          verb = "Pending buy"
+        case ("sell", _):         verb = "Pending sell"
+        default:                  verb = side.capitalized
+        }
+        let title = "\(verb) \(symbol)"
+
+        // Map Alpaca internal statuses to human labels
+        let statusLabel: String
+        switch status {
+        case "filled":                          statusLabel = "filled"
+        case "partially_filled":                statusLabel = "partial fill"
+        case "accepted", "new", "pending_new",
+             "accepted_for_bidding", "held":    statusLabel = "queued"
+        case "canceled", "cancelled":           statusLabel = "canceled"
+        case "expired":                         statusLabel = "expired"
+        case "replaced":                        statusLabel = "replaced"
+        default:                                statusLabel = "placed"
+        }
+
+        // Detail: qty + value if known
+        let qtyStr = formatQuantity(useQty)
+        let detail: String
+        if price > 0 && value > 0 {
+            detail = "\(qtyStr) shares @ \(fmt$(price)) · \(fmt$(value))"
+        } else if useQty > 0 {
+            detail = "\(qtyStr) shares · \(statusLabel)"
+        } else {
+            detail = statusLabel.capitalized
+        }
+
+        let variant: MessageVariant = status == "filled" ? .trade : .alert
         return ActivityLogItem(
-            title: title.trimmingCharacters(in: .whitespaces),
+            title: title,
             detail: detail,
             time: anyDate(order["filled_at"]) ?? anyDate(order["submitted_at"]),
             variant: variant
@@ -612,20 +787,80 @@ class AgentViewModel: ObservableObject {
     private func parseEvent(_ event: [String: Any]) -> ActivityLogItem {
         let kind = anyString(event["type"] ?? event["event"] ?? event["name"], fallback: "agent_event")
         let payload = event["payload"] as? [String: Any] ?? event
-        let symbol = anyString(payload["symbol"], fallback: "")
-        let action = anyString(payload["action"] ?? payload["side"], fallback: "")
-        let status = anyString(payload["status"], fallback: "")
-        let detail = [
-            symbol.isEmpty ? nil : symbol,
-            action.isEmpty ? nil : action.uppercased(),
-            status.isEmpty ? nil : status
-        ].compactMap { $0 }.joined(separator: " | ")
+
+        // Human-readable titles by event type
+        let title: String
+        let detail: String
+        let variant: MessageVariant
+
+        switch kind {
+        case "regime_change":
+            let from = anyString(payload["from"], fallback: "").uppercased()
+            let to   = anyString(payload["to"], fallback: "").uppercased()
+            title  = "Sentiment changed"
+            detail = from.isEmpty ? "Market regime updated to \(to)." : "Regime shifted \(from) → \(to). Strategy universe updated."
+            variant = .alert
+
+        case "news_risk_detected":
+            let sym   = anyString(payload["symbol"], fallback: "position")
+            let delta = anyInt(payload["delta"] as Any)
+            let head  = anyString(payload["headline"], fallback: "")
+            title  = "Negative news detected"
+            detail = head.isEmpty ? "Sentiment drop on \(sym) (Δ\(delta))." : "\(sym): \(head.prefix(80))"
+            variant = .danger
+
+        case "exit_triggered":
+            let sym    = anyString(payload["symbol"], fallback: "position")
+            let reason = cleanReason(anyString(payload["reason"], fallback: "exit signal"))
+            let pnl    = anyDouble(payload["pnl_pct"])
+            title  = "Exit signal triggered"
+            detail = "\(sym): \(reason.lowercased()) · \(signedPercentText(pnl)) P&L"
+            variant = .alert
+
+        case "risk_gate_active":
+            title  = "Risk gate activated"
+            detail = anyString(payload["message"], fallback: "Exposure limit reached. No new entries.")
+            variant = .danger
+
+        case "risk_gate_cleared":
+            title  = "Risk gate cleared"
+            detail = anyString(payload["message"], fallback: "Exposure limits normalised. Entries permitted.")
+            variant = .normal
+
+        case "paper_orders_submitted":
+            let submitted = payload["submitted"] as? [[String: Any]] ?? []
+            let count = submitted.count
+            let syms  = submitted.compactMap { $0["symbol"] as? String }.prefix(3).joined(separator: ", ")
+            title  = "Orders placed"
+            detail = count == 0 ? "Paper orders submitted." : "\(count) paper order\(count == 1 ? "" : "s") placed\(syms.isEmpty ? "" : ": \(syms)")."
+            variant = .trade
+
+        case "paper_orders_failed":
+            let errors = payload["errors"] as? [[String: Any]] ?? []
+            let msg = errors.first.flatMap { $0["error"] as? String } ?? "Order rejected by risk gate."
+            title  = "Orders blocked"
+            detail = msg
+            variant = .danger
+
+        case "model_updated":
+            let gen = anyInt(payload["generation"] as Any)
+            title  = "Strategy optimised"
+            detail = gen > 0 ? "Model updated to generation \(gen)." : "Strategy model parameters updated."
+            variant = .normal
+
+        default:
+            // Generic fallback
+            let msg = anyString(payload["reason"] ?? payload["message"], fallback: "")
+            title  = kind.replacingOccurrences(of: "_", with: " ").capitalized
+            detail = msg.isEmpty ? "Agent activity recorded." : msg
+            variant = kind.lowercased().contains("error") || kind.lowercased().contains("fail") ? .danger : .normal
+        }
 
         return ActivityLogItem(
-            title: kind.replacingOccurrences(of: "_", with: " ").capitalized,
-            detail: detail.isEmpty ? anyString(payload["reason"], fallback: "Agent activity recorded") : detail,
+            title: title,
+            detail: detail,
             time: anyDate(event["ts"]) ?? anyDate(event["time"]) ?? anyDate(event["created_at"]),
-            variant: kind.lowercased().contains("error") ? .danger : .normal
+            variant: variant
         )
     }
 
