@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alpaca-server
+  namespace: alpaca-trader
+  labels:
+    app: alpaca-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alpaca-server
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: alpaca-server
+    spec:
+      serviceAccountName: alpaca-trader-sa
+      containers:
+        - name: server
+          image: gcr.io/pure-tribute-440710-r8/alpaca-trader:latest
+          imagePullPolicy: Always
+          command: ["python", "server.py"]
+          ports:
+            - containerPort: 5001
+              name: http
+          envFrom:
+            - configMapRef:
+                name: alpaca-trader-config
+            - secretRef:
+                name: alpaca-trader-secrets
+          volumeMounts:
+            - name: state
+              mountPath: /data/state
+          readinessProbe:
+            httpGet:
+              path: /api/status
+              port: 5001
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /api/status
+              port: 5001
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: alpaca-trader-state

@@ -1,0 +1,16 @@
+# External LoadBalancer — open to all IPs.
+# Access is controlled by X-API-Key header (LAB_API_KEY in K8s secret).
+apiVersion: v1
+kind: Service
+metadata:
+  name: alpaca-server
+  namespace: alpaca-trader
+spec:
+  selector:
+    app: alpaca-server
+  ports:
+    - name: http
+      protocol: TCP
+      port: 5001
+      targetPort: 5001
+  type: LoadBalancer

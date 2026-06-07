@@ -1,0 +1,324 @@
+"""
+alpaca_client.py — All Alpaca API interaction for robinhood-trader.
+Adapted from swing-bot; uses local config/logger.
+"""
+from __future__ import annotations
+import time
+from typing import Optional
+
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import (
+    MarketOrderRequest, LimitOrderRequest,
+    GetOrdersRequest, ClosePositionRequest, GetPortfolioHistoryRequest,
+)
+from alpaca.trading.enums import (
+    OrderSide, TimeInForce, OrderClass, OrderType, QueryOrderStatus,
+)
+from alpaca.common.enums import Sort
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.historical.news import NewsClient
+from alpaca.data.requests import StockBarsRequest, NewsRequest
+from alpaca.data.enums import DataFeed
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+import config
+from logger import get_logger
+
+log = get_logger("alpaca_client")
+
+_ALPACA_HOSTS = (
+    "data.alpaca.markets",
+    "paper-api.alpaca.markets",
+    "api.alpaca.markets",
+    "localhost",
+    "127.0.0.1",
+)
+
+
+def _configure_alpaca_no_proxy() -> None:
+    """Route Alpaca API traffic direct — corporate HTTP proxies often block market data."""
+    import os
+    for key in ("NO_PROXY", "no_proxy"):
+        existing = os.environ.get(key, "")
+        parts = [part.strip() for part in existing.split(",") if part.strip()]
+        for host in _ALPACA_HOSTS:
+            if host not in parts:
+                parts.append(host)
+        os.environ[key] = ",".join(parts)
+
+
+_configure_alpaca_no_proxy()
+
+
+def _make_data_feed(feed_str: str) -> DataFeed:
+    mapping = {
+        "iex": DataFeed.IEX,
+        "sip": DataFeed.SIP,
+        "otc": DataFeed.OTC,
+    }
+    feed = (feed_str or "iex").strip().lower()
+    return mapping.get(feed, DataFeed.IEX)
+
+
+class AlpacaClient:
+    """Thin wrapper around alpaca-py."""
+
+    def __init__(self):
+        if not config.ALPACA_API_KEY or not config.ALPACA_API_SECRET:
+            raise EnvironmentError(
+                "Alpaca API keys not set. "
+                "Run: eval $(cd ~/Code/conjur-secret-manager && npm run --silent export)"
+            )
+        self.trading = TradingClient(
+            config.ALPACA_API_KEY,
+            config.ALPACA_API_SECRET,
+            paper=config.PAPER,
+        )
+        self.data = StockHistoricalDataClient(
+            config.ALPACA_API_KEY,
+            config.ALPACA_API_SECRET,
+        )
+        self.news = NewsClient(
+            config.ALPACA_API_KEY,
+            config.ALPACA_API_SECRET,
+        )
+        log.info("AlpacaClient initialized — PAPER mode")
+
+    @staticmethod
+    def _require_submission_enabled() -> None:
+        if not config.fund_manager_order_submission_enabled():
+            raise EnvironmentError(
+                "Order submission is locked. "
+                "Set FUND_MANAGER_ORDER_SUBMISSION_ENABLED=false to override."
+            )
+
+    # ── Account ───────────────────────────────────────────────────────────────
+
+    def get_account(self) -> dict:
+        acct = self.trading.get_account()
+        return {
+            "equity":         float(acct.equity),
+            "cash":           float(acct.cash),
+            "buying_power":   float(acct.buying_power),
+            "daytrade_count": int(acct.daytrade_count),
+            "pdt":            bool(acct.pattern_day_trader),
+            "status":         acct.status.value,
+        }
+
+    def get_portfolio_history(self, period: str = "1M", timeframe: str = "1D") -> dict:
+        req = GetPortfolioHistoryRequest(period=period, timeframe=timeframe)
+        history = self.trading.get_portfolio_history(req)
+
+        def _list(attr):
+            value = getattr(history, attr, None)
+            return list(value or [])
+
+        return {
+            "timestamp":       _list("timestamp"),
+            "equity":          _list("equity"),
+            "profit_loss":     _list("profit_loss"),
+            "profit_loss_pct": _list("profit_loss_pct"),
+            "base_value":      getattr(history, "base_value", None),
+            "timeframe":       timeframe,
+            "period":          period,
+        }
+
+    def get_clock(self) -> dict:
+        clock = self.trading.get_clock()
+
+        def _iso(value):
+            return value.isoformat() if hasattr(value, "isoformat") else value
+
+        return {
+            "is_open":    bool(getattr(clock, "is_open", False)),
+            "timestamp":  _iso(getattr(clock, "timestamp", None)),
+            "next_open":  _iso(getattr(clock, "next_open", None)),
+            "next_close": _iso(getattr(clock, "next_close", None)),
+        }
+
+    # ── Positions ─────────────────────────────────────────────────────────────
+
+    def get_positions(self) -> dict[str, dict]:
+        """Return {symbol: position_dict}, ignoring IGNORED_POSITIONS."""
+        positions = self.trading.get_all_positions()
+        ignore = {s.upper() for s in (config.IGNORED_POSITIONS or [])}
+        out = {}
+        for p in positions:
+            if p.symbol.upper() in ignore:
+                continue
+            out[p.symbol] = {
+                "qty":             float(p.qty),
+                "side":            p.side.value,
+                "entry":           float(p.avg_entry_price),
+                "market_val":      float(p.market_value),
+                "unrealized_pl":   float(p.unrealized_pl),
+                "unrealized_plpc": float(p.unrealized_plpc),
+            }
+        return out
+
+    def close_position(self, symbol: str) -> dict:
+        self._require_submission_enabled()
+        try:
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=50)
+            for o in self.trading.get_orders(filter=req):
+                if o.symbol.upper() == symbol.upper():
+                    try:
+                        self.trading.cancel_order_by_id(o.id)
+                    except Exception as e:
+                        log.warning(f"{symbol}: cancel of {o.id} failed — {e}")
+        except Exception as e:
+            log.warning(f"{symbol}: could not list orders before close — {e}")
+        resp = self.trading.close_position(symbol)
+        log.info(f"Closed position: {symbol} → order {resp.id}")
+        return {"order_id": str(resp.id), "symbol": symbol}
+
+    # ── Orders ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _order_to_dict(o) -> dict:
+        def _value(attr, default=None):
+            value = getattr(o, attr, default)
+            return getattr(value, "value", value)
+
+        def _iso(attr):
+            value = getattr(o, attr, None)
+            return value.isoformat() if hasattr(value, "isoformat") else value
+
+        return {
+            "id":               str(getattr(o, "id", "")),
+            "symbol":           getattr(o, "symbol", ""),
+            "side":             _value("side"),
+            "qty":              float(getattr(o, "qty", 0) or 0),
+            "filled_qty":       float(getattr(o, "filled_qty", 0) or 0),
+            "status":           _value("status"),
+            "type":             _value("order_type"),
+            "time_in_force":    _value("time_in_force"),
+            "submitted_at":     _iso("submitted_at"),
+            "filled_at":        _iso("filled_at"),
+            "filled_avg_price": (
+                float(getattr(o, "filled_avg_price"))
+                if getattr(o, "filled_avg_price", None) is not None else None
+            ),
+            "limit_price": (
+                float(getattr(o, "limit_price"))
+                if getattr(o, "limit_price", None) is not None else None
+            ),
+        }
+
+    def get_open_orders(self) -> list[dict]:
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=50)
+        return [self._order_to_dict(o) for o in self.trading.get_orders(filter=req)]
+
+    def get_recent_orders(self, limit: int = 100) -> list[dict]:
+        """Return recent orders (open + closed combined)."""
+        try:
+            req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=limit)
+            return [self._order_to_dict(o) for o in self.trading.get_orders(filter=req)]
+        except Exception:
+            orders_by_id = {}
+            for qs in (QueryOrderStatus.OPEN, QueryOrderStatus.CLOSED):
+                req = GetOrdersRequest(status=qs, limit=limit)
+                for o in self.trading.get_orders(filter=req):
+                    item = self._order_to_dict(o)
+                    orders_by_id[item["id"]] = item
+            return list(orders_by_id.values())[:limit]
+
+    def cancel_order(self, order_id: str) -> bool:
+        self._require_submission_enabled()
+        try:
+            self.trading.cancel_order_by_id(order_id)
+            log.info(f"Cancelled order {order_id}")
+            return True
+        except Exception as e:
+            log.warning(f"Could not cancel order {order_id}: {e}")
+            return False
+
+    def place_market_order(self, symbol: str, qty: int, side: str) -> dict:
+        """Plain market order — used by the dashboard for paper trades."""
+        self._require_submission_enabled()
+        if qty <= 0:
+            raise ValueError(f"Invalid qty {qty} for {symbol}")
+        side_enum = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
+        req = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=side_enum,
+            time_in_force=TimeInForce.DAY,
+        )
+        order = self.trading.submit_order(req)
+        log.info(f"LAB ORDER | {side_enum.value.upper()} {symbol} {qty}sh → {order.id}")
+        return {
+            "order_id": str(order.id),
+            "symbol":   symbol,
+            "qty":      qty,
+            "side":     side_enum.value,
+        }
+
+    # ── News ──────────────────────────────────────────────────────────────────
+
+    def get_news(
+        self,
+        symbols: list[str],
+        start=None,
+        end=None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """
+        Return recent Alpaca/Benzinga news for a symbol basket.
+        Articles are sorted newest-first.
+        """
+        clean = sorted({str(s).upper() for s in (symbols or []) if str(s).strip()})
+        if not clean:
+            return []
+        try:
+            req = NewsRequest(
+                symbols=",".join(clean[:50]),
+                start=start,
+                end=end,
+                limit=max(1, min(int(limit or 50), 50)),
+                sort="desc",
+                include_content=False,
+                exclude_contentless=False,
+            )
+            news_set = self.news.get_news(req)
+            articles = getattr(news_set, "news", None)
+            if articles is None and hasattr(news_set, "data"):
+                articles = (getattr(news_set, "data") or {}).get("news")
+        except Exception as e:
+            log.warning(f"get_news failed for {clean}: {e}")
+            return []
+
+        out = []
+        for item in articles or []:
+            def _iso(attr):
+                value = getattr(item, attr, None)
+                return value.isoformat() if hasattr(value, "isoformat") else value
+
+            out.append({
+                "id":         str(getattr(item, "id", "")),
+                "headline":   getattr(item, "headline", "") or "",
+                "summary":    getattr(item, "summary", "") or "",
+                "source":     getattr(item, "source", "") or "",
+                "url":        getattr(item, "url", None),
+                "created_at": _iso("created_at"),
+                "updated_at": _iso("updated_at"),
+                "symbols":    [str(s).upper() for s in (getattr(item, "symbols", None) or [])],
+            })
+        return out
+
+    # ── Market data ───────────────────────────────────────────────────────────
+
+    def get_current_price(self, symbol: str) -> Optional[float]:
+        """Latest trade price; None on failure."""
+        try:
+            from alpaca.data.requests import StockLatestTradeRequest
+            req = StockLatestTradeRequest(
+                symbol_or_symbols=symbol,
+                feed=_make_data_feed(config.ALPACA_DATA_FEED),
+            )
+            resp = self.data.get_stock_latest_trade(req)
+            trade = resp.get(symbol) if isinstance(resp, dict) else None
+            return float(trade.price) if trade else None
+        except Exception as e:
+            log.debug(f"{symbol}: latest trade lookup failed — {e}")
+            return None

@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alpaca Agent</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--sidebar:#161b22;--panel:#1c2128;--border:#30363d;
+  --text:#e6edf3;--muted:#8b949e;--dim:#484f58;
+  --green:#3fb950;--red:#f85149;--amber:#d29922;--blue:#58a6ff;
+  --mono:"SF Mono","Cascadia Code","Fira Code",ui-monospace,monospace;
+}
+html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px}
+button{font:inherit;cursor:pointer}
+
+/* ── Layout ── */
+#app{display:grid;grid-template-columns:220px 1fr;height:100vh}
+
+/* ── Sidebar ── */
+#sidebar{
+  background:var(--sidebar);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;padding:16px 14px;gap:14px;overflow-y:auto
+}
+.brand-name{font-size:15px;font-weight:600;letter-spacing:-.02em}
+.brand-sub{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-top:2px}
+.divider{height:1px;background:var(--border);flex-shrink:0}
+.stat{display:flex;flex-direction:column;gap:3px}
+.stat-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-weight:600}
+.stat-value{font-family:var(--mono);font-size:16px;font-weight:600}
+.stat-value.green{color:var(--green)}
+.stat-value.red{color:var(--red)}
+.stat-value.muted{color:var(--muted)}
+.pill{
+  display:inline-flex;align-items:center;gap:5px;
+  font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;
+  width:fit-content;margin-top:2px
+}
+.pill.bull{background:rgba(63,185,80,.15);color:var(--green)}
+.pill.bear{background:rgba(248,81,73,.15);color:var(--red)}
+.pill.choppy{background:rgba(139,148,158,.12);color:var(--muted)}
+.pill.open{background:rgba(63,185,80,.15);color:var(--green)}
+.pill.closed{background:rgba(139,148,158,.12);color:var(--muted)}
+.dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.dot.green{background:var(--green)}
+.dot.red{background:var(--red)}
+.dot.amber{background:var(--amber)}
+.dot.gray{background:var(--dim)}
+#last-updated{font-size:10px;color:var(--dim);margin-top:auto;padding-top:8px}
+
+/* ── Chat area ── */
+#chat{display:flex;flex-direction:column;height:100vh;min-width:0}
+#chat-header{
+  padding:12px 16px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:8px;
+  font-size:12px;color:var(--muted);flex-shrink:0
+}
+#chat-header .status-dot{width:7px;height:7px;border-radius:50%;background:var(--green);
+  box-shadow:0 0 6px var(--green);flex-shrink:0}
+#chat-header .status-dot.error{background:var(--red);box-shadow:0 0 6px var(--red)}
+
+/* ── Messages ── */
+#messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
+#messages::-webkit-scrollbar{width:4px}
+#messages::-webkit-scrollbar-track{background:transparent}
+#messages::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+
+.msg{display:flex;flex-direction:column;gap:4px;max-width:78%}
+.msg.agent{align-self:flex-start}
+.msg.user{align-self:flex-end}
+.msg-meta{font-size:10px;color:var(--dim);padding:0 4px}
+.msg.user .msg-meta{text-align:right}
+
+.bubble{
+  padding:9px 13px;border-radius:12px;
+  font-size:13px;line-height:1.55;color:var(--text)
+}
+.bubble.agent{
+  background:var(--panel);border:1px solid var(--border);
+  border-radius:2px 12px 12px 12px
+}
+.bubble.agent.alert{border-left:2px solid var(--amber)}
+.bubble.agent.trade{border-left:2px solid var(--green)}
+.bubble.agent.danger{border-left:2px solid var(--red)}
+.bubble.user{
+  background:var(--blue);color:#fff;
+  border-radius:12px 12px 2px 12px
+}
+.bubble strong{font-weight:600}
+.bubble .mono{font-family:var(--mono);font-size:12px}
+
+.trade-actions{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.btn-accept{
+  font-size:11px;font-weight:600;padding:5px 14px;border-radius:6px;border:none;
+  background:var(--green);color:#0d1117
+}
+.btn-accept:hover{opacity:.85}
+.btn-decline{
+  font-size:11px;font-weight:600;padding:5px 14px;border-radius:6px;
+  background:transparent;border:1px solid var(--border);color:var(--muted)
+}
+.btn-decline:hover{border-color:var(--red);color:var(--red)}
+.btn-done{
+  font-size:11px;padding:5px 14px;border-radius:6px;
+  background:var(--panel);border:1px solid var(--border);color:var(--dim);cursor:default
+}
+
+/* Typing indicator */
+#typing{display:none;align-self:flex-start;padding:10px 14px}
+#typing span{
+  display:inline-block;width:6px;height:6px;border-radius:50%;
+  background:var(--dim);margin:0 2px;
+  animation:bounce .9s infinite
+}
+#typing span:nth-child(2){animation-delay:.15s}
+#typing span:nth-child(3){animation-delay:.3s}
+@keyframes bounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-5px)}}
+
+/* ── Quick commands ── */
+#quick-bar{
+  padding:8px 16px 6px;display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0;
+  border-top:1px solid var(--border)}
+.qbtn{
+  font-size:11px;padding:4px 11px;border-radius:16px;
+  background:var(--panel);border:1px solid var(--border);color:var(--muted)
+}
+.qbtn:hover{border-color:var(--blue);color:var(--blue)}
+
+/* ── Input ── */
+#input-bar{
+  padding:10px 16px 14px;display:flex;gap:8px;align-items:center;flex-shrink:0
+}
+#msg-input{
+  flex:1;background:var(--panel);border:1px solid var(--border);
+  border-radius:22px;padding:9px 16px;color:var(--text);font-size:13px;
+  outline:none
+}
+#msg-input::placeholder{color:var(--dim)}
+#msg-input:focus{border-color:var(--blue)}
+#send-btn{
+  width:36px;height:36px;border-radius:50%;background:var(--blue);border:none;
+  color:#fff;font-size:16px;display:flex;align-items:center;justify-content:center;
+  flex-shrink:0
+}
+#send-btn:hover{opacity:.85}
+#send-btn:disabled{background:var(--panel);border:1px solid var(--border);color:var(--dim);opacity:1}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Sidebar ── -->
+  <aside id="sidebar">
+    <div>
+      <div class="brand-name">Alpaca</div>
+      <div class="brand-sub">Paper · Agent</div>
+    </div>
+    <div class="divider"></div>
+    <div class="stat">
+      <span class="stat-label">Equity</span>
+      <span class="stat-value" id="s-equity">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Daily P&amp;L</span>
+      <span class="stat-value" id="s-pnl">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Cash</span>
+      <span class="stat-value muted" id="s-cash">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Positions</span>
+      <span class="stat-value muted" id="s-positions">—</span>
+    </div>
+    <div class="divider"></div>
+    <div class="stat">
+      <span class="stat-label">Regime</span>
+      <div id="s-regime"><span class="pill choppy"><span class="dot gray"></span>—</span></div>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Market</span>
+      <div id="s-market"><span class="pill closed"><span class="dot gray"></span>—</span></div>
+    </div>
+    <div id="last-updated"></div>
+  </aside>
+
+  <!-- ── Chat ── -->
+  <main id="chat">
+    <div id="chat-header">
+      <span class="status-dot" id="hdr-dot"></span>
+      <span id="header-status">Connecting…</span>
+    </div>
+
+    <div id="messages">
+      <div id="typing"><span></span><span></span><span></span></div>
+    </div>
+
+    <div id="quick-bar">
+      <button class="qbtn" onclick="quickSend('what is my p&l today')">P&amp;L today</button>
+      <button class="qbtn" onclick="quickSend('show me the top signals')">Top signals</button>
+      <button class="qbtn" onclick="quickSend('what are my open positions')">Positions</button>
+      <button class="qbtn" onclick="quickSend('what is the current regime')">Regime</button>
+      <button class="qbtn" onclick="quickSend('exit all positions now')">Exit all</button>
+    </div>
+
+    <div id="input-bar">
+      <input id="msg-input" type="text" placeholder="Ask anything or give a command…" autocomplete="off">
+      <button id="send-btn" onclick="handleSend()" title="Send">&#9658;</button>
+    </div>
+  </main>
+
+</div>
+
+<script>
+const BASE = '';
+const API_KEY = 'CHANGE_ME';
+
+// Wrap fetch to always include the API key header
+const apiFetch = (path, opts = {}) => fetch(`${BASE}${path}`, {
+  ...opts,
+  headers: { 'X-API-Key': API_KEY, ...(opts.headers || {}) }
+});
+
+let prevState = null;
+let initialized = false;
+
+const $ = id => document.getElementById(id);
+const msgs = $('messages');
+const typing = $('typing');
+
+function fmt$(n) {
+  if (n == null || isNaN(n)) return '—';
+  return '$' + Math.abs(n).toLocaleString('en-US', {minimumFractionDigits:0, maximumFractionDigits:0});
+}
+function fmtPnl(n) {
+  if (n == null || isNaN(n)) return '—';
+  const sign = n >= 0 ? '+' : '-';
+  return sign + '$' + Math.abs(n).toLocaleString('en-US', {minimumFractionDigits:0, maximumFractionDigits:0});
+}
+function now12() {
+  return new Date().toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', hour12:true});
+}
+
+// ── Add a chat bubble ─────────────────────────────────────────────────────────
+function addMsg(html, role='agent', variant='') {
+  typing.remove();
+  const wrap = document.createElement('div');
+  wrap.className = `msg ${role}`;
+  const label = role === 'agent' ? 'Agent' : 'You';
+  wrap.innerHTML = `
+    <span class="msg-meta">${label} · ${now12()}</span>
+    <div class="bubble ${role} ${variant}">${html}</div>`;
+  msgs.appendChild(wrap);
+  msgs.appendChild(typing);
+  msgs.scrollTop = msgs.scrollHeight;
+  return wrap;
+}
+
+// ── Trade proposal card ───────────────────────────────────────────────────────
+function addTradeProposal(orders, context) {
+  if (!orders || !orders.length) return;
+  const uid = 'tp_' + Date.now();
+  const lines = orders.map(o => {
+    const side = (o.side || o.action || '').toUpperCase();
+    const val  = o.estimated_value ? ' — est. <strong>$' + parseInt(o.estimated_value).toLocaleString() + '</strong>' : '';
+    return `<strong class="mono">${side} ${o.qty} ${o.symbol}</strong>${val}`;
+  }).join('<br>');
+
+  const note = context ? `<span style="color:var(--muted);font-size:12px;display:block;margin-top:4px">${context}</span>` : '';
+  const html = `${lines}${note}
+    <div class="trade-actions" id="${uid}">
+      <button class="btn-accept" onclick="acceptTrade(${JSON.stringify(orders).replace(/"/g,'&quot;')}, '${uid}')">Accept</button>
+      <button class="btn-decline" onclick="declineTrade('${uid}')">Decline</button>
+    </div>`;
+  addMsg(html, 'agent', 'trade');
+}
+
+function acceptTrade(orders, uid) {
+  document.getElementById(uid).innerHTML = '<button class="btn-done" disabled>Submitting…</button>';
+  apiFetch('/api/lab/orders/place', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({orders})
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.ok) {
+      const filled = (data.submitted || []).map(o => `${(o.side||'').toUpperCase()} ${o.qty} ${o.symbol}`).join(', ');
+      document.getElementById(uid).innerHTML = '<button class="btn-done" disabled>✓ Submitted</button>';
+      addMsg(`Order placed: <strong>${filled || 'see positions'}</strong>.`, 'agent', 'trade');
+      setTimeout(poll, 3000);
+    } else {
+      document.getElementById(uid).innerHTML = '<button class="btn-done" disabled>Failed</button>';
+      addMsg(`Order failed: ${(data.errors||[{error:'unknown'}])[0].error}`, 'agent', 'danger');
+    }
+  })
+  .catch(e => {
+    document.getElementById(uid).innerHTML = '<button class="btn-done" disabled>Error</button>';
+    addMsg(`Error: ${e.message}`, 'agent', 'danger');
+  });
+}
+
+function declineTrade(uid) {
+  document.getElementById(uid).innerHTML = '<button class="btn-done" disabled>Declined</button>';
+  addMsg('Holding cash.', 'agent');
+}
+
+// ── Sidebar ───────────────────────────────────────────────────────────────────
+function updateSidebar(data) {
+  const acct  = data.account  || {};
+  const acctg = data.accounting || {};
+  const clock = data.clock    || {};
+  const scores = data.live_scores || {};
+
+  const equity  = parseFloat(acct.equity || 0);
+  const lastEq  = parseFloat(acct.last_equity || equity);
+  const dailyPnl = equity - lastEq;
+  const openPnl  = parseFloat(acctg.unrealized_pnl || 0);
+  const cash    = parseFloat(acct.cash || 0);
+  const posCount = parseInt(acctg.filled_position_count || 0);
+  const regime  = scores.regime || 'CHOPPY';
+  const isOpen  = !!clock.is_open;
+
+  $('s-equity').textContent = fmt$(equity);
+
+  const displayPnl = openPnl !== 0 ? openPnl : dailyPnl;
+  const pnlEl = $('s-pnl');
+  pnlEl.textContent = fmtPnl(displayPnl);
+  pnlEl.className = 'stat-value ' + (displayPnl >= 0 ? 'green' : 'red');
+
+  $('s-cash').textContent = fmt$(cash);
+  $('s-positions').textContent = posCount === 0 ? 'None' : `${posCount} open`;
+
+  const rClass = regime === 'BULL' ? 'bull' : regime === 'BEAR' ? 'bear' : 'choppy';
+  const rDot   = regime === 'BULL' ? 'green' : regime === 'BEAR' ? 'red' : 'gray';
+  $('s-regime').innerHTML = `<span class="pill ${rClass}"><span class="dot ${rDot}"></span>${regime}</span>`;
+
+  if (isOpen) {
+    $('s-market').innerHTML = `<span class="pill open"><span class="dot green"></span>Open</span>`;
+  } else {
+    let nextStr = '—';
+    if (clock.next_open) {
+      nextStr = new Date(clock.next_open).toLocaleDateString('en-US',
+        {weekday:'short', hour:'2-digit', minute:'2-digit', hour12:true});
+    }
+    $('s-market').innerHTML = `<span class="pill closed"><span class="dot gray"></span>Closed · ${nextStr}</span>`;
+  }
+
+  $('last-updated').textContent = 'Updated ' + now12();
+}
+
+// ── Proactive change detection ────────────────────────────────────────────────
+function detectChanges(nd) {
+  const pd = prevState;
+  const newRegime = (nd.live_scores || {}).regime;
+  const oldRegime = (pd.live_scores || {}).regime;
+
+  if (newRegime && oldRegime && newRegime !== oldRegime) {
+    const map = {
+      CHOPPY: 'alert',
+      BULL:   'trade',
+      BEAR:   'danger'
+    };
+    const msgs_text = {
+      BULL:   `Regime shift: <strong>${oldRegime} → BULL</strong>. Momentum building — running signal scan.`,
+      BEAR:   `Regime shift: <strong>${oldRegime} → BEAR</strong>. Bear instruments now eligible.`,
+      CHOPPY: `Regime shift: <strong>${oldRegime} → CHOPPY</strong>. No new entries — holding cash until trend forms.`
+    };
+    addMsg(msgs_text[newRegime] || `Regime changed: ${newRegime}`, 'agent', map[newRegime] || '');
+  }
+
+  const newCount = parseInt((nd.accounting || {}).filled_position_count || 0);
+  const oldCount = parseInt((pd.accounting || {}).filled_position_count || 0);
+  if (newCount > oldCount) {
+    addMsg(`${newCount - oldCount} new position${newCount - oldCount > 1 ? 's' : ''} opened. ${newCount} total.`, 'agent', 'trade');
+  } else if (newCount < oldCount && oldCount > 0) {
+    const pnl = parseFloat((nd.accounting || {}).unrealized_pnl || 0);
+    addMsg(`Position${oldCount - newCount > 1 ? 's' : ''} closed. Open P&amp;L: <strong>${fmtPnl(pnl)}</strong>`, 'agent');
+  }
+
+  const newNews = (nd.news_risk || []).map(n => n.symbol || n.ticker);
+  const oldNews = (pd.news_risk || []).map(n => n.symbol || n.ticker);
+  for (const nr of (nd.news_risk || [])) {
+    const sym = nr.symbol || nr.ticker;
+    if (!oldNews.includes(sym)) {
+      addMsg(`⚠ News risk: <strong class="mono">${sym}</strong> — "${nr.headline || nr.summary || 'check news'}"`, 'agent', 'alert');
+    }
+  }
+}
+
+// ── Initial greeting ──────────────────────────────────────────────────────────
+function postGreeting(data) {
+  const acct   = data.account || {};
+  const acctg  = data.accounting || {};
+  const clock  = data.clock || {};
+  const scores = data.live_scores || {};
+  const equity = parseFloat(acct.equity || 0);
+  const lastEq = parseFloat(acct.last_equity || equity);
+  const pnl    = equity - lastEq;
+  const posCount = parseInt(acctg.filled_position_count || 0);
+  const regime = scores.regime || '—';
+  const isOpen = !!clock.is_open;
+
+  const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+  let msg = `Agent online. Market is <strong>${isOpen ? 'open' : 'closed'}</strong>. `;
+  msg += `Equity <strong>${fmt$(equity)}</strong>, P&amp;L <strong style="color:${pnlColor}">${fmtPnl(pnl)}</strong>. `;
+  msg += `Regime: <strong>${regime}</strong>. `;
+  msg += posCount > 0
+    ? `${posCount} position${posCount > 1 ? 's' : ''} open.`
+    : 'No open positions — cash ready.';
+  addMsg(msg, 'agent');
+
+  for (const nr of (data.news_risk || [])) {
+    const sym = nr.symbol || nr.ticker;
+    addMsg(`⚠ News risk on <strong class="mono">${sym}</strong>: "${nr.headline || ''}"`, 'agent', 'alert');
+  }
+
+  if (isOpen && regime !== 'CHOPPY' && posCount === 0) {
+    setTimeout(() => {
+      addMsg(`${regime} regime with no open positions. Type <em>"show me the top signals"</em> to scan for entries.`, 'agent', 'trade');
+    }, 500);
+  }
+}
+
+// ── Poll /api/lab/overview every 30s ─────────────────────────────────────────
+async function poll() {
+  try {
+    const r = await apiFetch('/api/lab/overview');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    if (!data.ok) throw new Error('API returned ok:false');
+
+    updateSidebar(data);
+    if (!initialized) {
+      $('hdr-dot').classList.remove('error');
+      $('header-status').textContent = `Agent active — ${(data.clock||{}).is_open ? 'monitoring market' : 'market closed'}`;
+      postGreeting(data);
+      initialized = true;
+    } else {
+      detectChanges(data);
+    }
+    prevState = data;
+  } catch(e) {
+    $('hdr-dot').classList.add('error');
+    $('header-status').textContent = 'Disconnected — retrying…';
+    if (!initialized) {
+      addMsg(`Cannot reach server: ${e.message}. Retrying in 30s…`, 'agent', 'danger');
+      initialized = true; // only show once
+    }
+  }
+}
+
+// ── Chat send ─────────────────────────────────────────────────────────────────
+async function sendMessage(text) {
+  addMsg(text.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])), 'user');
+  $('msg-input').value = '';
+  $('send-btn').disabled = true;
+  typing.style.display = 'flex';
+  msgs.scrollTop = msgs.scrollHeight;
+
+  try {
+    const r = await apiFetch('/api/lab/chat/message', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text})
+    });
+    const data = await r.json();
+    typing.style.display = 'none';
+
+    if (data.trade_proposal) {
+      const tp = data.trade_proposal;
+      addTradeProposal(tp.orders, tp.context || tp.regime || null);
+    } else {
+      addMsg(data.reply || data.error || '(no response)', 'agent',
+             data.variant || '');
+    }
+
+    poll();
+  } catch(e) {
+    typing.style.display = 'none';
+    addMsg(`Request failed: ${e.message}`, 'agent', 'danger');
+  } finally {
+    $('send-btn').disabled = false;
+    $('msg-input').focus();
+  }
+}
+
+function handleSend() {
+  const t = $('msg-input').value.trim();
+  if (t) sendMessage(t);
+}
+
+function quickSend(text) {
+  $('msg-input').value = text;
+  handleSend();
+}
+
+$('msg-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+});
+
+// ── Start ─────────────────────────────────────────────────────────────────────
+poll();
+setInterval(poll, 30000);
+</script>
+</body>
+</html>

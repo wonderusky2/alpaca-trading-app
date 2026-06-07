@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: alpaca-trader
+  namespace: alpaca-trader
+  labels:
+    app: alpaca-trader
+spec:
+  schedule: "*/5 * * * 1-5"
+  timeZone: "America/New_York"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 240
+      template:
+        metadata:
+          labels:
+            app: alpaca-trader
+        spec:
+          restartPolicy: Never
+          serviceAccountName: alpaca-trader-sa
+          containers:
+            - name: trader
+              image: gcr.io/pure-tribute-440710-r8/alpaca-trader:latest
+              imagePullPolicy: Always
+              command: ["python", "trader.py"]
+              envFrom:
+                - configMapRef:
+                    name: alpaca-trader-config
+                - secretRef:
+                    name: alpaca-trader-secrets
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "256Mi"

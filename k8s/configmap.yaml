@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alpaca-trader-config
+  namespace: alpaca-trader
+data:
+  ALPACA_DATA_FEED: "iex"
+  STATE_DIR: "/data/state"
+  FLASK_HOST: "0.0.0.0"
+  FLASK_PORT: "5001"
+  # Set to "false" to lock dashboard order submission
+  FUND_MANAGER_ORDER_SUBMISSION_ENABLED: "true"

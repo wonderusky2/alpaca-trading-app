@@ -1,0 +1,16 @@
+# Persistent state: lab_events.jsonl, lab_peak_equity.json
+# Mounted on the server Deployment at /data/state.
+# CronJob (trader.py) reads state from the Alpaca API directly — no PVC needed.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: alpaca-trader-state
+  namespace: alpaca-trader
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # GCP standard persistent disk. Change to "premium-rwo" for SSD.
+  storageClassName: standard-rwo

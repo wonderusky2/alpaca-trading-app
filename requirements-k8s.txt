@@ -1,0 +1,9 @@
+# Server + trader dependencies for the GCP container image.
+# Mac-only packages (rumps, py2app) are intentionally excluded.
+yfinance>=0.2.40
+google-generativeai>=0.8.0
+filelock>=3.13.0
+requests>=2.31.0
+alpaca-py>=0.8.0
+flask>=3.0.0
+flask-cors>=4.0.0
