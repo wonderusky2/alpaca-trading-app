@@ -44,8 +44,9 @@ BULL_UNIVERSE = BULL_ETF + MOMENTUM_STOCKS
 BEAR_UNIVERSE = BEAR_ETF
 ALL_SYMBOLS   = ["SPY", "QQQ", "VIX"] + BULL_UNIVERSE + BEAR_UNIVERSE
 
-MIN_CONVICTION = 65   # 0-100 scale; ≥65 required to generate a signal
-MAX_POSITIONS  = 5    # max concurrent positions
+MIN_CONVICTION          = 65   # 0-100 scale; ≥65 required to generate a signal
+BEAR_ETF_MIN_CONVICTION = 50   # lower bar for bear ETFs in BEAR regime — they lag at the start of a move
+MAX_POSITIONS           = 5    # max concurrent positions
 
 # ── Indicator weights (default) ───────────────────────────────────────────────
 # Each weight = max points contributed when signal is fully aligned.
@@ -685,7 +686,12 @@ class TradeSignal:
 
 
 # ── Main signal scan ──────────────────────────────────────────────────────────
-def get_signals(quotes: dict, profile_name: str = "current", min_conviction: int | None = None) -> list[TradeSignal]:
+def get_signals(
+    quotes: dict,
+    profile_name: str = "current",
+    min_conviction: int | None = None,
+    bear_etf_min_conviction: int | None = None,
+) -> list[TradeSignal]:
     """
     Scan all symbols, return top signals ranked by conviction.
 
@@ -696,7 +702,8 @@ def get_signals(quotes: dict, profile_name: str = "current", min_conviction: int
     regime  = detect_regime(quotes)
     profile = VARIANT_PROFILES.get(profile_name) or {}
 
-    min_conv   = min_conviction if min_conviction is not None else int(profile.get("conviction_override",  MIN_CONVICTION))
+    min_conv      = min_conviction if min_conviction is not None else int(profile.get("conviction_override", MIN_CONVICTION))
+    bear_etf_conv = bear_etf_min_conviction if bear_etf_min_conviction is not None else BEAR_ETF_MIN_CONVICTION
     max_pos    = int(profile.get("max_pos_override",     MAX_POSITIONS))
     etf_only   = bool(profile.get("etf_only",           False))
     ind_weights = {k: v for k, v in profile.items() if k not in _PROFILE_PARAM_KEYS}
@@ -713,7 +720,10 @@ def get_signals(quotes: dict, profile_name: str = "current", min_conviction: int
     for sym in universe:
         score, breakdown = score_symbol(sym, quotes, regime, weights=ind_weights)
         all_scores.append((sym, score))
-        if score < min_conv:
+        # Bear ETFs get a lower threshold in BEAR regime — their own technicals lag
+        # at the start of a down move; the regime call is the primary signal.
+        threshold = bear_etf_conv if (regime == "BEAR" and sym in BEAR_ETF) else min_conv
+        if score < threshold:
             continue
 
         # Hard veto: MACD negative and falling = momentum against us — no entry

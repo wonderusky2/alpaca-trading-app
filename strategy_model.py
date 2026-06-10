@@ -15,7 +15,8 @@ VARIANT_HISTORY_PATH  = STATE_DIR / "variant_history.json"
 DEFAULT_MODEL = {
     "version": 1,
     "generation": 0,
-    "min_conviction": 75,
+    "min_conviction": 63,
+    "bear_etf_min_conviction": 50,
     "max_positions": 3,
     "position_size_pct": 0.05,
     "trailing_stop_pct": 3.0,
@@ -31,7 +32,8 @@ DEFAULT_MODEL = {
 }
 
 BOUNDS = {
-    "min_conviction": (65, 90),
+    "min_conviction": (62, 72),          # cap at 72 — engine designed for 65, ≥75 kills bull signals
+    "bear_etf_min_conviction": (42, 60), # bear ETFs lag; too low = noise trades, too high = never enters
     "max_positions": (1, 5),
     "position_size_pct": (0.02, 0.08),
     "trailing_stop_pct": (1.5, 6.0),
@@ -49,6 +51,7 @@ def _clamp(value, low, high):
 def sanitize_model(model: dict) -> dict:
     clean = {**DEFAULT_MODEL, **(model or {})}
     clean["min_conviction"] = int(_clamp(int(clean["min_conviction"]), *BOUNDS["min_conviction"]))
+    clean["bear_etf_min_conviction"] = int(_clamp(int(clean.get("bear_etf_min_conviction", 50)), *BOUNDS["bear_etf_min_conviction"]))
     clean["max_positions"] = int(_clamp(int(clean["max_positions"]), *BOUNDS["max_positions"]))
     clean["position_size_pct"] = round(float(_clamp(float(clean["position_size_pct"]), *BOUNDS["position_size_pct"])), 4)
     clean["trailing_stop_pct"] = round(float(_clamp(float(clean["trailing_stop_pct"]), *BOUNDS["trailing_stop_pct"])), 2)

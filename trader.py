@@ -119,15 +119,49 @@ def _check_trailing_stops(client: AlpacaClient, positions: dict, quotes: dict, m
         hold_days = _holding_days(memory.get(sym) or {})
         reason = None
 
-        if pnl_pct <= -trailing_stop_pct:
+        # Technicals for context-aware exits
+        tech  = (quotes.get(sym) or {}).get("technicals") or {}
+        price = float(quotes.get(sym, {}).get("price") or 0)
+
+        # 1. Signal reversal: only exit when score is truly weak (<50), not just below
+        #    entry threshold — avoids stop-outs on single-tick noise.
+        current_score, _ = sg.score_symbol(sym, quotes, regime)
+        reversal_floor = int(model.get("signal_reversal_threshold", 50))
+        if 0 < current_score < reversal_floor:
+            reason = "signal_reversal"
+
+        # 2. Hard loss stop
+        elif pnl_pct <= -trailing_stop_pct:
             reason = "loss_stop"
+
+        # 3. Price closed below the day's opening price — intraday thesis broken
+        elif price > 0:
+            daily_open = float(quotes.get(sym, {}).get("daily_open") or 0)
+            if daily_open > 0 and price < daily_open:
+                reason = "below_day_open"
+
+        # 4. Price crossed below EMA21 — trend has turned
+        elif price > 0 and tech:
+            ema21 = float(tech.get("ema21") or 0)
+            if ema21 > 0 and price < ema21:
+                reason = "below_ema21"
+
+            # 5. Price >1% below VWAP — institutional flow has turned negative
+            elif float(tech.get("price_vs_vwap_pct") or 0) < -1.0:
+                reason = "below_vwap"
+
+        # 5. Profit giveback
         elif (
             peak_pnl_pct >= float(model.get("profit_lock_trigger_pct", 2.0))
             and giveback_pct >= float(model.get("profit_giveback_pct", 1.0))
         ):
             reason = "profit_giveback"
+
+        # 6. Stale hold
         elif hold_days >= int(model.get("max_holding_days", 2)):
             reason = "max_holding_days"
+
+        # 7. Regime flipped against the position
         elif bool(model.get("exit_on_regime_flip", True)) and _regime_against_position(sym, regime):
             reason = "regime_flip"
 
@@ -144,6 +178,7 @@ def _check_trailing_stops(client: AlpacaClient, positions: dict, quotes: dict, m
             notify.trade_sell(sym, qty, price, pnl, reason)
             log.info("Exit %s: SELL %d %s @ $%.2f (pnl=%.2f%% peak=%.2f%% hold=%dd P&L $%.2f)",
                      reason, qty, sym, price, pnl_pct, peak_pnl_pct, hold_days, pnl)
+            _record_sell(sym)
             exited.append(sym)
         except Exception as e:
             log.error("%s sell failed for %s: %s", reason, sym, e)
@@ -203,61 +238,115 @@ def run_eod_flat(client: AlpacaClient, positions: dict, quotes: dict) -> None:
 
 
 # ── Daily optimization ────────────────────────────────────────────────────────
-_LAST_OPT_PATH = strategy_model.STATE_DIR / "last_optimization.json"
+_LAST_OPT_PATH      = strategy_model.STATE_DIR / "last_optimization.json"
+_SELL_COOLDOWN_PATH = strategy_model.STATE_DIR / "sell_cooldown.json"
+_COOLDOWN_MINUTES   = 30
+
+
+def _load_sell_cooldowns() -> dict:
+    try:
+        return json.loads(_SELL_COOLDOWN_PATH.read_text(encoding="utf-8")) if _SELL_COOLDOWN_PATH.exists() else {}
+    except Exception:
+        return {}
+
+
+def _record_sell(sym: str) -> None:
+    cooldowns = _load_sell_cooldowns()
+    cooldowns[sym.upper()] = datetime.now(timezone.utc).isoformat()
+    try:
+        _SELL_COOLDOWN_PATH.write_text(json.dumps(cooldowns, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning("Could not save sell cooldown: %s", e)
+
+
+def _in_cooldown(sym: str) -> bool:
+    sold_at_str = _load_sell_cooldowns().get(sym.upper())
+    if not sold_at_str:
+        return False
+    try:
+        elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(sold_at_str)).total_seconds()
+        return elapsed < _COOLDOWN_MINUTES * 60
+    except Exception:
+        return False
 
 
 def _run_daily_optimization() -> None:
-    """Run variant backtest once per trading day; apply winner params to strategy model."""
+    """Run variant backtest weekly; apply winner only if it meaningfully beats 'current'.
+
+    Cadence : weekly (≥7 days since last run) — daily re-fitting chases noise.
+    Period  : 3M (~60 trading days) — 1M is statistically meaningless for 5 variants.
+    Margin  : winner must beat 'current' by ≥3.0 objective points; otherwise keep current.
+    """
     today = datetime.now(timezone.utc).date().isoformat()
     try:
         prev = json.loads(_LAST_OPT_PATH.read_text(encoding="utf-8")) if _LAST_OPT_PATH.exists() else {}
-        if prev.get("date") == today:
-            log.info("Daily optimization already ran today (%s); skipping.", today)
-            return
+        last_date_str = prev.get("date") or ""
+        if last_date_str:
+            try:
+                days_since = (
+                    datetime.now(timezone.utc).date()
+                    - datetime.fromisoformat(last_date_str).date()
+                ).days
+                if days_since < 7:
+                    log.info("Optimization ran %d day(s) ago — next run in %d day(s).", days_since, 7 - days_since)
+                    return
+            except Exception:
+                pass
     except Exception:
         pass
 
-    log.info("Running daily variant optimization for %s …", today)
+    log.info("Running weekly variant optimization for %s …", today)
     try:
-        result = bt.run_variants(period="1M")
+        result = bt.run_variants(period="3M")
         if not result.get("ok"):
             log.warning("run_variants returned ok=False: %s", result.get("error"))
             return
 
-        winner = result.get("winner") or "current"
-        obj = float(result.get("winner_objective") or 0.0)
-        ranked = result.get("ranked") or []
+        winner     = result.get("winner") or "current"
+        winner_obj = float(result.get("winner_objective") or 0.0)
+        ranked     = result.get("ranked") or []
 
-        # Apply winner's position-param overrides to strategy model
-        profile = sg.VARIANT_PROFILES.get(winner, {})
-        param_overrides = {k: v for k, v in profile.items() if k in sg._PROFILE_PARAM_KEYS}
-        model = strategy_model.load_model()
+        # Only switch variants if winner beats 'current' by a meaningful margin
+        variants    = result.get("variants") or {}
+        current_obj = float((variants.get("current") or {}).get("objective") or 0.0)
+        MIN_MARGIN  = 3.0
+
+        if winner != "current" and winner_obj <= current_obj + MIN_MARGIN:
+            log.info(
+                "Optimization: '%s' obj=%.2f vs current=%.2f — margin %.2f < %.2f required; keeping 'current'.",
+                winner, winner_obj, current_obj, winner_obj - current_obj, MIN_MARGIN,
+            )
+            winner = "current"
+
+        model   = strategy_model.load_model()
         updated = dict(model)
         updated["active_variant"] = winner
-        if "conviction_override" in param_overrides:
-            updated["min_conviction"] = int(param_overrides["conviction_override"])
-        if "max_pos_override" in param_overrides:
-            updated["max_positions"] = int(param_overrides["max_pos_override"])
-        if "hold_days_override" in param_overrides:
-            updated["max_holding_days"] = int(param_overrides["hold_days_override"])
-        if "stop_pct_override" in param_overrides:
-            updated["trailing_stop_pct"] = float(param_overrides["stop_pct_override"])
-        if "lock_trigger_override" in param_overrides:
-            updated["profit_lock_trigger_pct"] = float(param_overrides["lock_trigger_override"])
-        strategy_model.save_model(updated)
-        if param_overrides:
+
+        if winner != "current":
+            profile         = sg.VARIANT_PROFILES.get(winner, {})
+            param_overrides = {k: v for k, v in profile.items() if k in sg._PROFILE_PARAM_KEYS}
+            if "conviction_override" in param_overrides:
+                updated["min_conviction"] = int(param_overrides["conviction_override"])
+            if "max_pos_override" in param_overrides:
+                updated["max_positions"] = int(param_overrides["max_pos_override"])
+            if "hold_days_override" in param_overrides:
+                updated["max_holding_days"] = int(param_overrides["hold_days_override"])
+            if "stop_pct_override" in param_overrides:
+                updated["trailing_stop_pct"] = float(param_overrides["stop_pct_override"])
+            if "lock_trigger_override" in param_overrides:
+                updated["profit_lock_trigger_pct"] = float(param_overrides["lock_trigger_override"])
             log.info("Applied variant '%s' param overrides: %s", winner, param_overrides)
 
-        # Persist to prevent re-run same day
+        strategy_model.save_model(updated)
+
         _LAST_OPT_PATH.write_text(
-            json.dumps({"date": today, "winner": winner, "objective": obj, "ranked": ranked}, indent=2),
+            json.dumps({"date": today, "winner": winner, "objective": winner_obj, "ranked": ranked}, indent=2),
             encoding="utf-8",
         )
 
-        # iMessage alert
         ranked_str = ", ".join(f"{n}={o:.2f}" for n, o in (ranked or [])[:4])
-        notify.send(f"RHT optimize: winner={winner} obj={obj:.2f} [{ranked_str}]")
-        log.info("Daily optimization done: winner=%s obj=%.3f", winner, obj)
+        notify.send(f"RHT optimize: winner={winner} obj={winner_obj:.2f} current={current_obj:.2f} [{ranked_str}]")
+        log.info("Weekly optimization done: winner=%s obj=%.3f current=%.3f", winner, winner_obj, current_obj)
 
     except Exception as e:
         log.error("Daily optimization failed: %s", e)
@@ -319,10 +408,12 @@ def main() -> None:
              model.get("generation"), min_conviction, float(model.get("position_size_pct", POSITION_SIZE_PCT)) * 100)
 
     # ── Signal scoring ─────────────────────────────────────────────────────
-    # CHOPPY no longer blocks — signals come back at 50% size_mult
+    # CHOPPY = lowest signal-to-noise. Run exits but take no new positions.
     if regime == "CHOPPY":
-        log.info("CHOPPY — scanning for high-conviction setups at half size.")
-    trade_signals = [sig for sig in sg.get_signals(quotes) if sig.score >= min_conviction]
+        log.info("CHOPPY regime — no new entries today. Exits still monitored.")
+        return
+    bear_etf_min_conviction = int(model.get("bear_etf_min_conviction", sg.BEAR_ETF_MIN_CONVICTION))
+    trade_signals = sg.get_signals(quotes, min_conviction=min_conviction, bear_etf_min_conviction=bear_etf_min_conviction)
     log.info("Signals: %s", [(s.symbol, s.score) for s in trade_signals])
 
     if not trade_signals:
@@ -335,6 +426,9 @@ def main() -> None:
             log.info("Max positions (%d) reached.", max_positions); break
         if sig.symbol in positions:
             continue  # already holding
+        if _in_cooldown(sig.symbol):
+            log.info("Cooldown: %s sold within last %dm — skipping rebuy.", sig.symbol, _COOLDOWN_MINUTES)
+            continue
 
         price = quotes.get(sig.symbol, {}).get("price", 0)
         if price <= 0:

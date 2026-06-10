@@ -173,6 +173,11 @@ def _simulate_day(row: dict, rows: list[dict], model: dict, ind_weights: dict, e
     """
     quotes    = row["quotes"]
     regime    = sg.detect_regime(quotes)
+
+    # CHOPPY = no new entries (mirrors live trader behaviour)
+    if regime == "CHOPPY":
+        return 0.0, 0
+
     day_pnl   = 0.0
     trades    = 0
     size_mult = sg.regime_size_multiplier(regime)
@@ -182,10 +187,12 @@ def _simulate_day(row: dict, rows: list[dict], model: dict, ind_weights: dict, e
         etf_set  = set(sg.BULL_ETF + sg.BEAR_ETF)
         universe = [s for s in universe if s in etf_set]
 
+    bear_etf_conv = int(model.get("bear_etf_min_conviction", sg.BEAR_ETF_MIN_CONVICTION))
     signals = []
     for sym in universe:
         score, _ = sg.score_symbol(sym, quotes, regime, weights=ind_weights)
-        if score >= int(model["min_conviction"]):
+        threshold = bear_etf_conv if (regime == "BEAR" and sym in sg.BEAR_ETF) else int(model["min_conviction"])
+        if score >= threshold:
             signals.append((sym, score))
     signals.sort(key=lambda item: item[1], reverse=True)
     selected = signals[:int(model["max_positions"])]
