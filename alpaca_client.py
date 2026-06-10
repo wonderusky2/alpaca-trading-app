@@ -370,8 +370,10 @@ class AlpacaClient:
                             prev_close = price
 
                         vwap = 0.0
+                        daily_open = 0.0
                         if daily_bar:
                             vwap = float(getattr(daily_bar, "vwap", 0) or 0)
+                            daily_open = float(getattr(daily_bar, "open", 0) or 0)
 
                         if price and price > 0:
                             change_pct = (price - prev_close) / prev_close * 100 if prev_close else 0
@@ -380,6 +382,7 @@ class AlpacaClient:
                                 "prev_close": round(prev_close, 4),
                                 "change_pct": round(change_pct, 4),
                                 "vwap":       round(vwap, 4),
+                                "daily_open": round(daily_open, 4),
                             }
                     except Exception as se:
                         log.debug("Snapshot parse failed for %s: %s", sym, se)
@@ -419,9 +422,19 @@ class AlpacaClient:
         for i in range(0, len(clean), 50):
             batch = clean[i:i + 50]
             try:
+                # IEX free feed ignores `limit` without an explicit start date.
+                # Compute start from timeframe + limit so historical data is returned.
+                import datetime as _dt
+                _mins_per_bar = {
+                    "1min": 1, "5min": 5, "15min": 15, "1hour": 60, "1day": 390
+                }.get(timeframe.lower(), 15)
+                _trading_mins = limit * _mins_per_bar
+                _calendar_days = max(7, int(_trading_mins / 390 * 1.6) + 3)  # 60% buffer
+                _bar_start = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=_calendar_days)
                 req = StockBarsRequest(
                     symbol_or_symbols=batch,
                     timeframe=tf,
+                    start=_bar_start,
                     limit=limit,
                     feed=feed,
                     adjustment="raw",

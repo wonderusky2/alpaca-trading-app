@@ -54,8 +54,7 @@ struct DashboardView: View {
                 LatestActivity(
                     items: vm.activityItems,
                     isRefreshing: vm.isRefreshingActivity,
-                    error: vm.activityError,
-                    refresh: vm.refreshActivity
+                    error: vm.activityError
                 )
                 PositionsNowPanel(vm: vm)
             }
@@ -64,8 +63,11 @@ struct DashboardView: View {
         }
         .background(Color.appBackground)
         .toolbar(.hidden, for: .navigationBar)
+        .refreshable {
+            await vm.refreshAllAsync()
+        }
         .safeAreaInset(edge: .top) {
-            DashboardHeader(openChat: openChat, refresh: vm.refresh)
+            DashboardHeader(openChat: openChat)
                 .padding(.horizontal, 14)
                 .padding(.top, 2)
                 .padding(.bottom, 8)
@@ -76,7 +78,6 @@ struct DashboardView: View {
 
 struct DashboardHeader: View {
     let openChat: () -> Void
-    let refresh: () -> Void
 
     var body: some View {
         HStack(alignment: .center) {
@@ -84,10 +85,7 @@ struct DashboardHeader: View {
                 .font(.title2.weight(.bold))
                 .foregroundStyle(.primary)
             Spacer()
-            HStack(spacing: 8) {
-                HeaderIconButton(systemName: "text.bubble.fill", action: openChat, label: "Open chat")
-                HeaderIconButton(systemName: "arrow.clockwise", action: refresh, label: "Refresh")
-            }
+            HeaderIconButton(systemName: "text.bubble.fill", action: openChat, label: "Open chat")
         }
     }
 }
@@ -1969,7 +1967,6 @@ struct LatestActivity: View {
     let items: [ActivityLogItem]
     let isRefreshing: Bool
     let error: String?
-    let refresh: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1978,14 +1975,9 @@ struct LatestActivity: View {
                     .font(.caption.weight(.bold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button(action: refresh) {
-                    if isRefreshing {
-                        ProgressView()
-                    } else {
-                        Image(systemName: "arrow.clockwise")
-                    }
+                if isRefreshing {
+                    ProgressView().scaleEffect(0.8)
                 }
-                .accessibilityLabel("Refresh activity")
             }
             VStack(spacing: 0) {
                 if let error {
@@ -2087,6 +2079,12 @@ struct ActivityLogRow: View {
         }
     }
 
+    private func timeStampLabel(_ date: Date) -> String {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "MMM d, h:mm a"
+        return fmt.string(from: date)
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Circle()
@@ -2104,7 +2102,7 @@ struct ActivityLogRow: View {
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
                 if let time = item.time {
-                    Text(time, style: .time)
+                    Text(timeStampLabel(time))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }

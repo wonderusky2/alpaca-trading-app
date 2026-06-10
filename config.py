@@ -13,7 +13,7 @@ ALPACA_DATA_FEED: str = "iex"        # IEX (free); change to "sip" with subscrip
 MAX_DAILY_BAR_STALE_DAYS: int = 5    # reject stale daily bars older than this
 
 # ── Positions to ignore (phantom/delisted holdings) ───────────────────────────
-IGNORED_POSITIONS: list[str] = []
+IGNORED_POSITIONS: list[str] = ["DAWN"]   # stuck/delisted — exclude from counts and scoring
 
 # ── Risk / protect-gains parameters ──────────────────────────────────────────
 PROTECT_GAINS_ENABLED: bool = True

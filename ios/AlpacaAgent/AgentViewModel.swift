@@ -280,6 +280,13 @@ class AgentViewModel: ObservableObject {
         }
     }
 
+    func refreshAllAsync() async {
+        await fetchOverview()
+        await fetchPortfolioHistory(for: selectedPortfolioRange)
+        await fetchActivity()
+        await fetchVariants()
+    }
+
     func refreshActivity() {
         Task { await fetchActivity() }
     }
@@ -370,14 +377,9 @@ class AgentViewModel: ObservableObject {
             activityItems = Array(items.prefix(30))
             activityError = nil
         } catch {
+            // On failure, preserve the last good activity data — don't pollute the feed with error rows.
+            // activityError is shown as a non-intrusive indicator in the UI instead.
             activityError = error.localizedDescription
-            let item = ActivityLogItem(
-                title: "Activity refresh failed",
-                detail: error.localizedDescription,
-                time: Date(),
-                variant: .danger
-            )
-            activityItems = [item] + activityItems
         }
     }
 
@@ -909,13 +911,14 @@ private func anyDate(_ v: Any?) -> Date? {
     case let d as Double:
         return Date(timeIntervalSince1970: d)
     case let s as String:
+        // Try with fractional seconds first (Python isoformat includes microseconds)
+        let isoFrac = ISO8601DateFormatter()
+        isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = isoFrac.date(from: s) { return date }
+        // Fallback: no fractional seconds
         let iso = ISO8601DateFormatter()
-        if let date = iso.date(from: s) {
-            return date
-        }
-        if let unix = Double(s) {
-            return Date(timeIntervalSince1970: unix)
-        }
+        if let date = iso.date(from: s) { return date }
+        if let unix = Double(s) { return Date(timeIntervalSince1970: unix) }
         return nil
     default:
         return nil

@@ -139,9 +139,45 @@ def get_client() -> AlpacaClient:
 _overview_cache:     dict = {"ts": 0.0, "data": None}
 _live_scores_cache:  dict = {"ts": 0.0, "data": None}
 _news_cache:         dict = {"ts": 0.0, "data": {}, "symbols": set()}   # symbol → articles
-_OVERVIEW_TTL   = 30
-_LIVE_SCORE_TTL = 300
-_NEWS_TTL       = 600
+_OVERVIEW_TTL      = 30
+_LIVE_SCORE_TTL    = 300
+_NEWS_TTL          = 600
+_live_scores_lock  = threading.Lock()   # prevent overlapping score runs
+
+# ── Background live-score refresh loop ────────────────────────────────────────
+def _live_score_refresh_loop() -> None:
+    """Auto-refresh live scores every 10 min during market hours, hourly otherwise.
+    Runs as a daemon thread started at server startup.
+    """
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
+    MARKET_INTERVAL = 10 * 60   # 10 min during market hours
+
+    def _market_open() -> bool:
+        now = datetime.now(_ET)
+        if now.weekday() >= 5:
+            return False
+        mins = now.hour * 60 + now.minute
+        return 570 <= mins < 960   # 9:30 AM – 4:00 PM ET
+
+    # Stagger first run by 15 s to let the server finish startup
+    time.sleep(15)
+    log.info("live-score refresh loop started")
+    while True:
+        if _market_open():
+            try:
+                if _live_scores_lock.acquire(blocking=False):
+                    try:
+                        _run_live_scores()
+                    finally:
+                        _live_scores_lock.release()
+            except Exception as e:
+                log.warning("live-score refresh loop error: %s", e)
+            time.sleep(MARKET_INTERVAL)
+        else:
+            time.sleep(60)   # check every minute until market opens
+
+threading.Thread(target=_live_score_refresh_loop, daemon=True, name="live-score-refresh").start()
 
 # ── Portfolio event detection state ────────────────────────────────────────────
 _last_event_state: dict = {
@@ -345,6 +381,8 @@ def _build_accounting(
     live_scores: dict | None = None,
 ) -> dict:
     equity   = float((account or {}).get("equity") or 0)
+    _model   = strategy_model.load_model()
+    _target_wt_pct = float(_model.get("position_size_pct", 0.05)) * 100
     open_ids = {str(o.get("id")) for o in (open_orders or [])}
     all_orders = list(open_orders or []) + [
         o for o in (recent_orders or []) if str(o.get("id")) not in open_ids
@@ -397,10 +435,10 @@ def _build_accounting(
             "cost_basis":        round(abs(qty * entry_px), 2),
             "current_value":     round(mkt_val, 2),
             "gross_value":       round(abs(mkt_val), 2),
-            "target_value":      0,
-            "target_weight_pct": 0,
+            "target_value":      round(equity * float(_model.get("position_size_pct", 0.05)), 2),
+            "target_weight_pct": round(_target_wt_pct, 2),
             "current_weight_pct": round(cur_wt, 2),
-            "drift_pct":         round(cur_wt, 2),
+            "drift_pct":         round(cur_wt - _target_wt_pct, 2),
             "unrealized_pnl":    round(pnl, 2),
             "unrealized_pnl_pct": round(pnl_pct, 2),
             "contribution_bps":  round((pnl / equity) * 10000, 1) if equity else 0,
@@ -1174,6 +1212,9 @@ class DecisionCoordinator:
 
     def overview(self) -> dict:
         live_scores = self.market_news.live_scores(force=False)
+        if live_scores is None:
+            threading.Thread(target=_run_live_scores, daemon=True).start()
+            live_scores = _live_scores_cache.get("data")
         # Score held positions FIRST so exit recommendations can use signal data
         regime_str = str((live_scores or {}).get("regime") or "CHOPPY").upper()
         # We need the position list — do a quick positions fetch first
@@ -1358,8 +1399,12 @@ def _portfolio_narrative(
         why.append(f"{len(exits)} position{'s are' if len(exits)>1 else ' is'} triggering exit rules — acting on them protects what you've made.")
 
     if not pos_count:
-        bias = "looking bullish" if avg_score >= 60 else "looking bearish" if avg_score <= 40 else "mixed"
-        why.append(f"You're fully in cash. Market signals are {bias}.")
+        if avg_score == 0:
+            # No signals loaded yet — don't falsely call the market "bearish"
+            why.append("You're fully in cash. Signal scan is running — entries appear when conditions are met.")
+        else:
+            bias = "looking bullish" if avg_score >= 60 else "looking bearish" if avg_score <= 40 else "mixed"
+            why.append(f"You're fully in cash. Market signals are {bias}.")
 
     # ── Next — what to do, in plain English ───────────────────────────────────
     next_actions: list[str] = []
@@ -1371,16 +1416,21 @@ def _portfolio_narrative(
         next_actions.append(f"Sell the {n} position{'s' if n>1 else ''} that are triggering exit rules.")
 
     if not next_actions:
-        if regime == "BULL" and cash_pct > 25 and avg_score >= min_conviction:
-            next_actions.append(f"Market is trending up and you have {cash_pct:.0f}% in cash — good time to look for new entries.")
+        if regime == "BULL" and cash_pct > 25:
+            if avg_score >= min_conviction:
+                next_actions.append(f"Market is trending up and you have {cash_pct:.0f}% in cash — good time to look for new entries.")
+            else:
+                next_actions.append(f"Market is BULL — scanner is looking for high-conviction entries. {cash_pct:.0f}% cash ready to deploy.")
         elif regime == "BEAR" and pos_count > 0:
             next_actions.append("Market is heading down — tighten your stops and consider reducing exposure.")
         elif regime == "BEAR":
             next_actions.append("Market is heading down. Stay in cash and wait for the trend to reverse.")
         elif pos_count > 0:
             next_actions.append("Market is choppy. Hold what you have and avoid adding new positions.")
+        elif regime in ("CHOPPY", "CHOP"):
+            next_actions.append("Market is choppy. Waiting for a clearer trend before deploying capital.")
         else:
-            next_actions.append("Stay in cash. Wait for a clear market trend before investing.")
+            next_actions.append("Waiting for market data before making a call.")
 
     if news_risk and not any("bad news" in a.lower() or "news" in a.lower() for a in next_actions):
         next_actions.append("Review the news-hit positions before making any moves.")
@@ -1917,17 +1967,9 @@ def api_lab_chat_message():
     cache_snap = _overview_cache.get("data")
     if not cache_snap:
         try:
-            _client_inst = get_client()
-            _positions   = _client_inst.get_positions()
-            _open_orders = _client_inst.get_open_orders()
-            _recent      = _client_inst.get_recent_orders(limit=50)
-            _account     = _client_inst.get_account()
-            _accounting  = _build_accounting(_positions, _open_orders, _recent, _account, None)
-            cache_snap = {
-                "account":    _account,
-                "accounting": _accounting,
-                "live_scores": _live_scores_cache.get("data"),
-            }
+            cache_snap = _coordinator.overview()
+            _overview_cache["ts"]   = time.time()
+            _overview_cache["data"] = cache_snap
         except Exception as e:
             log.warning("chat context fallback fetch failed: %s", e)
             cache_snap = {}
@@ -1992,7 +2034,7 @@ def api_lab_chat_message():
 
     # Technicals for held positions
     pos_tech_lines = []
-    all_scores = {s.get("symbol", "?"): s for s in (scores_snap.get("all") or [])}
+    all_scores = {s.get("symbol", "?"): s for s in (scores_snap.get("signals") or scores_snap.get("top") or [])}
     for p in positions:
         sym  = p.get("symbol", "?")
         tech = (all_scores.get(sym) or {}).get("technicals") or {}
@@ -2007,6 +2049,15 @@ def api_lab_chat_message():
             )
 
     text_low = text.lower()
+
+    # ── Fast-path: "run live scores / scan" intent ───────────────────────────
+    scan_keywords = {"run live scores", "run scores", "do it now", "trigger scan", "trigger scores",
+                     "run scan", "scan now", "refresh signals", "run signals", "score now",
+                     "start scan", "kick off scan", "force scan", "rescan"}
+    if any(k in text_low for k in scan_keywords):
+        threading.Thread(target=_run_live_scores, daemon=True).start()
+        return jsonify({"ok": True, "reply":
+            "Signal scan started. Takes ~30 seconds. Ask me 'what are the top signals?' when done."})
 
     # ── Fast-path: "exit all" intent ──────────────────────────────────────────
     exit_keywords = {"exit all", "close all", "sell everything", "flatten", "get out", "liquidate"}
@@ -2047,20 +2098,63 @@ When user asks to BUY or SELL (e.g. "buy 10 NVDA", "sell my TSLA"):
   {"trade_proposal": {"orders": [{"symbol": "NVDA", "side": "buy", "qty": 10}], "summary": "Brief reason"}}
   - qty must be a positive integer; side must be "buy" or "sell"
 
+When user asks to run/trigger/start a scan or live scores (e.g. "run live scores", "do it now", "scan now", "refresh signals"):
+  Respond with ONLY this JSON (no markdown, no extra text):
+  {"action": "trigger_live_scores"}
+
 For all other queries respond in plain text. Never fabricate data not in context. This is paper trading."""
 
     # ── Context block ─────────────────────────────────────────────────────────
+    # ── Recent orders ──────────────────────────────────────────────────────────
+    try:
+        _recent_raw = get_client().get_recent_orders(limit=10)
+        recent_order_lines = [
+            f"{o.get('side','?').upper()} {o.get('filled_qty') or o.get('qty','?')} {o.get('symbol','?')} "
+            f"@ ${float(o.get('filled_avg_price') or 0):,.2f} [{o.get('status','?')}] {str(o.get('filled_at') or o.get('submitted_at') or '')[:16]}"
+            for o in (_recent_raw or [])[:8]
+        ]
+    except Exception:
+        recent_order_lines = ["unavailable"]
+
+    # ── Variant history ────────────────────────────────────────────────────────
+    try:
+        vh = strategy_model.variant_win_rates()
+        variant_lines = [
+            f"{v}: {d['wins']}/{d['total']} wins ({d['win_rate']*100:.0f}%) avg_obj={d['avg_objective']:.3f}"
+            for v, d in sorted(vh.items(), key=lambda x: -x[1]['win_rate'])
+        ]
+    except Exception:
+        variant_lines = ["unavailable"]
+
+    # ── News risk ──────────────────────────────────────────────────────────────
+    news_risk  = cache_snap.get("news_risk") or []
+    news_lines = [
+        f"{n.get('symbol')}: {n.get('headline','')[:80]} (delta={n.get('delta')})"
+        for n in news_risk[:3]
+    ] or ["none"]
+
+    gross_exp  = float((acctg_snap.get("gross_exposure_pct")) or 0)
+    drift_max  = float((acctg_snap.get("max_drift_pct")) or 0)
+    next_reb   = acctg_snap.get("next_rebalance_date") or "unknown"
+
     pos_tech_str = "\n".join(pos_tech_lines) if pos_tech_lines else "no technicals available"
     context_block = (
         f"=== Portfolio State ===\n"
         f"Equity: ${equity:,.0f} | Cash: ${cash:,.0f} | Daily P&L: ${daily_pnl:+,.0f}\n"
+        f"Gross exposure: {gross_exp:.1f}% | Max weight drift: {drift_max:.1f}% | Next rebalance: {next_reb}\n"
         f"Market regime: {regime}\n"
         f"Open positions ({len(positions)}): {', '.join(pos_lines) if pos_lines else 'none'}\n"
         f"Position technicals:\n{pos_tech_str}\n"
         f"Exit recommendations: {', '.join(exit_lines) if exit_lines else 'none'}\n"
         f"Risk: {risk_state.get('status','?')} — {risk_state.get('message','')}\n"
+        f"\n=== Recent Orders ===\n"
+        f"{chr(10).join(recent_order_lines)}\n"
+        f"\n=== News Risk ===\n"
+        f"{chr(10).join(news_lines)}\n"
         f"\n=== Strategy Model ===\n"
         f"Generation {generation} | Active variant: {variant} | Min conviction: {conviction}/100 | Max hold: {max_hold}d\n"
+        f"\n=== Variant Win Rates (last 90 days) ===\n"
+        f"{chr(10).join(variant_lines)}\n"
         f"\n=== Top Signal Candidates (with indicator breakdown) ===\n"
         f"{chr(10).join(sig_lines) if sig_lines else 'No signals cached — run live scores first.'}\n"
     )
@@ -2068,7 +2162,9 @@ For all other queries respond in plain text. Never fabricate data not in context
     # ── Gemini ────────────────────────────────────────────────────────────────
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not gemini_key:
-        reply = _simple_chat_response(text_low, equity, daily_pnl, cash, regime, pos_lines, sig_lines)
+        reply = _simple_chat_response(text_low, equity, daily_pnl, cash, regime, pos_lines, sig_lines,
+                                      variant_lines=variant_lines, recent_order_lines=recent_order_lines,
+                                      model_state=model_state)
         return jsonify({"ok": True, "reply": reply, "variant": "keyword_fallback"})
 
     try:
@@ -2082,7 +2178,17 @@ For all other queries respond in plain text. Never fabricate data not in context
         response  = gmodel.generate_content(full_user)
         raw = (response.text or "").strip()
 
-        # Try to parse as trade_proposal JSON
+        # Try to parse as action / trade_proposal JSON
+        if raw.startswith("{") and "action" in raw:
+            try:
+                parsed = json.loads(raw)
+                if parsed.get("action") == "trigger_live_scores":
+                    threading.Thread(target=_run_live_scores, daemon=True).start()
+                    return jsonify({"ok": True, "reply":
+                        "Signal scan started. Takes ~30 seconds. Ask me 'what are the top signals?' when done."})
+            except (json.JSONDecodeError, Exception):
+                pass
+
         if raw.startswith("{") and "trade_proposal" in raw:
             try:
                 parsed = json.loads(raw)
@@ -2110,13 +2216,16 @@ For all other queries respond in plain text. Never fabricate data not in context
 
     except Exception as e:
         log.warning("Gemini chat error: %s", e)
-        reply = _simple_chat_response(text_low, equity, daily_pnl, cash, regime, pos_lines, sig_lines)
+        reply = _simple_chat_response(text_low, equity, daily_pnl, cash, regime, pos_lines, sig_lines,
+                                      variant_lines=variant_lines, recent_order_lines=recent_order_lines,
+                                      model_state=model_state)
         return jsonify({"ok": True, "reply": f"(LLM unavailable: {type(e).__name__}) {reply}",
                         "variant": "keyword_fallback"})
 
 
-def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_lines):
-    if any(k in text for k in ("p&l", "pnl", "profit", "loss", "how am i doing", "performance")):
+def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_lines,
+                          variant_lines=None, recent_order_lines=None, model_state=None):
+    if any(k in text for k in ("p&l", "pnl", "profit", "loss", "how am i doing", "performance", "return")):
         sign = "+" if daily_pnl >= 0 else ""
         return (f"Equity ${equity:,.0f}, daily P&L {sign}${daily_pnl:,.0f}. "
                 f"Cash available: ${cash:,.0f}.")
@@ -2126,7 +2235,7 @@ def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_
             return "Open positions: " + "; ".join(pos_lines) + "."
         return "No open positions. All cash."
 
-    if any(k in text for k in ("signal", "scan", "score", "what to buy", "entry")):
+    if any(k in text for k in ("signal", "scan", "score", "what to buy", "entry", "candidate")):
         if sig_lines:
             return "Top signals: " + "; ".join(sig_lines) + "."
         return "No signals cached yet. Trigger a scan or wait for next run."
@@ -2141,12 +2250,32 @@ def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_
         }.get(regime, "still loading.")
         return f"Current market is {desc}"
 
-    if any(k in text for k in ("cash", "buying power", "available")):
+    if any(k in text for k in ("cash", "buying power", "available", "balance")):
         return f"Cash available: ${cash:,.0f}."
+
+    if any(k in text for k in ("order", "trade", "activity", "recent", "history", "filled")):
+        if recent_order_lines and recent_order_lines != ["unavailable"]:
+            return "Recent orders:\n" + "\n".join(recent_order_lines[:6])
+        return "No recent order data available."
+
+    if any(k in text for k in ("variant", "winning", "win rate", "best variant", "which variant")):
+        if variant_lines and variant_lines != ["unavailable"]:
+            return "Variant win rates:\n" + "\n".join(variant_lines)
+        return "No variant history yet — run at least one daily optimization."
+
+    if any(k in text for k in ("model", "strategy", "conviction", "generation", "param", "setting")):
+        if model_state:
+            m = model_state
+            return (f"Strategy gen {m.get('generation',0)}: variant={m.get('active_variant','?')}, "
+                    f"min_conviction={m.get('min_conviction',75)}, max_positions={m.get('max_positions',3)}, "
+                    f"position_size={int(float(m.get('position_size_pct',0.05))*100)}%, "
+                    f"trailing_stop={m.get('trailing_stop_pct',3.0)}%, "
+                    f"max_hold={m.get('max_holding_days',2)}d.")
+        return "Strategy model not available."
 
     return (f"Equity ${equity:,.0f} | P&L ${daily_pnl:+,.0f} | Regime {regime} | "
             f"{'No positions' if not pos_lines else str(len(pos_lines)) + ' positions open'}. "
-            "Ask me about positions, signals, P&L, or regime.")
+            "Ask me about positions, signals, P&L, regime, orders, variant history, or model settings.")
 
 
 @app.route("/lab")

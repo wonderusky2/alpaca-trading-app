@@ -27,3 +27,4 @@ xcuserdata/
 
 .robinhood-trader/
 state/
+strategy_model.py

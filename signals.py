@@ -42,7 +42,14 @@ MOMENTUM_STOCKS = [
 
 BULL_UNIVERSE = BULL_ETF + MOMENTUM_STOCKS
 BEAR_UNIVERSE = BEAR_ETF
-ALL_SYMBOLS   = ["SPY", "QQQ", "VIX"] + BULL_UNIVERSE + BEAR_UNIVERSE
+
+# ── Breadth / regime-validation instruments (fetched but never traded) ────────
+# RSP  = equal-weight S&P 500 (SPY vs RSP divergence = narrow vs broad rally)
+# Sectors: XLK tech, XLF financials, XLI industrials, XLY consumer discretionary
+# Together these confirm whether a move is broad-based or mega-cap-driven
+BREADTH_SYMBOLS = ["RSP", "XLK", "XLF", "XLI", "XLY"]
+
+ALL_SYMBOLS   = ["SPY", "QQQ", "VIX"] + BREADTH_SYMBOLS + BULL_UNIVERSE + BEAR_UNIVERSE
 
 MIN_CONVICTION          = 65   # 0-100 scale; ≥65 required to generate a signal
 BEAR_ETF_MIN_CONVICTION = 50   # lower bar for bear ETFs in BEAR regime — they lag at the start of a move
@@ -152,8 +159,38 @@ def detect_regime(quotes: dict) -> str:
     # Wide daily range but near-zero slope = whipsaw, not trend
     ranging = atr_pct > 0.8 and abs(trend_slope) < 0.05
 
+    # ── 5. Market breadth ─────────────────────────────────────────────────────
+    # RSP vs SPY divergence: cap-weighted rally not confirmed by equal-weight = narrow
+    rsp_chg = float((quotes.get("RSP") or {}).get("change_pct") or 0)
+    spy_chg = float((quotes.get("SPY") or {}).get("change_pct") or 0)
+    breadth_divergence = spy_chg - rsp_chg   # >0 means mega-caps leading, rest lagging
+
+    # Sector confirmation: count how many key sectors are positive
+    sector_changes = [
+        float((quotes.get(s) or {}).get("change_pct") or 0)
+        for s in ("XLK", "XLF", "XLI", "XLY")
+    ]
+    sectors_green = sum(1 for c in sector_changes if c > 0)
+
+    # Internal breadth: fraction of momentum stocks trading above their own VWAP
+    above_vwap = sum(
+        1 for s in MOMENTUM_STOCKS
+        if float((quotes.get(s) or {}).get("technicals", {}).get("price_vs_vwap_pct") or 0) > 0
+    )
+    internal_breadth_pct = above_vwap / len(MOMENTUM_STOCKS)   # 0.0 – 1.0
+
+    # Narrow rally: SPY up but equal-weight lags AND sectors mixed AND internals weak
+    narrow_rally = (
+        momentum == "bull"
+        and breadth_divergence > 0.3        # mega-caps carrying SPY
+        and sectors_green < 3               # fewer than 3/4 sectors green
+        and internal_breadth_pct < 0.45     # less than half of momentum stocks above VWAP
+    )
+
+    # Broad sell-off confirmation for BEAR: most sectors red, internals weak
+    broad_selloff = sectors_green <= 1 and internal_breadth_pct < 0.35
+
     # ── Decision logic ────────────────────────────────────────────────────────
-    # CHOPPY: explicitly bail out when conditions are unclear
     if ranging:
         return "CHOPPY"
     if vix_regime == "stressed" and momentum != "bear":
@@ -162,12 +199,14 @@ def detect_regime(quotes: dict) -> str:
         return "CHOPPY"
     if momentum != trend and trend != "flat":
         return "CHOPPY"   # intraday and multi-day disagree — wait for resolution
+    if narrow_rally:
+        return "CHOPPY"   # SPY up on 2-3 mega caps — not a broad tradeable bull
 
-    # BULL: momentum up, trend confirms, VIX not stressed
+    # BULL: momentum up, trend confirms, VIX not stressed, breadth confirms
     if momentum == "bull" and vix_regime in ("calm", "elevated", "unknown"):
         return "BULL"
 
-    # BEAR: momentum down, trend confirms or VIX stressed
+    # BEAR: momentum down — broad selloff strengthens conviction but isn't required
     if momentum == "bear":
         return "BEAR"
 
