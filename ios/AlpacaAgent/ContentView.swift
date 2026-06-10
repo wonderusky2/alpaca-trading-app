@@ -1,14 +1,14 @@
 import SwiftUI
 
 extension Color {
-    static let appBackground = Color(.systemGroupedBackground)
-    static let appSurface = Color(.secondarySystemGroupedBackground)
-    static let appBorder = Color(.separator).opacity(0.35)
-    static let appMuted = Color(.secondaryLabel)
-    static let appGreen = Color(red: 0.00, green: 0.63, blue: 0.31)
-    static let appRed = Color(red: 0.86, green: 0.18, blue: 0.16)
-    static let appAmber = Color(red: 0.88, green: 0.55, blue: 0.08)
-    static let appBlue = Color(red: 0.00, green: 0.43, blue: 0.86)
+    static let appBackground = Color(.systemBackground)
+    static let appSurface    = Color(.secondarySystemBackground)
+    static let appBorder     = Color(.separator).opacity(0.18)
+    static let appMuted      = Color(.secondaryLabel)
+    static let appGreen      = Color(red: 0.0,   green: 0.784, blue: 0.020)  // Robinhood #00C805
+    static let appRed        = Color(red: 0.929, green: 0.106, blue: 0.141)  // #ED1B24
+    static let appAmber      = Color(red: 0.88,  green: 0.55,  blue: 0.08)
+    static let appBlue       = Color(red: 0.00,  green: 0.43,  blue: 0.86)
 }
 
 struct ContentView: View {
@@ -21,7 +21,8 @@ struct ContentView: View {
                 showingChat = true
             }
         }
-        .tint(.appGreen)
+        .tint(Color.appGreen)
+        .preferredColorScheme(.dark)
         .sheet(isPresented: $showingChat) {
             NavigationStack {
                 ChatView(vm: vm) {
@@ -48,30 +49,22 @@ struct DashboardView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 10) {
-                TodayHeroCard(vm: vm)
-                WhatNextPanel(vm: vm)
-                LatestActivity(
-                    items: vm.activityItems,
-                    isRefreshing: vm.isRefreshingActivity,
-                    error: vm.activityError
-                )
-                PositionsNowPanel(vm: vm)
+            LazyVStack(alignment: .leading, spacing: 0) {
+                TodayHeroCard(vm: vm, openChat: openChat)
+                Divider()
+                MarketPulsePanel(vm: vm)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                Divider()
+                RobinhoodPositionsList(vm: vm)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
         }
         .background(Color.appBackground)
         .toolbar(.hidden, for: .navigationBar)
         .refreshable {
             await vm.refreshAllAsync()
-        }
-        .safeAreaInset(edge: .top) {
-            DashboardHeader(openChat: openChat)
-                .padding(.horizontal, 14)
-                .padding(.top, 2)
-                .padding(.bottom, 8)
-                .background(Color.appBackground)
         }
     }
 }
@@ -81,9 +74,7 @@ struct DashboardHeader: View {
 
     var body: some View {
         HStack(alignment: .center) {
-            Text("Performance")
-                .font(.title2.weight(.bold))
-                .foregroundStyle(.primary)
+            // Minimal Robinhood-style header — P&L is the hero, no title needed
             Spacer()
             HeaderIconButton(systemName: "text.bubble.fill", action: openChat, label: "Open chat")
         }
@@ -267,6 +258,175 @@ struct WhatNextPanel: View {
     }
 }
 
+// ── Market Pulse Panel — trading-terminal view ────────────────────────────────
+struct MarketPulsePanel: View {
+    @ObservedObject var vm: AgentViewModel
+
+    private var cashPct: Int {
+        guard vm.overview.equity > 0 else { return 100 }
+        return Int(vm.overview.cash / vm.overview.equity * 100)
+    }
+
+    private var regimeColor: Color {
+        switch vm.overview.regime {
+        case "BULL": return Color.appGreen
+        case "BEAR": return Color.appRed
+        default:     return Color.appAmber
+        }
+    }
+
+    private var heldSymbols: Set<String> {
+        Set(vm.positions.map { $0.symbol.uppercased() })
+    }
+
+    private var topSignals: [SignalInsight] {
+        Array(vm.signalInsights.prefix(5))
+    }
+
+    private var nextAction: String {
+        if !vm.exitRecommendations.isEmpty {
+            let syms = vm.exitRecommendations.prefix(3).map(\.symbol).joined(separator: ", ")
+            let more = vm.exitRecommendations.count > 3 ? " +\(vm.exitRecommendations.count - 3)" : ""
+            return "Sell \(syms)\(more) — exit rules fired"
+        }
+        if let first = vm.portfolioNarrative.nextActions.first {
+            return first
+        }
+        return "Waiting for signal"
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // ── Status row ──────────────────────────────────────────────────
+            HStack(spacing: 0) {
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(regimeColor)
+                        .frame(width: 7, height: 7)
+                    Text(vm.overview.regime)
+                        .font(.system(size: 13, weight: .black, design: .monospaced))
+                        .foregroundStyle(regimeColor)
+                }
+                .padding(.horizontal, 12)
+                .frame(maxHeight: .infinity)
+
+                Divider().frame(height: 20)
+
+                Text("\(cashPct)% CASH")
+                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    .foregroundStyle(cashPct > 50 ? Color.appGreen : Color.appAmber)
+                    .padding(.horizontal, 12)
+
+                Divider().frame(height: 20)
+
+                Text(vm.positions.isEmpty ? "NO POS" : "\(vm.positions.count) POS")
+                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    .foregroundStyle(vm.positions.isEmpty ? Color.appMuted : Color.appBlue)
+                    .padding(.horizontal, 12)
+
+                Spacer()
+
+                if !vm.exitRecommendations.isEmpty {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10))
+                        Text("\(vm.exitRecommendations.count) EXIT")
+                            .font(.system(size: 11, weight: .black))
+                    }
+                    .foregroundStyle(Color.appAmber)
+                    .padding(.horizontal, 12)
+                }
+            }
+            .frame(height: 36)
+            .background(Color(.tertiarySystemGroupedBackground))
+
+            Divider()
+
+            // ── Next action strip ───────────────────────────────────────────
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.right.circle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(vm.exitRecommendations.isEmpty ? regimeColor : Color.appAmber)
+                Text(nextAction)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+        .background(Color.appSurface)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+    }
+}
+
+// ── Signal score row ──────────────────────────────────────────────────────────
+struct SignalScoreRow: View {
+    let sig: SignalInsight
+    let isHeld: Bool
+    let minScore: Int
+
+    private var above: Bool { sig.score >= minScore }
+
+    private var scoreColor: Color {
+        if sig.score >= 85 { return Color.appGreen }
+        if sig.score >= minScore { return Color.appAmber }
+        return Color(.systemGray3)
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Text("\(sig.score)")
+                .font(.system(size: 18, weight: .black, design: .monospaced))
+                .foregroundStyle(scoreColor)
+                .frame(width: 44, alignment: .center)
+
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color(.quaternarySystemFill))
+                        .frame(height: 3)
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(scoreColor)
+                        .frame(width: geo.size.width * CGFloat(sig.score) / 100, height: 3)
+                }
+                .frame(maxHeight: .infinity)
+            }
+            .frame(width: 40)
+
+            HStack(spacing: 4) {
+                Text(sig.symbol)
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(above ? .primary : .secondary)
+                if isHeld {
+                    Circle()
+                        .fill(Color.appBlue)
+                        .frame(width: 5, height: 5)
+                }
+            }
+            .padding(.leading, 10)
+            .frame(width: 78, alignment: .leading)
+
+            Spacer()
+
+            let pct = sig.changePct
+            Text(String(format: pct >= 0 ? "+%.1f%%" : "%.1f%%", pct))
+                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                .foregroundStyle(pct >= 0 ? Color.appGreen : Color.appRed)
+
+            Image(systemName: above ? "arrow.up.circle.fill" : "circle")
+                .font(.system(size: 13))
+                .foregroundStyle(above ? scoreColor : Color(.quaternarySystemFill))
+                .padding(.leading, 8)
+                .padding(.trailing, 12)
+        }
+        .frame(height: 38)
+    }
+}
+
+
 /// Full-width horizontal conviction bar with 5 colored zones and a thumb marker.
 struct ConvictionBar: View {
     let value: Double    // 0.0–1.0
@@ -427,6 +587,7 @@ struct ExitRecommendationRow: View {
 // ── Today Hero Card ───────────────────────────────────────────────────────────
 struct TodayHeroCard: View {
     @ObservedObject var vm: AgentViewModel
+    let openChat: () -> Void
 
     // Hero uses the selected portfolio range P&L — matches whatever period the chart shows
     private var heroValue: Double? {
@@ -440,7 +601,7 @@ struct TodayHeroCard: View {
 
     private var heroLabel: String {
         switch vm.selectedPortfolioRange {
-        case .day:     return vm.overview.isOpen ? "TODAY SO FAR" : "YESTERDAY"
+        case .day:     return "TODAY"
         case .week:    return "THIS WEEK"
         case .month:   return "THIS MONTH"
         case .quarter: return "THIS QUARTER"
@@ -462,95 +623,80 @@ struct TodayHeroCard: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Status chips — no OPEN/CLOSED badge (redundant), just regime + variant
-            HStack(spacing: 8) {
-                PaperBadge()
-                VariantBadge(variant: vm.strategyModel.activeVariant)
-                Text(vm.overview.regime)
-                    .font(.caption2.weight(.bold))
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .foregroundStyle(regimeColor)
-                    .padding(.horizontal, 7).padding(.vertical, 3)
-                    .background(regimeColor.opacity(0.12))
-                    .clipShape(Capsule())
+        VStack(alignment: .leading, spacing: 0) {
+
+            // ── Chat + market status ──────────────────────────────────────
+            HStack {
+                HStack(spacing: 6) {
+                    Circle().fill(regimeColor).frame(width: 8, height: 8)
+                    Text(vm.overview.regime)
+                        .font(.system(size: 13, weight: .black))
+                        .foregroundStyle(regimeColor)
+                    Text("·").foregroundStyle(Color.appMuted).font(.footnote)
+                    Text("PAPER")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(Color.appAmber)
+                    Text("·").foregroundStyle(Color.appMuted).font(.footnote)
+                    Text(vm.overview.isOpen ? "LIVE" : "CLOSED")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(vm.overview.isOpen ? Color.appGreen : Color.appMuted)
+                }
                 Spacer()
-                // Market status as tiny text, not a huge pill
-                Text(vm.overview.isOpen ? "LIVE" : "CLOSED")
-                    .font(.caption2.weight(.bold))
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .foregroundStyle(vm.overview.isOpen ? Color.appGreen : Color.appMuted)
+                Button(action: openChat) {
+                    Image(systemName: "text.bubble")
+                        .font(.system(size: 18))
+                        .foregroundStyle(Color.appMuted)
+                }
+                .buttonStyle(.plain)
             }
             .padding(.bottom, 14)
 
-            // P&L hero
-            Text(heroLabel)
-                .font(.caption.weight(.bold))
-                .foregroundStyle(.secondary)
-                .kerning(1.2)
+            // ── Portfolio value — the hero number ─────────────────────────
+            Text(money(vm.overview.equity))
+                .font(.system(size: 44, weight: .bold, design: .rounded))
+                .foregroundStyle(.primary)
                 .padding(.bottom, 4)
 
+            // ── P&L change for selected period ────────────────────────────
             if let v = heroValue {
-                Text(signedMoney(v))
-                    .font(.system(size: 48, weight: .bold, design: .rounded))
-                    .foregroundStyle(pnlColor)
-                Text(signedPercent(heroValuePct) + "  ·  " + narrativeSubtitle)
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(pnlColor)
-                    .multilineTextAlignment(.center)
-                    .padding(.top, 2)
-            } else {
-                Text(money(vm.overview.equity))
-                    .font(.system(size: 48, weight: .bold, design: .rounded))
-                    .foregroundStyle(.primary)
-                Text(narrativeSubtitle)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 2)
-            }
-
-            Text("Total portfolio \(money(vm.overview.equity))")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.top, 6)
-
-            // Chart
-            if !vm.portfolioPoints.isEmpty {
-                PortfolioChart(points: vm.portfolioPoints,
-                               isLoading: vm.isLoadingPortfolioHistory,
-                               color: heroValue != nil ? pnlColor : .appGreen)
-                    .frame(height: 70)
-                    .padding(.top, 14)
-                    .padding(.horizontal, 4)
-            }
-
-            PortfolioRangePicker(selectedRange: vm.selectedPortfolioRange) { vm.selectPortfolioRange($0) }
-                .padding(.top, 10)
-
-            // Cash row — consolidated here, no separate card
-            if vm.overview.equity > 0 {
-                let cashPct = vm.overview.cash / vm.overview.equity * 100
-                Divider().padding(.top, 6)
-                HStack {
-                    Text("Cash on sidelines")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text(money(vm.overview.cash))
-                        .font(.caption.weight(.semibold))
-                    Text("· \(Int(cashPct))%")
-                        .font(.caption)
-                        .foregroundStyle(cashPct > 50 ? Color.appGreen : Color.appAmber)
+                HStack(spacing: 5) {
+                    Text(signedMoney(v))
+                    Text("(\(signedPercent(heroValuePct)))")
+                    Text(heroLabel).foregroundStyle(Color.appMuted)
                 }
-                .padding(.top, 4)
+                .font(.body.weight(.semibold))
+                .foregroundStyle(pnlColor)
+                .padding(.bottom, 16)
+            } else {
+                Text(heroLabel)
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .padding(.bottom, 16)
             }
+
+            // ── Chart — full bleed ────────────────────────────────────────
+            if !vm.portfolioPoints.isEmpty {
+                PortfolioChart(
+                    points: vm.portfolioPoints,
+                    isLoading: vm.isLoadingPortfolioHistory,
+                    color: heroValue != nil ? pnlColor : Color.appGreen
+                )
+                .frame(height: 80)
+                .padding(.horizontal, -16)
+            }
+
+            // ── Time range picker ─────────────────────────────────────────
+            PortfolioRangePicker(
+                selectedRange: vm.selectedPortfolioRange,
+                select: { vm.selectPortfolioRange($0) },
+                onCustomRange: { start, end in vm.selectCustomRange(start: start, end: end) }
+            )
+            .padding(.top, 8)
         }
-        .padding(16)
-        .frame(maxWidth: .infinity)
-        .background(Color.appSurface)
-        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var regimeColor: Color {
@@ -596,8 +742,7 @@ struct AlgoNarrativeCard: View {
     }
 
     var body: some View {
-        guard !bullets.isEmpty else { return AnyView(EmptyView()) }
-        return AnyView(
+        if !bullets.isEmpty {
             VStack(alignment: .leading, spacing: 14) {
                 Text("WHAT THE ALGO DID")
                     .font(.caption.weight(.bold))
@@ -629,7 +774,7 @@ struct AlgoNarrativeCard: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.appSurface)
             .clipShape(RoundedRectangle(cornerRadius: 14))
-        )
+        }
     }
 }
 
@@ -651,8 +796,7 @@ struct CashPanel: View {
     }
 
     var body: some View {
-        guard vm.overview.equity > 0 else { return AnyView(EmptyView()) }
-        return AnyView(
+        if vm.overview.equity > 0 {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Cash on the sidelines")
                     .font(.caption)
@@ -672,18 +816,272 @@ struct CashPanel: View {
             .padding(16)
             .background(Color.appSurface)
             .clipShape(RoundedRectangle(cornerRadius: 14))
-        )
+        }
     }
 }
 
 // ── Positions right now ───────────────────────────────────────────────────────
+// ── Robinhood-style positions list ───────────────────────────────────────────
+struct RobinhoodPositionsList: View {
+    @ObservedObject var vm: AgentViewModel
+    @State private var showHistory = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(vm.positions.isEmpty ? "WATCHLIST" : "POSITIONS")
+                    .font(.system(size: 11, weight: .black))
+                    .foregroundStyle(.secondary)
+                    .kerning(1)
+                Spacer()
+                Button { showHistory = true } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: 12, weight: .semibold))
+                        Text("History")
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color.appSurface)
+                    .clipShape(Capsule())
+                    .overlay(Capsule().stroke(Color(.separator).opacity(0.4), lineWidth: 0.5))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.bottom, 12)
+
+            if vm.positions.isEmpty {
+                if vm.signalInsights.isEmpty {
+                    Text("Scanning for setups…")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, 24)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(Array(vm.signalInsights.prefix(6).enumerated()),
+                                id: \.element.id) { i, sig in
+                            RobinhoodWatchlistRow(sig: sig,
+                                                  minScore: vm.strategyModel.minConviction)
+                            if i < min(vm.signalInsights.count, 6) - 1 { Divider() }
+                        }
+                    }
+                }
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(vm.positions.enumerated()), id: \.element.id) { i, pos in
+                        RobinhoodPositionRow(
+                            pos: pos,
+                            insight: vm.heldInsights[pos.symbol],
+                            hasExit: vm.exitRecommendations.contains { $0.symbol == pos.symbol }
+                        )
+                        if i < vm.positions.count - 1 { Divider() }
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $showHistory) { historySheet }
+    }
+
+    @ViewBuilder
+    var historySheet: some View {
+        NavigationStack {
+            ScrollView {
+                LatestActivity(
+                    items: vm.activityItems,
+                    isRefreshing: vm.isRefreshingActivity,
+                    error: vm.activityError
+                )
+                .padding(.horizontal, 16).padding(.vertical, 10)
+            }
+            .background(Color.appBackground)
+            .navigationTitle("Activity Log")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showHistory = false }
+                        .foregroundStyle(Color.appGreen)
+                }
+            }
+        }
+    }
+}
+
+// ── Robinhood watchlist row: symbol+info | sparkline | score pill ─────────────
+struct RobinhoodWatchlistRow: View {
+    let sig: SignalInsight
+    let minScore: Int
+
+    private var above: Bool { sig.score >= minScore }
+    private var pillColor: Color {
+        sig.score >= 85 ? Color.appGreen : sig.score >= minScore ? Color.appAmber : Color(.systemGray3)
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            // Symbol + subtitle
+            VStack(alignment: .leading, spacing: 3) {
+                Text(sig.symbol)
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(above ? .primary : .secondary)
+                Text(sig.topLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            // Mini sparkline
+            MiniSparkline(indicators: sig.orderedIndicators,
+                          isPositive: sig.changePct >= 0)
+                .frame(width: 72, height: 36)
+
+            // Price pill + change%
+            VStack(alignment: .trailing, spacing: 3) {
+                Text(sig.lastPrice > 0 ? String(format: "$%.2f", sig.lastPrice) : "–")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(minWidth: 64)
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .background(pillColor)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                let pct = sig.changePct
+                Text(String(format: pct >= 0 ? "+%.1f%%" : "%.1f%%", pct))
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(pct >= 0 ? Color.appGreen : Color.appRed)
+            }
+        }
+        .padding(.vertical, 14)
+    }
+}
+
+// ── Robinhood position row: symbol+entry | sparkline | value pill ─────────────
+struct RobinhoodPositionRow: View {
+    let pos: PositionRow
+    let insight: SignalInsight?
+    let hasExit: Bool
+
+    private var pillColor: Color { pos.unrealizedPnl >= 0 ? Color.appGreen : Color.appRed }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            // Symbol + entry info
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(pos.symbol)
+                        .font(.system(size: 17, weight: .bold))
+                    if hasExit {
+                        Text("EXIT")
+                            .font(.system(size: 9, weight: .black))
+                            .foregroundStyle(Color.appAmber)
+                            .padding(.horizontal, 4).padding(.vertical, 2)
+                            .background(Color.appAmber.opacity(0.2))
+                            .clipShape(Capsule())
+                    }
+                }
+                Text("\(formatShares(pos.qty)) sh  ·  avg \(money(pos.entryPrice))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            // Mini sparkline from signal indicators
+            if let sig = insight {
+                MiniSparkline(indicators: sig.orderedIndicators,
+                              isPositive: pos.unrealizedPnl >= 0)
+                    .frame(width: 72, height: 36)
+            } else {
+                Spacer().frame(width: 72)
+            }
+
+            // Value pill + P&L
+            VStack(alignment: .trailing, spacing: 3) {
+                Text(money(pos.currentValue))
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(minWidth: 72)
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .background(pillColor)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                HStack(spacing: 3) {
+                    Text(signedMoney(pos.unrealizedPnl))
+                    Text("(\(signedPercent(pos.unrealizedPnlPct)))")
+                }
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(pillColor)
+            }
+        }
+        .padding(.vertical, 14)
+    }
+}
+
+// ── Mini sparkline built from signal indicator sequence ───────────────────────
+struct MiniSparkline: View {
+    let indicators: [NamedIndicator]
+    let isPositive: Bool
+
+    /// Build pseudo price points (0–1) from indicator states
+    private var points: [CGFloat] {
+        var pts: [CGFloat] = [0.5]
+        var cur: CGFloat = 0.5
+        for ind in indicators {
+            switch ind.indicator.status {
+            case "bullish": cur = min(1.0, cur + 0.18)
+            case "bearish": cur = max(0.0, cur - 0.18)
+            default:        cur = cur + (isPositive ? 0.02 : -0.02)
+            }
+            pts.append(cur)
+        }
+        return pts
+    }
+
+    private var lineColor: Color { isPositive ? Color.appGreen : Color.appRed }
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let h = geo.size.height
+            let pts = points
+            let minY = (pts.min() ?? 0) - 0.05
+            let maxY = (pts.max() ?? 1) + 0.05
+            let range = max(maxY - minY, 0.01)
+            let xStep = w / CGFloat(max(pts.count - 1, 1))
+            // Use closure instead of func to stay ViewBuilder-compatible (Swift 6)
+            let pt: (Int) -> CGPoint = { i in
+                CGPoint(
+                    x: CGFloat(i) * xStep,
+                    y: h - h * CGFloat((pts[i] - minY) / range)
+                )
+            }
+
+            // Baseline
+            Path { p in
+                let by = h * CGFloat((0.5 - minY) / range)
+                p.move(to: CGPoint(x: 0, y: h - by))
+                p.addLine(to: CGPoint(x: w, y: h - by))
+            }
+            .stroke(Color.secondary.opacity(0.25),
+                    style: StrokeStyle(lineWidth: 0.5, dash: [2, 2]))
+
+            // Sparkline
+            Path { p in
+                guard pts.count > 1 else { return }
+                p.move(to: pt(0))
+                for i in 1..<pts.count { p.addLine(to: pt(i)) }
+            }
+            .stroke(lineColor, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+        }
+    }
+}
+
+
 struct PositionsNowPanel: View {
     @ObservedObject var vm: AgentViewModel
     private var exitSymbols: Set<String> { Set(vm.exitRecommendations.map(\.symbol)) }
 
     var body: some View {
-        guard !vm.positions.isEmpty else { return AnyView(EmptyView()) }
-        return AnyView(
+        if !vm.positions.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .firstTextBaseline) {
                     Label("Exposure", systemImage: "chart.pie.fill")
@@ -754,9 +1152,7 @@ struct PositionsNowPanel: View {
                 }
             }
             .padding(14)
-            .background(Color.appSurface)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-        )
+        }
     }
 
     private var totalValue: Double {
@@ -1281,9 +1677,7 @@ struct CandidatesPanel: View {
 
     var body: some View {
         let scanned = Array(vm.signalInsights.prefix(8))
-        guard !scanned.isEmpty else { return AnyView(EmptyView()) }
-
-        return AnyView(
+        if !scanned.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 Label("Market Scan", systemImage: "waveform.path.ecg")
                     .font(.caption.weight(.bold))
@@ -1303,7 +1697,7 @@ struct CandidatesPanel: View {
             .padding(12)
             .background(Color.appSurface)
             .clipShape(RoundedRectangle(cornerRadius: 14))
-        )
+        }
     }
 }
 
@@ -1792,12 +2186,21 @@ struct PnlTile: View {
 struct PortfolioRangePicker: View {
     let selectedRange: PortfolioRange
     let select: (PortfolioRange) -> Void
+    var onCustomRange: ((Date, Date) -> Void)? = nil
+
+    @State private var showDatePicker = false
+    @State private var draftStart: Date = Calendar.current.date(byAdding: .month, value: -1, to: Date()) ?? Date()
+    @State private var draftEnd: Date = Date()
 
     var body: some View {
         HStack(spacing: 4) {
             ForEach(PortfolioRange.allCases) { range in
                 Button {
-                    select(range)
+                    if range == .custom {
+                        showDatePicker = true
+                    } else {
+                        select(range)
+                    }
                 } label: {
                     Text(label(for: range))
                         .font(.caption2.weight(.bold))
@@ -1815,6 +2218,42 @@ struct PortfolioRangePicker: View {
         .padding(4)
         .background(Color(.tertiarySystemGroupedBackground))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .sheet(isPresented: $showDatePicker) {
+            NavigationStack {
+                Form {
+                    Section("From") {
+                        DatePicker("Start", selection: $draftStart, in: ...draftEnd, displayedComponents: .date)
+                            .datePickerStyle(.graphical)
+                            .tint(Color.appGreen)
+                    }
+                    Section("To") {
+                        DatePicker("End", selection: $draftEnd, in: draftStart...Date(), displayedComponents: .date)
+                            .datePickerStyle(.graphical)
+                            .tint(Color.appGreen)
+                    }
+                }
+                .scrollContentBackground(.hidden)
+                .background(Color.appBackground)
+                .navigationTitle("Custom Range")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { showDatePicker = false }
+                            .foregroundStyle(.secondary)
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Apply") {
+                            showDatePicker = false
+                            select(.custom)
+                            onCustomRange?(draftStart, draftEnd)
+                        }
+                        .foregroundStyle(Color.appGreen)
+                        .fontWeight(.bold)
+                    }
+                }
+            }
+            .preferredColorScheme(.dark)
+        }
     }
 
     private func label(for range: PortfolioRange) -> String {
@@ -1971,16 +2410,18 @@ struct LatestActivity: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Label("What happened", systemImage: "clock.arrow.circlepath")
-                    .font(.caption.weight(.bold))
+                Label("Activity", systemImage: "clock.arrow.circlepath")
+                    .font(.system(size: 11, weight: .black))
                     .foregroundStyle(.secondary)
+                    .kerning(0.5)
                 Spacer()
                 if isRefreshing {
                     ProgressView().scaleEffect(0.8)
                 }
             }
             VStack(spacing: 0) {
-                if let error {
+                // Only surface the error when there's truly nothing to show
+                if let error, items.isEmpty {
                     ActivityLogRow(
                         item: ActivityLogItem(
                             title: "Activity unavailable",
@@ -1989,51 +2430,48 @@ struct LatestActivity: View {
                             variant: .danger
                         )
                     )
-                    if !items.isEmpty {
-                        Divider().padding(.leading, 14)
-                    }
                 }
-                ForEach(Array(displayItems.prefix(4))) { item in
+                ForEach(displayItems) { item in
                     ActivityLogRow(item: item)
-                    if item.id != displayItems.prefix(4).last?.id {
-                        Divider().padding(.leading, 14)
+                    if item.id != displayItems.last?.id {
+                        Divider()
                     }
                 }
                 if items.isEmpty {
                     Text("No agent actions yet.")
-                        .font(.subheadline)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(14)
+                        .padding(.vertical, 8)
                 }
             }
-            .background(Color.appSurface)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
         }
     }
 
     private var displayItems: [ActivityLogItem] {
         let exits = items.filter { $0.title == "Exit signal triggered" }
         let pendingSells = items.filter { $0.title.hasPrefix("Pending sell") }
-        var grouped: [ActivityLogItem] = []
 
+        // Build synthetic grouped items for noisy raw events
+        var synthetic: [ActivityLogItem] = []
         if !exits.isEmpty {
-            let symbols = exits.compactMap { symbol(from: $0.detail) }
+            let allSymbols = exits.compactMap { symbol(from: $0.detail) }
+            var seen = Set<String>()
+            let symbols = allSymbols.filter { seen.insert($0).inserted }
             let reason = dominantExitReason(in: exits)
             let shown = symbols.prefix(5).joined(separator: ", ")
             let more = symbols.count > 5 ? " +\(symbols.count - 5) more" : ""
-            grouped.append(ActivityLogItem(
-                title: "Exit review: \(exits.count) position\(exits.count == 1 ? "" : "s")",
+            synthetic.append(ActivityLogItem(
+                title: "Exit review: \(symbols.count) position\(symbols.count == 1 ? "" : "s")",
                 detail: "\(reason). \(shown.isEmpty ? "The agent is cutting risk." : "\(shown)\(more) need sell review.")",
                 time: exits.compactMap(\.time).max(),
                 variant: .alert
             ))
         }
-
         if !pendingSells.isEmpty {
             let symbols = pendingSells.map { $0.title.replacingOccurrences(of: "Pending sell ", with: "") }
             let shown = symbols.prefix(5).joined(separator: ", ")
-            grouped.append(ActivityLogItem(
+            synthetic.append(ActivityLogItem(
                 title: "Sell orders queued",
                 detail: shown.isEmpty ? "\(pendingSells.count) sell order\(pendingSells.count == 1 ? "" : "s") waiting." : "\(shown) waiting for broker execution.",
                 time: pendingSells.compactMap(\.time).max(),
@@ -2041,10 +2479,13 @@ struct LatestActivity: View {
             ))
         }
 
-        let rest = items.filter { item in
-            item.title != "Exit signal triggered" && !item.title.hasPrefix("Pending sell")
-        }
-        return grouped + rest
+        // Remaining individual items (deduplicated raw exits/sells already collapsed above)
+        let rest = items
+            .filter { $0.title != "Exit signal triggered" && !$0.title.hasPrefix("Pending sell") }
+
+        // Merge everything and sort newest-first — no pinning
+        return (synthetic + rest)
+            .sorted { ($0.time ?? .distantPast) > ($1.time ?? .distantPast) }
     }
 
     private func symbol(from detail: String) -> String? {
@@ -2070,10 +2511,14 @@ struct LatestActivity: View {
 struct ActivityLogRow: View {
     let item: ActivityLogItem
 
-    private var tint: Color {
+    private var rowTint: Color {
         switch item.variant {
-        case .trade: return .appGreen
-        case .alert: return .appAmber
+        case .trade:
+            let lower = item.title.lowercased()
+            let isSell = lower.contains("sold") || lower.contains("sell")
+                      || lower.contains("closed") || lower.contains("exit")
+            return isSell ? .appRed : .appGreen
+        case .alert:  return .appAmber
         case .danger: return .appRed
         case .normal: return .appMuted
         }
@@ -2081,35 +2526,39 @@ struct ActivityLogRow: View {
 
     private func timeStampLabel(_ date: Date) -> String {
         let fmt = DateFormatter()
-        fmt.dateFormat = "MMM d, h:mm a"
+        fmt.dateFormat = "h:mm a"
         return fmt.string(from: date)
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Circle()
-                .fill(tint)
-                .frame(width: 7, height: 7)
-                .padding(.top, 6)
+        HStack(alignment: .top, spacing: 8) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(rowTint)
+                .frame(width: 3)
+                .padding(.vertical, 10)
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(item.title)
-                    .font(.headline.weight(.bold))
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(item.detail)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let time = item.time {
-                    Text(timeStampLabel(time))
-                        .font(.caption2)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(item.title)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                    Spacer()
+                    if let time = item.time {
+                        Text(timeStampLabel(time))
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if !item.detail.isEmpty {
+                    Text(item.detail)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
             }
-            Spacer(minLength: 0)
         }
-        .padding(10)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
     }
 }
 

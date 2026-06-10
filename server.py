@@ -69,6 +69,7 @@ STATE_DIR = Path(os.environ.get("STATE_DIR") or (Path.home() / ".robinhood-trade
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 LAB_EVENTS_PATH     = STATE_DIR / "lab_events.jsonl"
 LAB_PEAK_EQUITY_PATH = STATE_DIR / "lab_peak_equity.json"
+LAB_EVENT_STATE_PATH  = STATE_DIR / "lab_event_state.json"
 DASHBOARD_PATH      = Path(__file__).parent / "portfolio_lab.html"
 
 MARKET_HOLIDAYS_2026 = {
@@ -179,13 +180,29 @@ def _live_score_refresh_loop() -> None:
 
 threading.Thread(target=_live_score_refresh_loop, daemon=True, name="live-score-refresh").start()
 
-# ── Portfolio event detection state ────────────────────────────────────────────
-_last_event_state: dict = {
-    "regime":        "",
-    "exit_symbols":  set(),
-    "news_symbols":  set(),
-    "risk_action":   "",
-}
+# ── Portfolio event detection state (persisted across pod restarts) ───────────
+def _load_event_state() -> dict:
+    """Load event state from disk; returns empty state on first run or error."""
+    try:
+        raw = json.loads(LAB_EVENT_STATE_PATH.read_text(encoding="utf-8"))
+        raw["exit_symbols"] = set(raw.get("exit_symbols") or [])
+        raw["news_symbols"] = set(raw.get("news_symbols") or [])
+        return raw
+    except Exception:
+        return {"regime": "", "exit_symbols": set(), "news_symbols": set(), "risk_action": ""}
+
+def _save_event_state(state: dict) -> None:
+    try:
+        serializable = {
+            **{k: v for k, v in state.items() if k not in ("exit_symbols", "news_symbols")},
+            "exit_symbols": list(state.get("exit_symbols") or []),
+            "news_symbols": list(state.get("news_symbols") or []),
+        }
+        LAB_EVENT_STATE_PATH.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning("Could not save event state: %s", e)
+
+_last_event_state: dict = _load_event_state()
 
 # ── Events log ─────────────────────────────────────────────────────────────────
 def _append_event(event_type: str, payload: dict) -> None:
@@ -946,6 +963,8 @@ class MarketNewsAgent:
 
         news_map = _get_news_for_symbols(held_syms)
         for sym in held_syms:
+            if sym.upper() in _BEAR_ETFS:
+                continue  # Bearish news is GOOD for inverse/vol ETFs — don't flag as risk
             articles = news_map.get(sym, [])
             delta, terms = _news_score_delta(articles)
             if delta < -5:
@@ -1400,8 +1419,13 @@ def _portfolio_narrative(
 
     if not pos_count:
         if avg_score == 0:
-            # No signals loaded yet — don't falsely call the market "bearish"
             why.append("You're fully in cash. Signal scan is running — entries appear when conditions are met.")
+        elif regime == "BEAR":
+            # Bear regime: high scores on bear ETFs are GOOD, not a "bullish" contradiction
+            if avg_score >= min_conviction:
+                why.append(f"You're fully in cash. Bear ETF signals scoring {avg_score} avg — at threshold for entries.")
+            else:
+                why.append(f"You're fully in cash. Watching for bear ETF setups (SQQQ, SPXS, UVXY) above {min_conviction}.")
         else:
             bias = "looking bullish" if avg_score >= 60 else "looking bearish" if avg_score <= 40 else "mixed"
             why.append(f"You're fully in cash. Market signals are {bias}.")
@@ -1424,11 +1448,14 @@ def _portfolio_narrative(
         elif regime == "BEAR" and pos_count > 0:
             next_actions.append("Market is heading down — tighten your stops and consider reducing exposure.")
         elif regime == "BEAR":
-            next_actions.append("Market is heading down. Stay in cash and wait for the trend to reverse.")
-        elif pos_count > 0:
-            next_actions.append("Market is choppy. Hold what you have and avoid adding new positions.")
+            if avg_score >= min_conviction:
+                next_actions.append(f"Bear ETFs scoring {avg_score} avg — system queuing SQQQ/SPXS/UVXY entries next tick.")
+            else:
+                next_actions.append(f"Bear regime. Watching for SQQQ/SPXS/UVXY to score ≥ {min_conviction}.")
+        elif regime in ("CHOPPY", "CHOP") and pos_count > 0:
+            next_actions.append(f"Market is choppy — system enters at 50% position size when signals score ≥ {min_conviction}.")
         elif regime in ("CHOPPY", "CHOP"):
-            next_actions.append("Market is choppy. Waiting for a clearer trend before deploying capital.")
+            next_actions.append(f"Market is choppy — scanner active. System enters at 50% size when conviction ≥ {min_conviction}.")
         else:
             next_actions.append("Waiting for market data before making a call.")
 
@@ -1520,12 +1547,14 @@ def _detect_and_emit_portfolio_events(
             })
 
     # Update tracked state
-    _last_event_state = {
+    new_state = {
         "regime":       regime,
         "exit_symbols": exit_syms,
         "news_symbols": news_syms,
         "risk_action":  risk_action,
     }
+    _last_event_state = new_state
+    _save_event_state(new_state)
 
 
 def _decision_from_orders(orders: list[dict], gate: dict, accounting: dict, live_scores: dict | None) -> dict:
@@ -1667,21 +1696,31 @@ def api_lab_activity():
 @app.route("/api/lab/portfolio/history")
 @require_api_key
 def api_lab_portfolio_history():
-    period = str(request.args.get("period") or "1M")
+    period    = str(request.args.get("period") or "1M")
     timeframe = str(request.args.get("timeframe") or "1D")
-    allowed_periods = {"1D", "7D", "15D", "1M", "3M", "6M", "1A", "all"}
+    start     = request.args.get("start")   # ISO date string e.g. 2026-01-15
+    end       = request.args.get("end")     # ISO date string e.g. 2026-03-01
+    allowed_periods    = {"1D", "7D", "15D", "1M", "3M", "6M", "1A", "all"}
     allowed_timeframes = {"1Min", "5Min", "15Min", "1H", "1D"}
 
-    if period not in allowed_periods:
+    if not start and period not in allowed_periods:
         return jsonify({"ok": False, "error": f"Unsupported period: {period}"}), 400
     if timeframe not in allowed_timeframes:
         return jsonify({"ok": False, "error": f"Unsupported timeframe: {timeframe}"}), 400
 
     try:
-        history = _coordinator.portfolio.history(period=period, timeframe=timeframe)
+        if start:
+            # Custom date range — pass start/end to Alpaca directly
+            history = get_client().get_portfolio_history(
+                timeframe=timeframe,
+                date_start=start,
+                date_end=end or None,
+            )
+        else:
+            history = _coordinator.portfolio.history(period=period, timeframe=timeframe)
         return jsonify({
             "ok": True,
-            "period": period,
+            "period": period if not start else "custom",
             "timeframe": timeframe,
             "history": history,
         })
@@ -2074,6 +2113,67 @@ def api_lab_chat_message():
             "summary": f"Close all {len(orders)} position(s) — paper trade only",
         }})
 
+    # ── Fast-path: "place orders" / "enter" / "execute signals" intent ────────
+    enter_keywords = {
+        "place orders", "place the orders", "place order",
+        "enter positions", "enter the positions", "enter trades",
+        "execute orders", "execute trades", "execute signals",
+        "make the trades", "make the trade", "submit orders",
+        "buy signals", "buy the signals", "deploy capital",
+        "go ahead", "just do it", "go for it", "do the trades",
+    }
+    if any(k in text_low for k in enter_keywords):
+        cached_signals = (scores_snap.get("signals") or scores_snap.get("top") or [])
+        held_syms = {p["symbol"].upper() for p in positions}
+        _model = strategy_model.load_model()
+        min_conv = int(_model.get("min_conviction", 75))
+        size_pct = float(_model.get("position_size_pct", 0.05))
+        regime_mult = 0.5 if regime in ("CHOPPY", "CHOP") else 1.0
+        orders = []
+        deployed = 0.0
+        for sig in cached_signals:
+            sym = str(sig.get("symbol") or "").upper()
+            score = int(float(sig.get("score") or 0))
+            if score < min_conv:
+                continue
+            if sym in held_syms:
+                continue
+            price = float((sig.get("quote") or {}).get("price") or 0)
+            if price <= 0:
+                try:
+                    price = get_client().get_current_price(sym) or 0
+                except Exception:
+                    pass
+            if price <= 0:
+                continue
+            alloc = equity * size_pct * regime_mult
+            qty = max(1, int(alloc / price))
+            cost = qty * price
+            if deployed + cost > cash * 0.95:
+                break
+            deployed += cost
+            orders.append({
+                "symbol": sym,
+                "side": "buy",
+                "qty": qty,
+                "estimated_value": round(cost, 2),
+            })
+        if not orders:
+            no_sig_reply = (
+                "No signals cached — run a scan first."
+                if not cached_signals else
+                f"No eligible signals above conviction {min_conv} that aren't already held."
+            )
+            return jsonify({"ok": True, "reply": no_sig_reply})
+        regime_note = " at 50% size (CHOPPY)" if regime_mult < 1 else ""
+        return jsonify({"ok": True, "trade_proposal": {
+            "orders": orders,
+            "summary": (
+                f"Enter top {len(orders)} signal(s){regime_note}: "
+                + ", ".join(f"{o['symbol']} x{o['qty']}" for o in orders)
+            ),
+        }})
+
     # ── System prompt ─────────────────────────────────────────────────────────
     system_prompt = """\
 You are an algorithmic trading analyst for an Alpaca PAPER trading account (no real money at risk).
@@ -2097,6 +2197,10 @@ When user asks to BUY or SELL (e.g. "buy 10 NVDA", "sell my TSLA"):
   Respond with ONLY this JSON (no markdown, no extra text):
   {"trade_proposal": {"orders": [{"symbol": "NVDA", "side": "buy", "qty": 10}], "summary": "Brief reason"}}
   - qty must be a positive integer; side must be "buy" or "sell"
+
+When user says to place/enter/execute orders or "go ahead" or "just do it" (e.g. "place orders", "enter positions", "go for it", "deploy capital"):
+  Respond with ONLY this JSON using the top qualifying signals from context (no markdown, no extra text):
+  {"action": "place_top_signals"}
 
 When user asks to run/trigger/start a scan or live scores (e.g. "run live scores", "do it now", "scan now", "refresh signals"):
   Respond with ONLY this JSON (no markdown, no extra text):
@@ -2186,6 +2290,43 @@ For all other queries respond in plain text. Never fabricate data not in context
                     threading.Thread(target=_run_live_scores, daemon=True).start()
                     return jsonify({"ok": True, "reply":
                         "Signal scan started. Takes ~30 seconds. Ask me 'what are the top signals?' when done."})
+                if parsed.get("action") == "place_top_signals":
+                    # Redirect to the same logic as the fast-path enter block
+                    cached_signals = (scores_snap.get("signals") or scores_snap.get("top") or [])
+                    held_syms = {p["symbol"].upper() for p in positions}
+                    _model = strategy_model.load_model()
+                    min_conv = int(_model.get("min_conviction", 75))
+                    size_pct = float(_model.get("position_size_pct", 0.05))
+                    regime_mult = 0.5 if regime in ("CHOPPY", "CHOP") else 1.0
+                    _orders = []
+                    _deployed = 0.0
+                    for _sig in cached_signals:
+                        _sym = str(_sig.get("symbol") or "").upper()
+                        if int(float(_sig.get("score") or 0)) < min_conv:
+                            continue
+                        if _sym in held_syms:
+                            continue
+                        _price = float((_sig.get("quote") or {}).get("price") or 0)
+                        if _price <= 0:
+                            continue
+                        _alloc = equity * size_pct * regime_mult
+                        _qty = max(1, int(_alloc / _price))
+                        _cost = _qty * _price
+                        if _deployed + _cost > cash * 0.95:
+                            break
+                        _deployed += _cost
+                        _orders.append({"symbol": _sym, "side": "buy", "qty": _qty,
+                                        "estimated_value": round(_cost, 2)})
+                    if _orders:
+                        _regime_note = " at 50% size (CHOPPY)" if regime_mult < 1 else ""
+                        return jsonify({"ok": True, "trade_proposal": {
+                            "orders": _orders,
+                            "summary": (
+                                f"Enter top {len(_orders)} signal(s){_regime_note}: "
+                                + ", ".join(f"{o['symbol']} x{o['qty']}" for o in _orders)
+                            ),
+                        }})
+                    return jsonify({"ok": True, "reply": "No eligible signals to enter right now."})
             except (json.JSONDecodeError, Exception):
                 pass
 
@@ -2244,8 +2385,8 @@ def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_
         desc = {
             "BULL":    "trending up — momentum strategies active.",
             "BEAR":    "trending down — hedges and exits favored.",
-            "CHOP":    "choppy — no new entries, staying in cash.",
-            "CHOPPY":  "choppy — no new entries, staying in cash.",
+            "CHOP":    "choppy — system trades at 50% size when signals score ≥ 63.",
+            "CHOPPY":  "choppy — system trades at 50% size when signals score ≥ 63.",
             "UNKNOWN": "still loading — signals refreshing.",
         }.get(regime, "still loading.")
         return f"Current market is {desc}"

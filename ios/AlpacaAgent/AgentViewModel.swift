@@ -14,6 +14,8 @@ class AgentViewModel: ObservableObject {
     @Published var lastOverviewAt: Date?
     @Published var overviewError: String?
     @Published var selectedPortfolioRange: PortfolioRange = .day
+    @Published var customRangeStart: Date = Calendar.current.date(byAdding: .month, value: -1, to: Date()) ?? Date()
+    @Published var customRangeEnd: Date = Date()
     @Published var portfolioPoints: [PortfolioPoint] = []
     @Published var portfolioRangePnl: Double = 0
     @Published var portfolioRangePnlPct: Double = 0
@@ -36,6 +38,7 @@ class AgentViewModel: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var prevRegime: String = ""
     private var prevPosCount: Int  = -1
+    private var prevSymbols: Set<String> = []
     private var prevVariant: String = ""
     private var initialized        = false
 
@@ -112,6 +115,7 @@ class AgentViewModel: ObservableObject {
             let openPnl = anyDouble(acctg["unrealized_pnl"])
             let posCount = anyInt(acctg["filled_position_count"])
             let positionRows = acctg["positions"] as? [[String: Any]] ?? []
+            let currentSymbols = positionRows.compactMap { $0["symbol"] as? String }.map { $0.uppercased() }
             let exitRows = acctg["exit_recommendations"] as? [[String: Any]] ?? []
             let regime  = scores["regime"] as? String ?? "CHOPPY"
             let isOpen  = clock["is_open"] as? Bool ?? false
@@ -148,11 +152,12 @@ class AgentViewModel: ObservableObject {
                              pnl: greetingPnl, posCount: posCount, newsRisks: newsRisks)
                 prevRegime   = regime
                 prevPosCount = posCount
+                prevSymbols  = Set(currentSymbols)
                 initialized  = true
             } else {
                 detectChanges(regime: regime, posCount: posCount,
-                              openPnl: openPnl, newsRisks: newsRisks,
-                              variant: strategyModel.activeVariant)
+                              symbols: currentSymbols, openPnl: openPnl,
+                              newsRisks: newsRisks, variant: strategyModel.activeVariant)
             }
         } catch {
             overviewError = error.localizedDescription
@@ -183,8 +188,8 @@ class AgentViewModel: ObservableObject {
     }
 
     private func detectChanges(regime: String, posCount: Int,
-                                openPnl: Double, newsRisks: [[String: Any]],
-                                variant: String) {
+                                symbols: [String], openPnl: Double,
+                                newsRisks: [[String: Any]], variant: String) {
         if regime != prevRegime && !prevRegime.isEmpty {
             let msgs: [String: String] = [
                 "BULL":   "Regime → BULL. Momentum active — running signal scan.",
@@ -199,20 +204,27 @@ class AgentViewModel: ObservableObject {
             prevRegime = regime
         }
 
-        if prevPosCount >= 0 && posCount != prevPosCount {
-            if posCount > prevPosCount {
-                let n = posCount - prevPosCount
-                let msg = "\(n) holding\(n > 1 ? "s" : "") opened. \(posCount) total."
+        let currentSet = Set(symbols.map { $0.uppercased() })
+        if prevPosCount >= 0 && currentSet != prevSymbols {
+            let added   = currentSet.subtracting(prevSymbols)
+            let removed = prevSymbols.subtracting(currentSet)
+
+            if !added.isEmpty {
+                let syms = added.sorted().joined(separator: ", ")
+                let msg = "Entered \(syms). \(currentSet.count) position\(currentSet.count == 1 ? "" : "s") open."
                 addMessage(ChatMessage(msg, role: .agent, variant: .trade))
-                notify(title: "Trade Executed", body: msg, sound: .defaultCritical)
-            } else if prevPosCount > 0 {
+                notify(title: "Position Opened", body: msg, sound: .defaultCritical)
+            }
+            if !removed.isEmpty {
                 let sign = openPnl >= 0 ? "+" : ""
-                let msg = "Holding closed. Open P&L: \(sign)\(fmt$(abs(openPnl)))"
+                let syms = removed.sorted().joined(separator: ", ")
+                let msg = "Closed \(syms). Open P&L: \(sign)\(fmt$(abs(openPnl)))"
                 addMessage(ChatMessage(msg, role: .agent))
                 notify(title: "Position Closed", body: msg)
             }
-            prevPosCount = posCount
         }
+        prevSymbols  = currentSet
+        prevPosCount = posCount
 
         if !prevVariant.isEmpty && variant != prevVariant && variant != "current" {
             let msg = "Strategy optimized → \(variant). Indicator weights adjusted for today."
@@ -294,7 +306,16 @@ class AgentViewModel: ObservableObject {
     func selectPortfolioRange(_ range: PortfolioRange) {
         guard range != selectedPortfolioRange else { return }
         selectedPortfolioRange = range
-        Task { await fetchPortfolioHistory(for: range) }
+        if range != .custom {
+            Task { await fetchPortfolioHistory(for: range) }
+        }
+    }
+
+    func selectCustomRange(start: Date, end: Date) {
+        customRangeStart = start
+        customRangeEnd = end
+        selectedPortfolioRange = .custom
+        Task { await fetchPortfolioHistoryCustom(start: start, end: end) }
     }
 
     private func fetchPortfolioHistory(for range: PortfolioRange) async {
@@ -499,6 +520,47 @@ class AgentViewModel: ObservableObject {
         return formatter.string(from: NSNumber(value: n)) ?? "$\(Int(n))"
     }
 
+    private func fetchPortfolioHistoryCustom(start: Date, end: Date) async {
+        isLoadingPortfolioHistory = true
+        defer { isLoadingPortfolioHistory = false }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd"
+        let days = Calendar.current.dateComponents([.day], from: start, to: end).day ?? 30
+        let timeframe = days <= 7 ? "15Min" : "1D"
+        do {
+            var request = Config.request("/api/lab/portfolio/history")
+            var components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+            components.queryItems = [
+                URLQueryItem(name: "start", value: fmt.string(from: start)),
+                URLQueryItem(name: "end",   value: fmt.string(from: end)),
+                URLQueryItem(name: "timeframe", value: timeframe),
+            ]
+            request.url = components.url
+            let (data, _) = try await URLSession.shared.data(for: request)
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let hist = json["history"] as? [String: Any] {
+                let timestamps = hist["timestamp"] as? [Any] ?? []
+                let equities   = hist["equity"]    as? [Any] ?? []
+                let count = min(timestamps.count, equities.count)
+                let pts = (0..<count).compactMap { i -> PortfolioPoint? in
+                    guard let date = anyDate(timestamps[i]) else { return nil }
+                    let eq = anyDouble(equities[i])
+                    guard eq > 0 else { return nil }
+                    return PortfolioPoint(time: date, equity: eq)
+                }
+                await MainActor.run {
+                    portfolioPoints = pts
+                    if let first = pts.first?.equity, let last = pts.last?.equity {
+                        portfolioRangePnl    = last - first
+                        portfolioRangePnlPct = first > 0 ? (last - first) / first * 100 : 0
+                    }
+                }
+            }
+        } catch {
+            // silently ignore — keep existing chart
+        }
+    }
+
     private func historyRequest(for range: PortfolioRange) -> (period: String, timeframe: String) {
         switch range {
         case .day:
@@ -636,7 +698,13 @@ class AgentViewModel: ObservableObject {
             case ("BULL", _) where cashPct > 25:
                 next.append("Market is trending up and you have \(Int(cashPct))% in cash — good time to look for new entries.")
             case ("BEAR", let n) where n > 0:
-                next.append("Market is heading down — tighten your stops and consider reducing exposure.")
+                let bearETFs: Set<String> = ["SQQQ","SPXS","SPXU","SOXS","UVXY","VIXY","SDOW","SRTY","TECS"]
+                let holdingBearETFs = positions.contains { bearETFs.contains($0.symbol.uppercased()) }
+                if holdingBearETFs {
+                    next.append("Market heading down — your bear/inverse positions are working. Keep stops tight and let them run.")
+                } else {
+                    next.append("Market is heading down — tighten your stops and consider reducing exposure.")
+                }
             case ("BEAR", _):
                 next.append("Market is heading down. Stay in cash and wait for the trend to reverse.")
             case (_, let n) where n > 0:
@@ -719,6 +787,7 @@ class AgentViewModel: ObservableObject {
                 trendDirection: anyString(technicals["trend_direction"], fallback: "--"),
                 priceVsTrendPct: anyDouble(technicals["price_vs_trend_pct"]),
                 fibPosition: anyString(technicals["fib_position"], fallback: "--"),
+                lastPrice: anyDouble(quote["price"]),
                 reasons: item["technical_reasons"] as? [String] ?? []
             )
             insight.signalBreakdown = breakdown
@@ -804,12 +873,19 @@ class AgentViewModel: ObservableObject {
             variant = .alert
 
         case "news_risk_detected":
-            let sym   = anyString(payload["symbol"], fallback: "position")
+            let sym   = anyString(payload["symbol"], fallback: "position").uppercased()
             let delta = anyInt(payload["delta"] as Any)
             let head  = anyString(payload["headline"], fallback: "")
-            title  = "Negative news detected"
-            detail = head.isEmpty ? "Sentiment drop on \(sym) (Δ\(delta))." : "\(sym): \(head.prefix(80))"
-            variant = .danger
+            let bearETFs: Set<String> = ["SQQQ","SPXS","SPXU","SOXS","UVXY","VIXY","SDOW","SRTY","TECS"]
+            if bearETFs.contains(sym) {
+                title  = "Market risk signal"
+                detail = head.isEmpty ? "Bearish signal on \(sym) — may benefit this short position." : "\(sym): \(head.prefix(80)) · bearish news may help this position"
+                variant = .alert
+            } else {
+                title  = "Negative news detected"
+                detail = head.isEmpty ? "Sentiment drop on \(sym) (Δ\(delta))." : "\(sym): \(head.prefix(80))"
+                variant = .danger
+            }
 
         case "exit_triggered":
             let sym    = anyString(payload["symbol"], fallback: "position")

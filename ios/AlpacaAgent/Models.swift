@@ -143,6 +143,7 @@ struct SignalInsight: Identifiable {
     let trendDirection: String
     let priceVsTrendPct: Double
     let fibPosition: String
+    let lastPrice: Double
     let reasons: [String]
     /// Keyed by indicator name: "rsi" | "macd" | "avwap" | "ema" | "trend" | "price_action"
     var signalBreakdown: [String: SignalIndicator] = [:]
