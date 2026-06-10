@@ -28,3 +28,8 @@ xcuserdata/
 .robinhood-trader/
 state/
 strategy_model.py
+
+signals.py
+trader.py
+backtest.py
+config.py
