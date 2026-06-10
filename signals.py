@@ -42,7 +42,7 @@ MOMENTUM_STOCKS = [
 
 BULL_UNIVERSE = BULL_ETF + MOMENTUM_STOCKS
 BEAR_UNIVERSE = BEAR_ETF
-ALL_SYMBOLS   = ["SPY", "QQQ"] + BULL_UNIVERSE + BEAR_UNIVERSE
+ALL_SYMBOLS   = ["SPY", "QQQ", "VIX"] + BULL_UNIVERSE + BEAR_UNIVERSE
 
 MIN_CONVICTION = 65   # 0-100 scale; ≥65 required to generate a signal
 MAX_POSITIONS  = 5    # max concurrent positions
@@ -98,21 +98,84 @@ VARIANT_PROFILES: dict[str, dict] = {
 # ── Regime detection ──────────────────────────────────────────────────────────
 def detect_regime(quotes: dict) -> str:
     """
-    BULL   — QQQ ≥ +0.4% AND index average ≥ +0.3%
-    BEAR   — QQQ ≤ −0.5% AND index average ≤ −0.4%
-    CHOPPY — everything else (still trade, 50% position size)
+    Multi-factor regime detection. Four signals are scored:
+
+      1. Intraday momentum  — QQQ + SPY change_pct (same as before)
+      2. Trend context      — SPY EMA9 vs EMA21 from technicals (multi-day)
+      3. Volatility level   — VIX price: <18 calm, 18-25 elevated, >25 stressed
+      4. Directional range  — SPY ATR% vs trend slope (wide range + flat = choppy)
+
+    BULL   — momentum up + trend bullish + VIX calm/moderate
+    BEAR   — momentum down + trend bearish + VIX elevated/stressed
+    CHOPPY — explicitly: flat momentum OR VIX stressed with no direction
+             OR trend and momentum disagree
     """
-    qqq = float((quotes.get("QQQ") or {}).get("change_pct") or 0)
-    spy = float((quotes.get("SPY") or {}).get("change_pct") or 0)
-    avg = (qqq + spy) / 2
-    if qqq >= 0.4 and avg >= 0.3:    return "BULL"
-    if qqq <= -0.5 and avg <= -0.4:  return "BEAR"
+    qqq       = float((quotes.get("QQQ") or {}).get("change_pct") or 0)
+    spy       = float((quotes.get("SPY") or {}).get("change_pct") or 0)
+    avg       = (qqq + spy) / 2
+
+    spy_tech  = (quotes.get("SPY") or {}).get("technicals") or {}
+    vix_price = float((quotes.get("VIX") or {}).get("price") or 0)
+
+    # ── 1. Intraday momentum signal ───────────────────────────────────────────
+    if qqq >= 0.4 and avg >= 0.3:
+        momentum = "bull"
+    elif qqq <= -0.5 and avg <= -0.4:
+        momentum = "bear"
+    else:
+        momentum = "flat"
+
+    # ── 2. Multi-day trend: SPY EMA9 vs EMA21 ────────────────────────────────
+    ema_trend = str(spy_tech.get("ema_trend") or "")   # "bullish" | "bearish"
+    ema_spread = float(spy_tech.get("ema_spread_pct") or 0)  # >0 = bull, <0 = bear
+    if ema_trend == "bullish" and ema_spread > 0.1:
+        trend = "bull"
+    elif ema_trend == "bearish" and ema_spread < -0.1:
+        trend = "bear"
+    else:
+        trend = "flat"
+
+    # ── 3. VIX volatility regime ──────────────────────────────────────────────
+    if vix_price <= 0:
+        vix_regime = "unknown"
+    elif vix_price < 18:
+        vix_regime = "calm"       # low fear — bull conditions
+    elif vix_price < 25:
+        vix_regime = "elevated"   # moderate fear — can trade but size down
+    else:
+        vix_regime = "stressed"   # high fear — choppy/bear, avoid longs
+
+    # ── 4. Directional range: high ATR + flat trend = choppy ─────────────────
+    atr_pct     = float(spy_tech.get("atr_pct") or 0)
+    trend_slope = float(spy_tech.get("trend_slope_pct") or 0)
+    # Wide daily range but near-zero slope = whipsaw, not trend
+    ranging = atr_pct > 0.8 and abs(trend_slope) < 0.05
+
+    # ── Decision logic ────────────────────────────────────────────────────────
+    # CHOPPY: explicitly bail out when conditions are unclear
+    if ranging:
+        return "CHOPPY"
+    if vix_regime == "stressed" and momentum != "bear":
+        return "CHOPPY"   # VIX spiking but market not clearly selling — danger zone
+    if momentum == "flat":
+        return "CHOPPY"
+    if momentum != trend and trend != "flat":
+        return "CHOPPY"   # intraday and multi-day disagree — wait for resolution
+
+    # BULL: momentum up, trend confirms, VIX not stressed
+    if momentum == "bull" and vix_regime in ("calm", "elevated", "unknown"):
+        return "BULL"
+
+    # BEAR: momentum down, trend confirms or VIX stressed
+    if momentum == "bear":
+        return "BEAR"
+
     return "CHOPPY"
 
 
 def regime_size_multiplier(regime: str) -> float:
     """Scale position size by regime conviction. CHOPPY = 50%, never 0."""
-    return {"BULL": 1.0, "BEAR": 1.0, "CHOPPY": 0.5}.get(regime, 0.5)
+    return {"BULL": 1.0, "BEAR": 1.0, "CHOPPY": 1.0}.get(regime, 1.0)
 
 
 # ── Indicator enrichment ──────────────────────────────────────────────────────
@@ -135,22 +198,24 @@ def enrich_quotes_with_indicators(
 
     bars_by_sym: dict[str, list[dict]] = {}   # sym → list of OHLCV row dicts
 
-    # ── 1. Alpaca bars (preferred) ────────────────────────────────────────────
+    # ── 1. Alpaca bars (preferred, with fallback for IEX ETF gaps) ───────────
     if alpaca_client is not None:
-        try:
-            import zoneinfo
-            _et = zoneinfo.ZoneInfo("America/New_York")
-            now_et = __import__("datetime").datetime.now(_et)
-            _mins = now_et.hour * 60 + now_et.minute
-            _market_open = now_et.weekday() < 5 and 570 <= _mins < 960
+        import zoneinfo as _tz
+        _et = _tz.ZoneInfo("America/New_York")
+        now_et = __import__("datetime").datetime.now(_et)
+        _mins = now_et.hour * 60 + now_et.minute
+        _market_open = now_et.weekday() < 5 and 570 <= _mins < 960
 
-            tf = "15min" if _market_open else "1day"
-            limit = 200 if _market_open else 120
-            alpaca_bars = alpaca_client.get_historical_bars(clean, timeframe=tf, limit=limit)
-
-            for sym, df in alpaca_bars.items():
+        def _absorb_bars(bars_dict: dict) -> None:
+            """Parse a get_historical_bars result into bars_by_sym."""
+            for sym, df in bars_dict.items():
+                _sym = sym.upper()
                 if df is None or df.empty:
                     continue
+                # Allow overwrite if existing bars are too thin for compute_technicals
+                if _sym in bars_by_sym and len(bars_by_sym[_sym]) >= 26:
+                    continue
+                sym = _sym
                 rows = []
                 for _, r in df.iterrows():
                     close = float(r.get("close", 0) or 0)
@@ -166,17 +231,100 @@ def enrich_quotes_with_indicators(
                     })
                 if rows:
                     bars_by_sym[sym.upper()] = rows
+
+        try:
+            # Primary: 15min during market hours, daily otherwise
+            tf = "15min" if _market_open else "1day"
+            limit = 200 if _market_open else 120
+            _absorb_bars(alpaca_client.get_historical_bars(clean, timeframe=tf, limit=limit))
+
+            # Fallback 1: 1hour bars for symbols still missing OR with too few bars (IEX intraday-only)
+            still_missing = [s for s in clean if s not in bars_by_sym or len(bars_by_sym[s]) < 26]
+            if still_missing and _market_open:
+                logging.getLogger("signals").info(
+                    "Retrying %d symbols with 1hour bars: %s", len(still_missing), still_missing
+                )
+                _absorb_bars(alpaca_client.get_historical_bars(still_missing, timeframe="1hour", limit=60))
+
+            # Fallback 2: daily bars — always available for all symbols (including thin intraday)
+            still_missing = [s for s in clean if s not in bars_by_sym or len(bars_by_sym[s]) < 26]
+            if still_missing:
+                logging.getLogger("signals").info(
+                    "Retrying %d symbols with 1day bars: %s", len(still_missing), still_missing
+                )
+                _absorb_bars(alpaca_client.get_historical_bars(still_missing, timeframe="1day", limit=120))
+
         except Exception as e:
             logging.getLogger("signals").warning("Alpaca bars failed: %s", e)
 
-    missing_from_alpaca = [s for s in clean if s not in bars_by_sym]
+    missing_from_alpaca = [s for s in clean if s not in bars_by_sym or len(bars_by_sym[s]) < 26]
     if missing_from_alpaca:
-        logging.getLogger("signals").warning(
-            "Alpaca bars missing for %d/%d symbols: %s",
-            len(missing_from_alpaca), len(clean), missing_from_alpaca,
-        )
+        # Use yfinance 1-hour intraday bars — same signal character as Alpaca 1hour fallback.
+        # Daily bars are NOT used; intraday-only ensures MACD/RSI reflect current momentum.
+        try:
+            import yfinance as yf
+            import datetime as _dt2
+            _yf_start = (_dt2.datetime.now(_dt2.timezone.utc) - _dt2.timedelta(days=59)).strftime("%Y-%m-%d")
+            tickers = yf.download(
+                missing_from_alpaca,
+                start=_yf_start,
+                interval="1h",
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+            def _parse_yf(df_sym, sym):
+                rows = []
+                for ts, r in df_sym.iterrows():
+                    close = float(r.get("Close") or 0)
+                    if close <= 0:
+                        continue
+                    rows.append({
+                        "open":   float(r.get("Open",   close) or close),
+                        "high":   float(r.get("High",   close) or close),
+                        "low":    float(r.get("Low",    close) or close),
+                        "close":  close,
+                        "volume": float(r.get("Volume", 0)     or 0),
+                        "vwap":   0.0,
+                    })
+                if len(rows) >= 26:
+                    bars_by_sym[sym.upper()] = rows
+            if hasattr(tickers.columns, "levels"):
+                for sym in missing_from_alpaca:
+                    try:
+                        df_sym = tickers.xs(sym.upper(), axis=1, level=1) if sym.upper() in tickers.columns.get_level_values(1) else None
+                        if df_sym is not None and not df_sym.empty:
+                            _parse_yf(df_sym, sym)
+                    except Exception:
+                        pass
+            elif not tickers.empty and len(missing_from_alpaca) == 1:
+                _parse_yf(tickers, missing_from_alpaca[0])
+            yf_got = [s for s in missing_from_alpaca if s.upper() in bars_by_sym]
+            logging.getLogger("signals").info(
+                "yfinance 1h filled %d/%d symbols", len(yf_got), len(missing_from_alpaca)
+            )
+            still_unscored = [s for s in missing_from_alpaca if s.upper() not in bars_by_sym]
+            if still_unscored:
+                logging.getLogger("signals").warning(
+                    "No intraday bars for %d symbols (will not score): %s",
+                    len(still_unscored), still_unscored,
+                )
+        except Exception as _yf_err:
+            logging.getLogger("signals").warning(
+                "yfinance 1h fallback failed: %s — %d symbols will not score",
+                _yf_err, len(missing_from_alpaca),
+            )
 
-    # ── Compute technicals from bars ──────────────────────────────────────────
+        # ── Compute technicals from bars ──────────────────────────────────────────
+    # Log bar counts for diagnostics
+    _bar_counts = {s: len(bars_by_sym[s]) for s in bars_by_sym}
+    _thin = {s: n for s, n in _bar_counts.items() if n < 26}
+    logging.getLogger("signals").info(
+        "Bar counts: %d symbols, thin(<26): %s, sample: %s",
+        len(_bar_counts),
+        _thin or "none",
+        dict(list(_bar_counts.items())[:4]),
+    )
     qqq_return = None
     enriched = dict(quotes)
     for sym in clean:
@@ -316,11 +464,11 @@ def _signal_breakdown(
 
     # ── RSI ────────────────────────────────────────────────────────────────────
     if bullish:
-        if 52 <= rsi_val <= 70:
+        if 52 <= rsi_val <= 76:
             rc, rs, rl = 1.0, "bullish", f"RSI {rsi_val:.0f} — momentum sweet zone"
-        elif 70 < rsi_val <= 80:
+        elif 76 < rsi_val <= 84:
             rc, rs, rl = 0.3, "neutral", f"RSI {rsi_val:.0f} — getting extended"
-        elif rsi_val > 80:
+        elif rsi_val > 84:
             rc, rs, rl = -0.5, "bearish", f"RSI {rsi_val:.0f} — overbought, risk of reversal"
         elif 45 <= rsi_val < 52:
             rc, rs, rl = 0.1, "neutral", f"RSI {rsi_val:.0f} — warming up"
@@ -482,11 +630,15 @@ def score_symbol(
     in_bear = sym in BEAR_ETF
 
     if regime == "BEAR":
-        # Bear ETFs are our long play — score them on bearish market conditions
-        # Stocks: evaluate as longs (can still run), but size will be 50%
-        bullish = not in_bear
+        # Bear ETFs (SQQQ/SPXS/UVXY) are LONG plays — they go UP when market falls.
+        # Score them with bullish=True so rising MACD/EMA/RSI on the ETF itself signals a good entry.
+        # Exclude them in BULL/CHOPPY (inverse ETFs have no place in an uptrend).
+        if in_bear:
+            bullish = True   # long the inverse ETF
+        else:
+            bullish = True   # stocks can still run even in bear regime
     else:
-        # BULL or CHOPPY: bear ETFs don't belong, everything else scored bullish
+        # BULL or CHOPPY: bear ETFs don't belong
         if in_bear:
             return 0, {}
         bullish = True
@@ -496,10 +648,10 @@ def score_symbol(
 
     # Mild penalty for strong intraday counter-moves
     chg = float(q.get("change_pct") or 0)
-    if bullish and chg < -1.5:
-        score = max(0, score - 8)   # falling stock on long side
-    elif not bullish and chg > 1.5:
-        score = max(0, score - 8)   # bear ETF falling hard = bad sign
+    if chg < -1.5 and not in_bear:
+        score = max(0, score - 8)   # regular stock falling hard on long entry
+    elif chg > 1.5 and in_bear:
+        score = max(0, score - 8)   # inverse ETF rising = market recovering = bad bear entry
 
     return score, breakdown
 
@@ -533,7 +685,7 @@ class TradeSignal:
 
 
 # ── Main signal scan ──────────────────────────────────────────────────────────
-def get_signals(quotes: dict, profile_name: str = "current") -> list[TradeSignal]:
+def get_signals(quotes: dict, profile_name: str = "current", min_conviction: int | None = None) -> list[TradeSignal]:
     """
     Scan all symbols, return top signals ranked by conviction.
 
@@ -544,7 +696,7 @@ def get_signals(quotes: dict, profile_name: str = "current") -> list[TradeSignal
     regime  = detect_regime(quotes)
     profile = VARIANT_PROFILES.get(profile_name) or {}
 
-    min_conv   = int(profile.get("conviction_override",  MIN_CONVICTION))
+    min_conv   = min_conviction if min_conviction is not None else int(profile.get("conviction_override",  MIN_CONVICTION))
     max_pos    = int(profile.get("max_pos_override",     MAX_POSITIONS))
     etf_only   = bool(profile.get("etf_only",           False))
     ind_weights = {k: v for k, v in profile.items() if k not in _PROFILE_PARAM_KEYS}
@@ -556,10 +708,20 @@ def get_signals(quotes: dict, profile_name: str = "current") -> list[TradeSignal
         universe = [s for s in universe if s in etf_set]
 
     results: list[TradeSignal] = []
+    all_scores: list[tuple[str, int]] = []   # debug: all scored symbols
+
     for sym in universe:
         score, breakdown = score_symbol(sym, quotes, regime, weights=ind_weights)
+        all_scores.append((sym, score))
         if score < min_conv:
             continue
+
+        # Hard veto: MACD negative and falling = momentum against us — no entry
+        if breakdown.get("macd", {}).get("label") == "MACD negative and falling":
+            logging.getLogger("signals").info(
+                "MACD veto: %s (score=%d) — MACD negative and falling, skipping", sym, score)
+            continue
+
 
         tech  = (quotes.get(sym) or {}).get("technicals") or {}
         price = float((quotes.get(sym) or {}).get("price") or
@@ -581,6 +743,14 @@ def get_signals(quotes: dict, profile_name: str = "current") -> list[TradeSignal
             signals=signal_labels,
             signal_breakdown=breakdown,
         ))
+
+    # Always log top 8 scores so we can see how close symbols are to threshold
+    top = sorted(all_scores, key=lambda x: x[1], reverse=True)[:8]
+    logging.getLogger("signals").info(
+        "Top scores (min=%d, regime=%s): %s",
+        min_conv, regime,
+        ", ".join(f"{s}={sc}" for s, sc in top),
+    )
 
     return sorted(results, key=lambda x: x.score, reverse=True)[:max_pos]
 
