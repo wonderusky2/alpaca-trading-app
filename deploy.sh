@@ -128,9 +128,9 @@ if [[ -f "${SCRIPT_DIR}/qa_agent.py" ]] && ( $APPLY || $RESTART ); then
 
   echo ""
   echo "→ Running post-deploy QA suite..."
-  # Write strategy_model.json to pod after every deploy (fresh pod loses state)
+  # QA_SERVER_URL points qa_agent at the live pod — default is localhost which doesn't work in CI.
   # --fix is intentionally omitted: post-deploy QA must never mutate live pod state.
-  if python3 "${SCRIPT_DIR}/qa_agent.py" --pod; then
+  if QA_SERVER_URL="http://34.60.235.98:5001" python3 "${SCRIPT_DIR}/qa_agent.py" --pod; then
     echo "✓ QA passed."
   else
     echo ""
