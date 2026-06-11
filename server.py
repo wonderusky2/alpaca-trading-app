@@ -42,6 +42,74 @@ log = get_logger("server")
 app = Flask(__name__)
 CORS(app)
 
+# ── Push notification device token store (#41) ────────────────────────────────
+_PUSH_TOKENS_PATH = strategy_model.STATE_DIR / "push_tokens.json"
+
+def _load_push_tokens() -> list[str]:
+    try:
+        if _PUSH_TOKENS_PATH.exists():
+            return json.loads(_PUSH_TOKENS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return []
+
+def _save_push_tokens(tokens: list[str]) -> None:
+    try:
+        strategy_model.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        _PUSH_TOKENS_PATH.write_text(json.dumps(list(set(tokens))), encoding="utf-8")
+    except Exception as e:
+        log.warning("save push tokens failed: %s", e)
+
+def send_push_notification(title: str, body: str, data: dict | None = None) -> int:
+    """Send APNs push to all registered devices. Returns count of attempted sends.
+
+    Uses HTTP/2 APNs provider API via the 'httpx' library if available.
+    Falls back silently if APNs is not configured.
+    """
+    apns_key   = os.environ.get("APNS_AUTH_KEY", "")
+    apns_key_id = os.environ.get("APNS_KEY_ID", "")
+    apns_team  = os.environ.get("APNS_TEAM_ID", "")
+    bundle_id  = os.environ.get("APNS_BUNDLE_ID", "com.johnshelest.AlpacaAgent")
+    tokens     = _load_push_tokens()
+    if not tokens or not all([apns_key, apns_key_id, apns_team]):
+        return 0   # not configured — silent no-op
+    try:
+        import jwt as _jwt, time as _time, httpx as _httpx
+        issued = int(_time.time())
+        token = _jwt.encode(
+            {"iss": apns_team, "iat": issued},
+            apns_key,
+            algorithm="ES256",
+            headers={"kid": apns_key_id},
+        )
+        headers = {
+            "authorization": f"bearer {token}",
+            "apns-topic": bundle_id,
+            "apns-push-type": "alert",
+        }
+        payload = {
+            "aps": {"alert": {"title": title, "body": body}, "sound": "default"},
+            **(data or {}),
+        }
+        sent = 0
+        apns_host = "https://api.push.apple.com"
+        with _httpx.Client(http2=True, timeout=10) as client:
+            for device_token in tokens:
+                url = f"{apns_host}/3/device/{device_token}"
+                r = client.post(url, json=payload, headers=headers)
+                if r.status_code == 200:
+                    sent += 1
+                else:
+                    log.warning("APNs rejected token %s…: %s %s",
+                                device_token[:8], r.status_code, r.text)
+        return sent
+    except ImportError:
+        log.debug("APNs push skipped — jwt/httpx not installed")
+        return 0
+    except Exception as e:
+        log.warning("APNs push failed: %s", e)
+        return 0
+
 # ── API key auth ───────────────────────────────────────────────────────────────
 _LAB_API_KEY: str = os.environ.get("LAB_API_KEY", "").strip()
 
@@ -689,9 +757,9 @@ def _run_live_scores() -> dict:
             # Plain-English technical reasons from per-indicator breakdown
             technical_reasons = [bd["label"] for bd in breakdown.values() if bd.get("label")]
 
-            # Gemini borderline boost (only 60-74, already in signals.py)
-            if 60 <= base_score < 75:
-                base_score += sg.gemini_sentiment_boost(sym, base_score)
+            # Gemini sentiment boost — cached, fires for borderline scores (#34)
+            if 40 <= base_score <= 72:
+                base_score += sg.gemini_sentiment_boost_cached(sym, base_score)
 
             # Alpaca news delta
             articles = news_map.get(sym, [])
@@ -2532,6 +2600,175 @@ def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_
     return (f"Equity ${equity:,.0f} | P&L ${daily_pnl:+,.0f} | Regime {regime} | "
             f"{'No positions' if not pos_lines else str(len(pos_lines)) + ' positions open'}. "
             "Ask me about positions, signals, P&L, regime, orders, variant history, or model settings.")
+
+
+@app.route("/api/lab/push/register", methods=["POST"])
+@require_api_key
+def api_push_register():
+    """Register a device token for APNs push notifications (#41)."""
+    body  = request.get_json(silent=True) or {}
+    token = str(body.get("device_token") or "").strip()
+    if not token:
+        return jsonify({"ok": False, "error": "device_token required"}), 400
+    tokens = _load_push_tokens()
+    if token not in tokens:
+        tokens.append(token)
+        _save_push_tokens(tokens)
+        log.info("Push token registered (%d total)", len(tokens))
+    return jsonify({"ok": True, "registered": len(tokens)})
+
+
+@app.route("/api/lab/push/send", methods=["POST"])
+@require_api_key
+def api_push_send():
+    """Manually fire a push notification (test / admin use)."""
+    body  = request.get_json(silent=True) or {}
+    title = str(body.get("title") or "Alpaca Agent")
+    msg   = str(body.get("body")  or "")
+    if not msg:
+        return jsonify({"ok": False, "error": "body required"}), 400
+    sent = send_push_notification(title, msg)
+    return jsonify({"ok": True, "sent": sent})
+
+
+@app.route("/api/lab/gaps")
+@require_api_key
+def api_lab_gaps():
+    """Pre-market gap scanner (#33) — returns symbols with |overnight gap| >= min_gap_pct.
+
+    Query params:
+      min_gap_pct  float  default 1.5
+    """
+    try:
+        min_gap = float(request.args.get("min_gap_pct") or 1.5)
+        client = get_client()
+        gaps = sg.scan_premarket_gaps(min_gap_pct=min_gap, alpaca_client=client)
+        return jsonify({"ok": True, "gaps": gaps, "min_gap_pct": min_gap})
+    except Exception as e:
+        log.warning("gaps error: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/lab/analytics/pnl-attribution")
+@require_api_key
+def api_lab_pnl_attribution():
+    """P&L attribution by signal factor (#39).
+
+    Joins the trade ledger with signal_snapshot to break down win rate and
+    average P&L per contributing indicator (rsi, macd, avwap, ema, trend,
+    price_action).  Only considers closed (sell) trades with a signal_snapshot
+    on the corresponding buy.
+    """
+    try:
+        import json as _json
+        limit = min(int(request.args.get("limit") or 500), 2000)
+        trades = trade_ledger.recent_trades(limit=limit)
+
+        # Build buy snapshot index: symbol+recorded_at → snapshot
+        buy_map: dict[str, dict] = {}
+        for t in trades:
+            if t["side"] == "buy" and t.get("signal_snapshot"):
+                try:
+                    snap = _json.loads(t["signal_snapshot"])
+                    buy_map[t["symbol"]] = snap
+                except Exception:
+                    pass
+
+        # Accumulate per-factor stats from sell rows
+        factor_stats: dict[str, dict] = {}
+        for t in trades:
+            if t["side"] != "sell" or t.get("pnl") is None:
+                continue
+            snap = buy_map.get(t["symbol"])
+            if not snap:
+                continue
+            breakdown = snap.get("breakdown") or {}
+            pnl = float(t["pnl"])
+            won = pnl > 0
+            for factor, bd in breakdown.items():
+                if not isinstance(bd, dict):
+                    continue
+                bias = bd.get("bias") or bd.get("candle_bias") or ""
+                if not bias or bias == "neutral":
+                    continue
+                key = f"{factor}:{bias}"
+                fs = factor_stats.setdefault(key, {"wins": 0, "losses": 0, "total_pnl": 0.0})
+                if won:
+                    fs["wins"] += 1
+                else:
+                    fs["losses"] += 1
+                fs["total_pnl"] += pnl
+
+        results = []
+        for key, fs in factor_stats.items():
+            total = fs["wins"] + fs["losses"]
+            results.append({
+                "factor":      key,
+                "trades":      total,
+                "wins":        fs["wins"],
+                "losses":      fs["losses"],
+                "win_rate":    round(fs["wins"] / total * 100, 1) if total else 0,
+                "total_pnl":   round(fs["total_pnl"], 2),
+                "avg_pnl":     round(fs["total_pnl"] / total, 2) if total else 0,
+            })
+        results.sort(key=lambda x: x["total_pnl"], reverse=True)
+
+        summary = trade_ledger.win_loss_summary(limit=limit)
+        return jsonify({"ok": True, "attribution": results, "summary": summary})
+    except Exception as e:
+        log.warning("pnl attribution error: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/lab/analytics/drift")
+@require_api_key
+def api_lab_drift():
+    """Live win-rate vs backtest expectation drift detector (#40).
+
+    Returns a drift alert if the rolling live win rate deviates > 15 percentage
+    points from the backtest win rate stored in strategy_model.
+    """
+    try:
+        import json as _json
+        # Live stats
+        live_summary = trade_ledger.win_loss_summary(limit=100)
+        live_win_rate = float(live_summary.get("win_rate_pct") or 0)
+        live_trades   = int(live_summary.get("trades") or 0)
+
+        # Backtest expectation from last model
+        model = strategy_model.load_model()
+        bt_win_rate = float(model.get("backtest_win_rate_pct") or 0)
+        if bt_win_rate == 0:
+            # Try to pull from the last variant result file
+            try:
+                opt_path = strategy_model.STATE_DIR / "last_optimization.json"
+                if opt_path.exists():
+                    opt = _json.loads(opt_path.read_text(encoding="utf-8"))
+                    bt_win_rate = float(
+                        (opt.get("winner_stats") or {}).get("win_rate_pct") or 0
+                    )
+            except Exception:
+                pass
+
+        drift = round(live_win_rate - bt_win_rate, 1) if bt_win_rate else None
+        alert = bool(drift is not None and abs(drift) > 15 and live_trades >= 10)
+
+        return jsonify({
+            "ok":           True,
+            "live_win_rate":   live_win_rate,
+            "bt_win_rate":     bt_win_rate,
+            "drift":           drift,
+            "live_trades":     live_trades,
+            "alert":           alert,
+            "alert_msg":       (
+                f"Live win rate {live_win_rate:.1f}% is {abs(drift):.1f}pp "
+                f"{'above' if drift > 0 else 'below'} backtest expectation ({bt_win_rate:.1f}%). "
+                "Consider reviewing the model."
+            ) if alert else None,
+        })
+    except Exception as e:
+        log.warning("drift error: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/lab")

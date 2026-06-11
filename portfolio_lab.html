@@ -211,6 +211,7 @@ button{font:inherit;cursor:pointer}
 
     <!-- ── Critical alert banner ── -->
     <div id="alert-banner"></div>
+    <div id="gap-panel" style="display:none;padding:6px 16px;background:var(--card-bg);border-bottom:1px solid var(--border);font-family:monospace"></div>
 
     <div id="messages">
       <div id="typing"><span></span><span></span><span></span></div>
@@ -552,8 +553,38 @@ async function pollHealth() {
     if (!r.ok) return;
     const data = await r.json();
     _lastAlerts = data.alerts || [];
+    // Inject drift alert if present (#40)
+    try {
+      const dr = await apiFetch('/api/lab/analytics/drift');
+      const dd = await dr.json();
+      if (dd.alert) {
+        _lastAlerts.push({ code: 'drift_alert', level: 'warning', message: dd.alert_msg });
+      }
+    } catch(e) { /* drift check is best-effort */ }
     renderAlerts(_lastAlerts);
   } catch(e) { /* silent — health endpoint is best-effort */ }
+}
+
+// ── Gap scanner — pre-market panel (#33) ──────────────────────────────────────
+async function pollGaps() {
+  try {
+    const r = await apiFetch('/api/lab/gaps?min_gap_pct=1.5');
+    if (!r.ok) return;
+    const data = await r.json();
+    const gaps = data.gaps || [];
+    let el = document.getElementById('gap-panel');
+    if (!el) return;
+    if (!gaps.length) { el.style.display = 'none'; return; }
+    el.style.display = 'block';
+    el.innerHTML = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">📊 Gap Scanner</div>` +
+      gaps.slice(0, 8).map(g => {
+        const color = g.gap_pct > 0 ? 'var(--green)' : 'var(--red)';
+        const arrow = g.gap_pct > 0 ? '▲' : '▼';
+        return `<span style="margin-right:10px;font-size:12px">
+          <b>${g.symbol}</b> <span style="color:${color}">${arrow}${Math.abs(g.gap_pct).toFixed(1)}%</span>
+        </span>`;
+      }).join('');
+  } catch(e) { /* silent */ }
 }
 
 // ── Start ─────────────────────────────────────────────────────────────────────
@@ -561,6 +592,8 @@ poll();
 setInterval(poll, 30000);
 pollHealth();
 setInterval(pollHealth, 60000);
+pollGaps();
+setInterval(pollGaps, 120000);
 </script>
 </body>
 </html>
