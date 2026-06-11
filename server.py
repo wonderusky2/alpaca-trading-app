@@ -42,6 +42,27 @@ log = get_logger("server")
 app = Flask(__name__)
 CORS(app)
 
+# ── Trading control state (#43, #44) ─────────────────────────────────────────
+_TRADER_STATE_PATH = strategy_model.STATE_DIR / "trader_control.json"
+
+def _load_trader_control() -> dict:
+    """Return current trading control flags. Defaults: paused=False, paper=True."""
+    try:
+        if _TRADER_STATE_PATH.exists():
+            return json.loads(_TRADER_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {"paused": False, "paper": True, "updated_at": None, "updated_by": "default"}
+
+def _save_trader_control(state: dict) -> None:
+    try:
+        strategy_model.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _TRADER_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning("save trader_control failed: %s", e)
+
+
 # ── Push notification device token store (#41) ────────────────────────────────
 _PUSH_TOKENS_PATH = strategy_model.STATE_DIR / "push_tokens.json"
 
@@ -2600,6 +2621,81 @@ def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_
     return (f"Equity ${equity:,.0f} | P&L ${daily_pnl:+,.0f} | Regime {regime} | "
             f"{'No positions' if not pos_lines else str(len(pos_lines)) + ' positions open'}. "
             "Ask me about positions, signals, P&L, regime, orders, variant history, or model settings.")
+
+
+@app.route("/api/lab/trader/control")
+@require_api_key
+def api_trader_control_get():
+    """Return current trading control state (paused, paper mode)."""
+    return jsonify({"ok": True, **_load_trader_control()})
+
+
+@app.route("/api/lab/trader/pause", methods=["POST"])
+@require_api_key
+def api_trader_pause():
+    """Pause auto-trading — trader.py will skip all entries/exits until resumed."""
+    state = _load_trader_control()
+    state["paused"] = True
+    _save_trader_control(state)
+    log.warning("Auto-trading PAUSED via API")
+    send_push_notification("⏸ Trading Paused", "Auto-trading has been paused.")
+    return jsonify({"ok": True, "paused": True})
+
+
+@app.route("/api/lab/trader/resume", methods=["POST"])
+@require_api_key
+def api_trader_resume():
+    """Resume auto-trading."""
+    state = _load_trader_control()
+    state["paused"] = False
+    _save_trader_control(state)
+    log.warning("Auto-trading RESUMED via API")
+    send_push_notification("▶️ Trading Resumed", "Auto-trading has been resumed.")
+    return jsonify({"ok": True, "paused": False})
+
+
+@app.route("/api/lab/trader/mode", methods=["POST"])
+@require_api_key
+def api_trader_mode():
+    """Switch between paper and live trading.
+
+    Body: { "paper": true|false, "confirm": "CONFIRM LIVE" }
+    Switching to live requires confirm=="CONFIRM LIVE" as an extra safety check.
+    Note: 'paper' is always reset to True on pod restart — the state file persists
+    across ticks but NOT across pod restarts, so live mode must be re-confirmed after
+    any deploy or restart.
+    """
+    body = request.get_json(silent=True) or {}
+    want_paper = bool(body.get("paper", True))
+
+    if not want_paper:
+        confirm = str(body.get("confirm") or "")
+        if confirm != "CONFIRM LIVE":
+            return jsonify({
+                "ok": False,
+                "error": "Switching to live requires confirm='CONFIRM LIVE' in request body.",
+            }), 400
+        # Also require live keys to be configured
+        live_key = os.environ.get("ALPACA_LIVE_KEY", "").strip()
+        if not live_key:
+            return jsonify({
+                "ok": False,
+                "error": "ALPACA_LIVE_KEY env var not set — cannot switch to live.",
+            }), 400
+
+    state = _load_trader_control()
+    prev_paper = state.get("paper", True)
+    state["paper"] = want_paper
+    _save_trader_control(state)
+
+    mode = "paper" if want_paper else "LIVE"
+    prev = "paper" if prev_paper else "LIVE"
+    log.warning("Trading mode changed: %s → %s", prev, mode)
+    send_push_notification(
+        f"🔀 Mode: {mode.upper()}",
+        f"Trading switched from {prev} to {mode}.",
+    )
+    return jsonify({"ok": True, "paper": want_paper, "mode": mode})
 
 
 @app.route("/api/lab/push/register", methods=["POST"])

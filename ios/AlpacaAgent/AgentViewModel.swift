@@ -35,6 +35,11 @@ class AgentViewModel: ObservableObject {
     @Published var todayVariantWinner: String = ""
     @Published var lastOptimizedAt: String = ""
 
+    // ── Trading control (#43, #44) ─────────────────────────────────────────
+    @Published var tradingPaused: Bool = false
+    @Published var tradingPaper:  Bool = true      // false = live (real $)
+    @Published var traderControlLoaded: Bool = false
+
     private var pollTask: Task<Void, Never>?
     private var prevRegime: String = ""
     private var prevPosCount: Int  = -1
@@ -289,6 +294,7 @@ class AgentViewModel: ObservableObject {
             await fetchPortfolioHistory(for: selectedPortfolioRange)
             await fetchActivity()
             await fetchVariants()
+            await fetchTraderControl()
         }
     }
 
@@ -297,6 +303,7 @@ class AgentViewModel: ObservableObject {
         await fetchPortfolioHistory(for: selectedPortfolioRange)
         await fetchActivity()
         await fetchVariants()
+        await fetchTraderControl()
     }
 
     func refreshActivity() {
@@ -310,6 +317,52 @@ class AgentViewModel: ObservableObject {
         Task {
             _ = try? await URLSession.shared.data(for: Config.request("/api/lab/events", method: "DELETE"))
         }
+    }
+
+    // ── Trading control (#43, #44) ─────────────────────────────────────────
+    func fetchTraderControl() async {
+        guard let (data, _) = try? await URLSession.shared.data(
+            for: Config.request("/api/lab/trader/control")) else { return }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        await MainActor.run {
+            tradingPaused = json["paused"] as? Bool ?? false
+            tradingPaper  = json["paper"]  as? Bool ?? true
+            traderControlLoaded = true
+        }
+    }
+
+    func setTradingPaused(_ paused: Bool) {
+        let endpoint = paused ? "/api/lab/trader/pause" : "/api/lab/trader/resume"
+        Task {
+            _ = try? await URLSession.shared.data(for: Config.request(endpoint, method: "POST"))
+            await fetchTraderControl()
+        }
+        tradingPaused = paused   // optimistic local update
+    }
+
+    /// Switch to live mode. Requires explicit user confirmation string.
+    func setLiveMode(confirm: String) async -> String? {
+        guard confirm == "CONFIRM LIVE" else { return "Type CONFIRM LIVE to enable live trading." }
+        let body: [String: Any] = ["paper": false, "confirm": "CONFIRM LIVE"]
+        guard let (data, resp) = try? await URLSession.shared.data(
+            for: Config.request("/api/lab/trader/mode", method: "POST", body: body)) else {
+            return "Network error"
+        }
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        if (resp as? HTTPURLResponse)?.statusCode == 200 {
+            await fetchTraderControl()
+            return nil   // success
+        }
+        return json["error"] as? String ?? "Unknown error"
+    }
+
+    func setPaperMode() {
+        Task {
+            _ = try? await URLSession.shared.data(
+                for: Config.request("/api/lab/trader/mode", method: "POST", body: ["paper": true]))
+            await fetchTraderControl()
+        }
+        tradingPaper = true
     }
 
     func selectPortfolioRange(_ range: PortfolioRange) {

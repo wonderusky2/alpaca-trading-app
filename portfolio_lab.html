@@ -61,6 +61,62 @@ button{font:inherit;cursor:pointer}
   box-shadow:0 0 6px var(--green);flex-shrink:0}
 #chat-header .status-dot.error{background:var(--red);box-shadow:0 0 6px var(--red)}
 
+/* ── Trading control bar ── */
+#trading-control-bar{
+  display:flex;align-items:center;gap:10px;padding:8px 16px;
+  border-bottom:1px solid var(--border);flex-shrink:0;background:var(--bg);
+  transition:background 0.3s
+}
+#trading-control-bar.paused{background:rgba(255,150,0,0.06)}
+#trading-control-bar.live-mode{background:rgba(255,60,60,0.06)}
+.ctrl-pill{
+  display:flex;align-items:center;gap:6px;padding:4px 10px;
+  border-radius:20px;font-size:11px;font-weight:600;cursor:pointer;
+  border:1px solid var(--border);background:var(--card-bg);
+  transition:all 0.2s;user-select:none
+}
+.ctrl-pill:hover{filter:brightness(1.15)}
+.ctrl-pill.active-green{border-color:var(--green);color:var(--green)}
+.ctrl-pill.active-orange{border-color:#f90;color:#f90}
+.ctrl-pill.active-red{border-color:#f44;color:#f44;background:rgba(255,60,60,0.10)}
+.ctrl-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.ctrl-spacer{flex:1}
+/* toggle switch */
+.toggle-wrap{position:relative;width:36px;height:20px;flex-shrink:0}
+.toggle-wrap input{opacity:0;width:0;height:0;position:absolute}
+.toggle-slider{
+  position:absolute;inset:0;border-radius:20px;background:var(--border);
+  cursor:pointer;transition:background .2s
+}
+.toggle-slider:before{
+  content:'';position:absolute;height:14px;width:14px;left:3px;top:3px;
+  border-radius:50%;background:#fff;transition:transform .2s
+}
+.toggle-wrap input:checked + .toggle-slider{background:var(--green)}
+.toggle-wrap input:checked + .toggle-slider:before{transform:translateX(16px)}
+/* live confirm modal */
+#live-modal{
+  display:none;position:fixed;inset:0;z-index:9999;
+  background:rgba(0,0,0,0.7);align-items:center;justify-content:center
+}
+#live-modal.open{display:flex}
+#live-modal-box{
+  background:var(--card-bg);border:1px solid #f44;border-radius:12px;
+  padding:28px 24px;max-width:380px;width:90%;display:flex;
+  flex-direction:column;gap:14px
+}
+#live-modal-box h3{margin:0;color:#f44;font-size:16px}
+#live-modal-box p{margin:0;font-size:13px;color:var(--muted);line-height:1.5}
+#live-confirm-input{
+  padding:8px 10px;border-radius:8px;border:1px solid var(--border);
+  background:var(--bg);color:var(--text);font-family:monospace;font-size:14px;width:100%;box-sizing:border-box
+}
+#live-modal-btns{display:flex;gap:8px;justify-content:flex-end}
+.modal-btn{padding:7px 16px;border-radius:8px;border:none;cursor:pointer;font-size:13px;font-weight:600}
+.modal-btn.cancel{background:var(--border);color:var(--text)}
+.modal-btn.confirm-live{background:#f44;color:#fff;opacity:0.4;pointer-events:none}
+.modal-btn.confirm-live.ready{opacity:1;pointer-events:auto}
+
 /* ── Messages ── */
 #messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
 #messages::-webkit-scrollbar{width:4px}
@@ -207,6 +263,36 @@ button{font:inherit;cursor:pointer}
     <div id="chat-header">
       <span class="status-dot" id="hdr-dot"></span>
       <span id="header-status">Connecting…</span>
+    </div>
+
+    <!-- ── Trading control bar ── -->
+    <div id="trading-control-bar">
+      <div class="ctrl-pill active-green" id="auto-pill" onclick="toggleTrading()">
+        <span class="ctrl-dot" id="auto-dot" style="background:var(--green)"></span>
+        <span id="auto-label">Auto</span>
+        <label class="toggle-wrap">
+          <input type="checkbox" id="auto-toggle" checked onchange="toggleTrading()">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="ctrl-spacer"></div>
+      <div class="ctrl-pill" id="mode-pill" onclick="clickModePill()">
+        <span class="ctrl-dot" id="mode-dot" style="background:var(--muted)"></span>
+        <span id="mode-label">Paper</span>
+      </div>
+    </div>
+
+    <!-- ── Live mode confirm modal ── -->
+    <div id="live-modal">
+      <div id="live-modal-box">
+        <h3>⚠️ Switch to Live Trading?</h3>
+        <p>This will use <strong>real money</strong>. All trades execute on your live Alpaca account. The system reverts to paper mode on the next pod restart.</p>
+        <input id="live-confirm-input" type="text" placeholder='Type "CONFIRM LIVE"' autocomplete="off" oninput="onLiveInputChange(this.value)">
+        <div id="live-modal-btns">
+          <button class="modal-btn cancel" onclick="closeLiveModal()">Cancel</button>
+          <button class="modal-btn confirm-live" id="live-confirm-btn" onclick="confirmLive()">Enable Live</button>
+        </div>
+      </div>
     </div>
 
     <!-- ── Critical alert banner ── -->
@@ -587,6 +673,115 @@ async function pollGaps() {
   } catch(e) { /* silent */ }
 }
 
+// ── Trading control (#43, #44) ────────────────────────────────────────────────
+let _traderPaused = false;
+let _traderPaper  = true;
+
+async function fetchTraderControl() {
+  try {
+    const r = await apiFetch('/api/lab/trader/control');
+    if (!r.ok) return;
+    const d = await r.json();
+    _traderPaused = !!d.paused;
+    _traderPaper  = d.paper !== false;
+    renderTraderControl();
+  } catch(e) { /* best-effort */ }
+}
+
+function renderTraderControl() {
+  const bar   = document.getElementById('trading-control-bar');
+  const pill  = document.getElementById('auto-pill');
+  const dot   = document.getElementById('auto-dot');
+  const label = document.getElementById('auto-label');
+  const tog   = document.getElementById('auto-toggle');
+  const mPill = document.getElementById('mode-pill');
+  const mDot  = document.getElementById('mode-dot');
+  const mLabel= document.getElementById('mode-label');
+
+  // Auto-trading toggle
+  tog.checked = !_traderPaused;
+  if (_traderPaused) {
+    pill.className = 'ctrl-pill active-orange';
+    dot.style.background = '#f90';
+    label.textContent = 'Paused';
+    bar.classList.add('paused'); bar.classList.remove('live-mode');
+  } else {
+    pill.className = 'ctrl-pill active-green';
+    dot.style.background = 'var(--green)';
+    label.textContent = 'Auto';
+    bar.classList.remove('paused');
+  }
+
+  // Paper / live pill
+  if (_traderPaper) {
+    mPill.className = 'ctrl-pill';
+    mDot.style.background = 'var(--muted)';
+    mLabel.textContent = 'Paper';
+    bar.classList.remove('live-mode');
+  } else {
+    mPill.className = 'ctrl-pill active-red';
+    mDot.style.background = '#f44';
+    mLabel.textContent = '⚡ LIVE';
+    bar.classList.add('live-mode');
+  }
+}
+
+async function toggleTrading() {
+  const want = _traderPaused;   // currently paused → we want to resume (true = play)
+  const endpoint = want ? '/api/lab/trader/resume' : '/api/lab/trader/pause';
+  _traderPaused = !want;        // optimistic
+  renderTraderControl();
+  await apiFetch(endpoint, {method:'POST'});
+  await fetchTraderControl();   // confirm server state
+}
+
+function clickModePill() {
+  if (_traderPaper) {
+    // Going live → open confirm modal
+    document.getElementById('live-confirm-input').value = '';
+    document.getElementById('live-confirm-btn').classList.remove('ready');
+    document.getElementById('live-modal').classList.add('open');
+  } else {
+    // Going back to paper → immediate
+    setPaperMode();
+  }
+}
+
+function onLiveInputChange(val) {
+  const btn = document.getElementById('live-confirm-btn');
+  if (val.trim() === 'CONFIRM LIVE') btn.classList.add('ready');
+  else btn.classList.remove('ready');
+}
+
+function closeLiveModal() {
+  document.getElementById('live-modal').classList.remove('open');
+}
+
+async function confirmLive() {
+  const val = document.getElementById('live-confirm-input').value.trim();
+  if (val !== 'CONFIRM LIVE') return;
+  closeLiveModal();
+  try {
+    const r = await apiFetch('/api/lab/trader/mode', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({paper: false, confirm: 'CONFIRM LIVE'})
+    });
+    const d = await r.json();
+    if (!d.ok) { alert('Error: ' + (d.error || 'Unknown')); return; }
+  } catch(e) { alert('Network error'); return; }
+  await fetchTraderControl();
+}
+
+async function setPaperMode() {
+  await apiFetch('/api/lab/trader/mode', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({paper: true})
+  });
+  await fetchTraderControl();
+}
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 poll();
 setInterval(poll, 30000);
@@ -594,6 +789,8 @@ pollHealth();
 setInterval(pollHealth, 60000);
 pollGaps();
 setInterval(pollGaps, 120000);
+fetchTraderControl();
+setInterval(fetchTraderControl, 30000);
 </script>
 </body>
 </html>

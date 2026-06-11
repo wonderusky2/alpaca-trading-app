@@ -50,6 +50,7 @@ struct DashboardView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
+                TradingControlBar(vm: vm)
                 TodayHeroCard(vm: vm, openChat: openChat)
                 Divider()
                 MarketPulsePanel(vm: vm)
@@ -155,6 +156,161 @@ struct StatusChip: View {
         .padding(.vertical, 8)
         .background(Color.appSurface)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+// ── Trading Control Bar (#43, #44) ────────────────────────────────────────────
+struct TradingControlBar: View {
+    @ObservedObject var vm: AgentViewModel
+    @State private var showLiveConfirm = false
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // ── Auto-trading toggle ───────────────────────────────────────
+            HStack(spacing: 6) {
+                Image(systemName: vm.tradingPaused ? "pause.circle.fill" : "play.circle.fill")
+                    .foregroundStyle(vm.tradingPaused ? Color.orange : Color.appGreen)
+                Text(vm.tradingPaused ? "Paused" : "Auto")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(vm.tradingPaused ? Color.orange : Color.appGreen)
+                Toggle("", isOn: Binding(
+                    get: { !vm.tradingPaused },
+                    set: { vm.setTradingPaused(!$0) }
+                ))
+                .labelsHidden()
+                .tint(Color.appGreen)
+                .scaleEffect(0.75)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Color.appSurface)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            Spacer()
+
+            // ── Paper / Live toggle ───────────────────────────────────────
+            Button {
+                if vm.tradingPaper {
+                    showLiveConfirm = true   // going live → confirm first
+                } else {
+                    vm.setPaperMode()        // going back to paper → immediate
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: vm.tradingPaper ? "doc.text.fill" : "bolt.fill")
+                        .font(.system(size: 11))
+                    Text(vm.tradingPaper ? "Paper" : "LIVE")
+                        .font(.system(size: 12, weight: .bold))
+                }
+                .foregroundStyle(vm.tradingPaper ? Color(.systemGray) : Color.red)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(vm.tradingPaper ? Color.appSurface : Color.red.opacity(0.15))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(vm.tradingPaper ? Color.clear : Color.red.opacity(0.6), lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .background(vm.tradingPaused ? Color.orange.opacity(0.08) : Color.clear)
+        .sheet(isPresented: $showLiveConfirm) {
+            LiveModeConfirmSheet(vm: vm, isPresented: $showLiveConfirm)
+        }
+        .onAppear {
+            if !vm.traderControlLoaded {
+                Task { await vm.fetchTraderControl() }
+            }
+        }
+    }
+}
+
+// ── Live Mode Confirmation Sheet (#44) ────────────────────────────────────────
+struct LiveModeConfirmSheet: View {
+    @ObservedObject var vm: AgentViewModel
+    @Binding var isPresented: Bool
+    @State private var confirmText = ""
+    @State private var errorMsg: String?
+    @State private var isWorking = false
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 20) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 48))
+                    .foregroundStyle(Color.red)
+
+                Text("Switch to Live Trading?")
+                    .font(.title2.bold())
+
+                Text("This will use **real money**. All trades will execute on your live Alpaca account. The system will revert to paper mode on the next pod restart.")
+                    .font(.subheadline)
+                    .foregroundStyle(Color(.systemGray))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Type CONFIRM LIVE to proceed:")
+                        .font(.caption)
+                        .foregroundStyle(Color(.systemGray))
+                    TextField("CONFIRM LIVE", text: $confirmText)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.characters)
+                        .font(.system(.body, design: .monospaced))
+                }
+                .padding(.horizontal)
+
+                if let err = errorMsg {
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(Color.red)
+                        .padding(.horizontal)
+                }
+
+                Button {
+                    isWorking = true
+                    errorMsg = nil
+                    Task {
+                        let err = await vm.setLiveMode(confirm: confirmText)
+                        isWorking = false
+                        if err == nil {
+                            isPresented = false
+                        } else {
+                            errorMsg = err
+                        }
+                    }
+                } label: {
+                    Group {
+                        if isWorking {
+                            ProgressView()
+                        } else {
+                            Text("Enable Live Trading")
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(confirmText == "CONFIRM LIVE" ? Color.red : Color(.systemGray4))
+                    .foregroundStyle(Color.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+                .disabled(confirmText != "CONFIRM LIVE" || isWorking)
+                .padding(.horizontal)
+
+                Spacer()
+            }
+            .padding(.top, 32)
+            .navigationTitle("Live Mode")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { isPresented = false }
+                }
+            }
+        }
     }
 }
 
