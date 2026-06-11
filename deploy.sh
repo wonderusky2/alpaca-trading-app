@@ -36,17 +36,16 @@ LATEST_IMAGE="${IMAGE}:latest"
 
 # ── 1. Build and push ─────────────────────────────────────────────────────────
 if $BUILD; then
-  echo "→ Building image: ${FULL_IMAGE}"
-  docker build \
-    --platform linux/amd64 \
-    -t "${FULL_IMAGE}" \
-    -t "${LATEST_IMAGE}" \
+  echo "→ Building image via Cloud Build (no Docker Desktop needed): ${FULL_IMAGE}"
+  gcloud builds submit \
+    --project="${GCP_PROJECT}" \
+    --tag="${FULL_IMAGE}" \
     .
 
-  echo "→ Pushing to GCR..."
-  docker push "${FULL_IMAGE}"
-  docker push "${LATEST_IMAGE}"
-  echo "✓ Image pushed: ${FULL_IMAGE}"
+  echo "→ Tagging :latest (no rebuild)..."
+  gcloud container images add-tag "${FULL_IMAGE}" "${LATEST_IMAGE}" --quiet
+
+  echo "✓ Image pushed: ${FULL_IMAGE} + ${LATEST_IMAGE}"
 fi
 
 # ── 2. Apply K8s manifests ────────────────────────────────────────────────────
