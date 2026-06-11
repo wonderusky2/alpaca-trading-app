@@ -36,8 +36,13 @@ COPY alpaca_client.py \
      server.py \
      signals.py \
      strategy_model.py \
+     trade_ledger.py \
      trader.py \
+     test_smoke.py \
      ./
+
+# ── Smoke test — fails the build if any import or attribute check blows up ────
+RUN python test_smoke.py
 
 # State directory (override with STATE_DIR env var; mount a PVC here)
 RUN mkdir -p /data/state
