@@ -184,7 +184,9 @@ def chk_pnl_not_phantom():
     d = _fetch("/api/lab/overview")
     acct = d.get("account") or {}
     equity   = float(acct.get("equity")      or 0)
-    last_eq  = float(acct.get("last_equity") or equity)
+    # Use adjusted_last_equity (DAWN-neutralised) — same value the dashboard shows.
+    # Falls back to last_equity if the field is absent (older builds).
+    last_eq  = float(acct.get("adjusted_last_equity") or acct.get("last_equity") or equity)
     daily    = equity - last_eq
     assert abs(daily) < 5000, (
         f"daily_pnl=${daily:+,.0f} looks phantom-inflated — "
