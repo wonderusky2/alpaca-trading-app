@@ -85,13 +85,14 @@ if trader:
             print(f"  ✓ trader.{fn}")
 
 # ── 4. Conviction multiplier sanity ───────────────────────────────────────────
+# Conviction scaling disabled (#19) — all scores return flat 1.0
 if trader and hasattr(trader, "_conviction_size_mult"):
     fn = trader._conviction_size_mult
-    assert fn(95) == 4.0,   f"score 95 should be 4x, got {fn(95)}"
-    assert fn(85) == 2.5,   f"score 85 should be 2.5x, got {fn(85)}"
-    assert fn(75) == 1.5,   f"score 75 should be 1.5x, got {fn(75)}"
-    assert fn(60) == 1.0,   f"score 60 should be 1x, got {fn(60)}"
-    print("  ✓ _conviction_size_mult values correct")
+    assert fn(95) == 1.0,   f"score 95 should be 1x (conviction scaling disabled), got {fn(95)}"
+    assert fn(85) == 1.0,   f"score 85 should be 1x (conviction scaling disabled), got {fn(85)}"
+    assert fn(75) == 1.0,   f"score 75 should be 1x (conviction scaling disabled), got {fn(75)}"
+    assert fn(60) == 1.0,   f"score 60 should be 1x (conviction scaling disabled), got {fn(60)}"
+    print("  ✓ _conviction_size_mult flat 1x (conviction scaling disabled)")
 
 # ── Result ────────────────────────────────────────────────────────────────────
 print()
