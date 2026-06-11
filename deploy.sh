@@ -105,6 +105,27 @@ fi
 # ── 4. Post-deploy QA ─────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "${SCRIPT_DIR}/qa_agent.py" ]] && ( $APPLY || $RESTART ); then
+
+  # Wait for Flask to actually accept connections before running QA.
+  # kubectl rollout status goes green as soon as the container starts,
+  # but Flask takes a few more seconds to bind its port.
+  echo "→ Waiting for Flask to be ready..."
+  SERVER_URL="http://34.60.235.98:5001/api/lab/health"
+  READY=false
+  for i in $(seq 1 24); do            # up to 2 minutes (24 × 5s)
+    if curl -sf --max-time 4 "${SERVER_URL}" > /dev/null 2>&1; then
+      READY=true
+      echo "✓ Server is ready (attempt ${i})."
+      break
+    fi
+    echo "  … not ready yet (attempt ${i}/24) — waiting 5s"
+    sleep 5
+  done
+  if ! $READY; then
+    echo "✗ Server did not become ready after 2 min — skipping QA."
+    exit 1
+  fi
+
   echo ""
   echo "→ Running post-deploy QA suite..."
   # Write strategy_model.json to pod after every deploy (fresh pod loses state)
