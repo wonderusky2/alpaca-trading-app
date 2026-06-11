@@ -146,6 +146,22 @@ button{font:inherit;cursor:pointer}
 }
 #send-btn:hover{opacity:.85}
 #send-btn:disabled{background:var(--panel);border:1px solid var(--border);color:var(--dim);opacity:1}
+
+/* ── Alert banner ── */
+#alert-banner{display:none;flex-direction:column;gap:4px;padding:8px 16px;flex-shrink:0}
+.alert-item{
+  display:flex;align-items:center;gap:8px;
+  padding:8px 12px;border-radius:6px;font-size:12px;line-height:1.4;
+}
+.alert-item.critical{background:#3d1a1a;border:1px solid var(--red);color:#ffa8a8}
+.alert-item.warning{background:#2d2200;border:1px solid var(--amber);color:#ffd97a}
+.alert-item .alert-icon{font-size:14px;flex-shrink:0}
+.alert-item .alert-text{flex:1}
+.alert-item .alert-dismiss{
+  background:none;border:none;color:var(--muted);cursor:pointer;
+  font-size:14px;padding:0 2px;flex-shrink:0;
+}
+.alert-item .alert-dismiss:hover{color:var(--text)}
 </style>
 </head>
 <body>
@@ -192,6 +208,9 @@ button{font:inherit;cursor:pointer}
       <span class="status-dot" id="hdr-dot"></span>
       <span id="header-status">Connecting…</span>
     </div>
+
+    <!-- ── Critical alert banner ── -->
+    <div id="alert-banner"></div>
 
     <div id="messages">
       <div id="typing"><span></span><span></span><span></span></div>
@@ -314,7 +333,9 @@ function updateSidebar(data) {
   const scores = data.live_scores || {};
 
   const equity  = parseFloat(acct.equity || 0);
-  const lastEq  = parseFloat(acct.last_equity || equity);
+  // Use adjusted_last_equity (DAWN-neutralised) so stuck/delisted positions
+  // don't inflate daily P&L. Falls back to last_equity if not present.
+  const lastEq  = parseFloat(acct.adjusted_last_equity || acct.last_equity || equity);
   const dailyPnl = equity - lastEq;
   const openPnl  = parseFloat(acctg.unrealized_pnl || 0);
   const cash    = parseFloat(acct.cash || 0);
@@ -324,7 +345,9 @@ function updateSidebar(data) {
 
   $('s-equity').textContent = fmt$(equity);
 
-  const displayPnl = openPnl !== 0 ? openPnl : dailyPnl;
+  // Always show full daily P&L (equity - last_equity). openPnl is only
+  // the current open position mark and doesn't reflect realized losses today.
+  const displayPnl = dailyPnl;
   const pnlEl = $('s-pnl');
   pnlEl.textContent = fmtPnl(displayPnl);
   pnlEl.className = 'stat-value ' + (displayPnl >= 0 ? 'green' : 'red');
@@ -365,7 +388,7 @@ function detectChanges(nd) {
     const msgs_text = {
       BULL:   `Regime shift: <strong>${oldRegime} → BULL</strong>. Momentum building — running signal scan.`,
       BEAR:   `Regime shift: <strong>${oldRegime} → BEAR</strong>. Bear instruments now eligible.`,
-      CHOPPY: `Regime shift: <strong>${oldRegime} → CHOPPY</strong>. No new entries — holding cash until trend forms.`
+      CHOPPY: `Regime shift: <strong>${oldRegime} → CHOPPY</strong>. System enters at 50% size when signals score ≥ 63.`
     };
     addMsg(msgs_text[newRegime] || `Regime changed: ${newRegime}`, 'agent', map[newRegime] || '');
   }
@@ -396,7 +419,7 @@ function postGreeting(data) {
   const clock  = data.clock || {};
   const scores = data.live_scores || {};
   const equity = parseFloat(acct.equity || 0);
-  const lastEq = parseFloat(acct.last_equity || equity);
+  const lastEq = parseFloat(acct.adjusted_last_equity || acct.last_equity || equity);
   const pnl    = equity - lastEq;
   const posCount = parseInt(acctg.filled_position_count || 0);
   const regime = scores.regime || '—';
@@ -500,9 +523,44 @@ $('msg-input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
 });
 
+// ── Health polling — critical alert banner ────────────────────────────────────
+const _dismissedAlerts = new Set();
+
+function renderAlerts(alerts) {
+  const banner = document.getElementById('alert-banner');
+  const active = alerts.filter(a => !_dismissedAlerts.has(a.code));
+  if (!active.length) { banner.style.display = 'none'; return; }
+  banner.style.display = 'flex';
+  banner.innerHTML = active.map(a => `
+    <div class="alert-item ${a.level}" data-code="${a.code}">
+      <span class="alert-icon">${a.level === 'critical' ? '🚨' : '⚠️'}</span>
+      <span class="alert-text">${a.message}</span>
+      <button class="alert-dismiss" onclick="dismissAlert('${a.code}')" title="Dismiss">✕</button>
+    </div>
+  `).join('');
+}
+
+function dismissAlert(code) {
+  _dismissedAlerts.add(code);
+  renderAlerts(_lastAlerts || []);
+}
+
+let _lastAlerts = [];
+async function pollHealth() {
+  try {
+    const r = await apiFetch('/api/lab/health');
+    if (!r.ok) return;
+    const data = await r.json();
+    _lastAlerts = data.alerts || [];
+    renderAlerts(_lastAlerts);
+  } catch(e) { /* silent — health endpoint is best-effort */ }
+}
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 poll();
 setInterval(poll, 30000);
+pollHealth();
+setInterval(pollHealth, 60000);
 </script>
 </body>
 </html>

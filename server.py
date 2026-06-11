@@ -1684,6 +1684,79 @@ def api_lab_overview():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/lab/health")
+@require_api_key
+def api_lab_health():
+    """Return system health: trader crash status, consecutive losses, kill-switch state."""
+    import strategy_model as _sm
+    alerts: list[dict] = []
+
+    # ── Trader health file (written by trader.py on each CronJob run) ─────────
+    health_path = _sm.STATE_DIR / "trader_health.json"
+    trader_health: dict = {}
+    try:
+        if health_path.exists():
+            trader_health = json.loads(health_path.read_text(encoding="utf-8"))
+        if trader_health.get("status") == "error":
+            alerts.append({
+                "level":   "critical",
+                "code":    "trader_crash",
+                "message": f"Trader crashed: {trader_health.get('detail', 'unknown error')}",
+                "ts":      trader_health.get("timestamp"),
+            })
+    except Exception:
+        pass
+
+    # ── Consecutive losses ────────────────────────────────────────────────────
+    consec_path = _sm.STATE_DIR / "consecutive_losses.json"
+    consecutive_losses = 0
+    try:
+        if consec_path.exists():
+            consec_data = json.loads(consec_path.read_text(encoding="utf-8"))
+            consecutive_losses = int(consec_data.get("count") or 0)
+            limit = int(os.environ.get("CONSECUTIVE_LOSS_HALT", 3))
+            if consecutive_losses >= limit:
+                alerts.append({
+                    "level":   "critical",
+                    "code":    "consecutive_loss_halt",
+                    "message": f"Kill gate active: {consecutive_losses} consecutive losses — no new entries.",
+                    "ts":      consec_data.get("last_reset"),
+                })
+            elif consecutive_losses >= max(1, limit - 1):
+                alerts.append({
+                    "level":   "warning",
+                    "code":    "consecutive_loss_warning",
+                    "message": f"Warning: {consecutive_losses} consecutive loss(es) — {limit - consecutive_losses} away from halt.",
+                    "ts":      consec_data.get("last_reset"),
+                })
+    except Exception:
+        pass
+
+    # ── Last successful trader run (stale if > 6 hours during market hours) ───
+    last_run_ts = trader_health.get("timestamp")
+    if last_run_ts:
+        try:
+            from datetime import datetime, timezone, timedelta
+            last_run = datetime.fromisoformat(last_run_ts)
+            age_hours = (datetime.now(timezone.utc) - last_run).total_seconds() / 3600
+            if age_hours > 6:
+                alerts.append({
+                    "level":   "warning",
+                    "code":    "trader_stale",
+                    "message": f"Trader last ran {age_hours:.1f}h ago — CronJob may not be firing.",
+                    "ts":      last_run_ts,
+                })
+        except Exception:
+            pass
+
+    return jsonify({
+        "ok":                True,
+        "alerts":            alerts,
+        "consecutive_losses": consecutive_losses,
+        "trader_health":     trader_health,
+    })
+
+
 @app.route("/api/lab/activity")
 @require_api_key
 def api_lab_activity():
