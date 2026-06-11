@@ -304,11 +304,11 @@ class AgentViewModel: ObservableObject {
     }
 
     func clearEvents() {
+        // Wipe locally immediately — visible right away.
+        activityItems = []
+        // Fire DELETE in background; no re-fetch so the cleared state sticks.
         Task {
-            var req = Config.request("/api/lab/events")
-            req.httpMethod = "DELETE"
-            _ = try? await URLSession.shared.data(for: req)
-            await fetchActivity()   // refresh so the cleared feed shows immediately
+            _ = try? await URLSession.shared.data(for: Config.request("/api/lab/events", method: "DELETE"))
         }
     }
 

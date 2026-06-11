@@ -899,8 +899,8 @@ struct RobinhoodPositionsList: View {
             .navigationTitle("Activity Log")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(role: .destructive) {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
                         vm.clearEvents()
                     } label: {
                         Label("Clear", systemImage: "trash")
