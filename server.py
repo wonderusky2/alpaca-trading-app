@@ -33,6 +33,7 @@ import config
 import notify
 import signals as sg
 import strategy_model
+import trade_ledger
 import trader
 from alpaca_client import AlpacaClient
 from logger import get_logger
@@ -1815,6 +1816,20 @@ def api_lab_variants():
         })
     except Exception as e:
         log.warning("variants error: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/lab/ledger")
+@require_api_key
+def api_lab_ledger():
+    """Return recent trades from the durable SQLite ledger + win/loss summary."""
+    try:
+        limit = min(int(request.args.get("limit") or 200), 1000)
+        trades = trade_ledger.recent_trades(limit=limit)
+        summary = trade_ledger.win_loss_summary(limit=limit)
+        return jsonify({"ok": True, "trades": trades, "summary": summary})
+    except Exception as e:
+        log.warning("ledger error: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
