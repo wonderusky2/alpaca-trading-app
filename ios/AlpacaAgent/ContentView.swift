@@ -899,6 +899,15 @@ struct RobinhoodPositionsList: View {
             .navigationTitle("Activity Log")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(role: .destructive) {
+                        vm.clearEvents()
+                    } label: {
+                        Label("Clear", systemImage: "trash")
+                            .font(.caption)
+                    }
+                    .foregroundStyle(Color(.systemGray))
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { showHistory = false }
                         .foregroundStyle(Color.appGreen)

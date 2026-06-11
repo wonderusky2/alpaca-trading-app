@@ -303,6 +303,15 @@ class AgentViewModel: ObservableObject {
         Task { await fetchActivity() }
     }
 
+    func clearEvents() {
+        Task {
+            var req = Config.request("/api/lab/events")
+            req.httpMethod = "DELETE"
+            _ = try? await URLSession.shared.data(for: req)
+            await fetchActivity()   // refresh so the cleared feed shows immediately
+        }
+    }
+
     func selectPortfolioRange(_ range: PortfolioRange) {
         guard range != selectedPortfolioRange else { return }
         selectedPortfolioRange = range

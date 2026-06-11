@@ -230,15 +230,28 @@ def _append_event(event_type: str, payload: dict) -> None:
     except Exception as e:
         log.warning("Could not append lab event: %s", e)
 
+_EVENT_MAX_AGE_DAYS = 7  # events older than this are silently dropped
+
 def _load_events(limit: int = 50) -> list[dict]:
     if not LAB_EVENTS_PATH.exists():
         return []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_EVENT_MAX_AGE_DAYS)
     events: list[dict] = []
     try:
         with LAB_EVENTS_PATH.open(encoding="utf-8") as f:
             for line in f:
                 try:
-                    events.append(json.loads(line))
+                    ev = json.loads(line)
+                    # Drop events older than max-age
+                    ts_str = ev.get("ts") or ev.get("time") or ""
+                    if ts_str:
+                        try:
+                            ev_ts = datetime.fromisoformat(ts_str)
+                            if ev_ts < cutoff:
+                                continue
+                        except Exception:
+                            pass
+                    events.append(ev)
                 except Exception:
                     pass
     except Exception:
@@ -1755,6 +1768,17 @@ def api_lab_health():
         "consecutive_losses": consecutive_losses,
         "trader_health":     trader_health,
     })
+
+
+@app.route("/api/lab/events", methods=["DELETE"])
+@require_api_key
+def api_lab_events_clear():
+    """Truncate the events log. Safe to call at any time — clears the activity feed."""
+    try:
+        LAB_EVENTS_PATH.write_text("", encoding="utf-8")
+        return jsonify({"ok": True, "message": "Events log cleared."})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/lab/activity")
