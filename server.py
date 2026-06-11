@@ -2025,7 +2025,10 @@ def api_lab_chat_message():
             return float(default)
 
     equity    = _flt(acct_snap, "equity")
-    last_eq   = _flt(acct_snap, "last_equity", equity)
+    # Use adjusted_last_equity (DAWN-neutralised) for display P&L;
+    # raw last_equity is used by kill-switch logic elsewhere.
+    last_eq   = _flt(acct_snap, "adjusted_last_equity",
+                     _flt(acct_snap, "last_equity", equity))
     cash      = _flt(acct_snap, "cash")
     daily_pnl = equity - last_eq
 

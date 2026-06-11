@@ -99,14 +99,38 @@ class AlpacaClient:
 
     def get_account(self) -> dict:
         acct = self.trading.get_account()
+        equity      = float(acct.equity)
+        last_equity = float(getattr(acct, "last_equity", 0) or 0)
+
+        # Adjust last_equity to cancel phantom daily P&L from IGNORED_POSITIONS (e.g. DAWN).
+        # These stuck/delisted positions have current market value in `equity` but were $0 at
+        # prior close, so `equity - last_equity` inflates daily P&L by their full value.
+        # Adding their current market value to last_equity neutralises this for all consumers.
+        ignored_val = 0.0
+        try:
+            ignore = {s.upper() for s in (config.IGNORED_POSITIONS or [])}
+            if ignore:
+                for p in self.trading.get_all_positions():
+                    if p.symbol.upper() in ignore:
+                        ignored_val += float(getattr(p, "market_value", 0) or 0)
+        except Exception:
+            pass
+
+        # Do NOT mutate last_equity here — it is used raw by the kill-switch,
+        # risk sizing, and iOS P&L display. Adjusting it globally was breaking
+        # daily_pnl math for all consumers (issue #4 in security audit).
+        # Instead expose adjusted_last_equity as a separate key so the dashboard
+        # can display a clean P&L while trade logic still uses the broker value.
         return {
-            "equity":         float(acct.equity),
-            "last_equity":    float(getattr(acct, "last_equity", 0) or 0),
-            "cash":           float(acct.cash),
-            "buying_power":   float(acct.buying_power),
-            "daytrade_count": int(acct.daytrade_count),
-            "pdt":            bool(acct.pattern_day_trader),
-            "status":         acct.status.value,
+            "equity":                equity,
+            "last_equity":           last_equity,           # raw broker value — used by kill-switch
+            "adjusted_last_equity":  last_equity + ignored_val,  # for display only (DAWN-adjusted)
+            "ignored_position_val":  ignored_val,
+            "cash":                  float(acct.cash),
+            "buying_power":          float(acct.buying_power),
+            "daytrade_count":        int(acct.daytrade_count),
+            "pdt":                   bool(acct.pattern_day_trader),
+            "status":                acct.status.value,
         }
 
     def get_portfolio_history(self, period: str = "1M", timeframe: str = "1D") -> dict:

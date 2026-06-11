@@ -54,12 +54,21 @@ if $APPLY; then
   echo "→ Applying K8s manifests..."
 
   # Substitute the real project ID into manifests on-the-fly
+  # SKIP secret.yaml — it has no data (Conjur-managed); applying it wipes live keys
   for f in k8s/*.yaml; do
+    [[ "$f" == *"secret.yaml" ]] && continue
     sed "s|gcr.io/pure-tribute-440710-r8|gcr.io/${GCP_PROJECT}|g" "$f" \
       | kubectl apply -f -
   done
 
   echo "✓ Manifests applied."
+
+  # Force rollout so the new :latest image is actually pulled.
+  # kubectl apply on an unchanged manifest is a no-op even with imagePullPolicy:Always.
+  if $BUILD; then
+    echo "→ Rolling restart to pick up new image..."
+    kubectl rollout restart deployment/alpaca-server --namespace alpaca-trader
+  fi
 
   # ── Seed K8s secret from Conjur (Conjur init-container not installed) ──────
   CONJUR_DIR="${HOME}/Code/conjur-secret-manager"
@@ -94,7 +103,24 @@ if $RESTART; then
   echo "✓ Restart complete."
 fi
 
-# ── 4. Port-forward hint ──────────────────────────────────────────────────────
+# ── 4. Post-deploy QA ─────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${SCRIPT_DIR}/qa_agent.py" ]] && ( $APPLY || $RESTART ); then
+  echo ""
+  echo "→ Running post-deploy QA suite..."
+  # Write strategy_model.json to pod after every deploy (fresh pod loses state)
+  # --fix is intentionally omitted: post-deploy QA must never mutate live pod state.
+  if python3 "${SCRIPT_DIR}/qa_agent.py" --pod; then
+    echo "✓ QA passed."
+  else
+    echo ""
+    echo "✗ QA FAILED — review output above before shipping."
+    echo "  To re-run: python3 qa_agent.py --pod --fix"
+    exit 1
+  fi
+fi
+
+# ── 5. Port-forward hint ──────────────────────────────────────────────────────
 echo ""
 echo "Access the dashboard (cluster is behind firewall — use port-forward):"
 echo "  kubectl port-forward svc/alpaca-server 5001:5001 -n alpaca-trader"
