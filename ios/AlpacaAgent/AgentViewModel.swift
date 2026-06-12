@@ -40,6 +40,7 @@ class AgentViewModel: ObservableObject {
     @Published var tradingPaper:  Bool = true      // false = live (real $)
     @Published var traderControlLoaded: Bool = false
 
+
     private var pollTask: Task<Void, Never>?
     private var prevRegime: String = ""
     private var prevPosCount: Int  = -1
@@ -487,7 +488,22 @@ class AgentViewModel: ObservableObject {
                     prepareTrade(proposal: proposal)
                 } else if let reply = json["reply"] as? String {
                     let variant = variantFrom(json["variant"] as? String)
-                    addMessage(ChatMessage(reply, role: .agent, variant: variant))
+                    // Parse optional signal_insight for on-demand score responses
+                    var insight: SignalInsight? = nil
+                    if let sigDict = json["signal_insight"] as? [String: Any] {
+                        insight = parseSignalInsight(from: sigDict)
+                        // Also inject into signalInsights so StockDetailSheet can show it
+                        if let si = insight {
+                            DispatchQueue.main.async {
+                                if let idx = self.signalInsights.firstIndex(where: { $0.symbol == si.symbol }) {
+                                    self.signalInsights[idx] = si
+                                } else {
+                                    self.signalInsights.insert(si, at: 0)
+                                }
+                            }
+                        }
+                    }
+                    addMessage(ChatMessage(reply, role: .agent, variant: variant, signalInsight: insight))
                 }
                 await fetchOverview()
             } catch {
@@ -850,9 +866,19 @@ class AgentViewModel: ObservableObject {
                 priceVsTrendPct: anyDouble(technicals["price_vs_trend_pct"]),
                 fibPosition: anyString(technicals["fib_position"], fallback: "--"),
                 lastPrice: anyDouble(quote["price"]),
+                side: anyString(item["side"], fallback: "buy"),
                 reasons: item["technical_reasons"] as? [String] ?? []
             )
             insight.signalBreakdown = breakdown
+            insight.news = (item["news"] as? [[String: Any]] ?? []).prefix(5).map { n in
+                SignalNewsItem(
+                    id:        anyString(n["id"],         fallback: UUID().uuidString),
+                    headline:  anyString(n["headline"],   fallback: ""),
+                    source:    anyString(n["source"],     fallback: ""),
+                    url:       anyString(n["url"],        fallback: ""),
+                    createdAt: anyString(n["created_at"], fallback: "")
+                )
+            }
             return insight
         }
     }
@@ -861,6 +887,12 @@ class AgentViewModel: ObservableObject {
         // Same shape as live_scores top entries — reuse the same parsing logic
         let wrapper: [String: Any] = ["top": rows]
         return parseSignalInsights(wrapper)
+    }
+
+    /// Parse a single signal_insight dict (from on-demand chat score responses).
+    private func parseSignalInsight(from item: [String: Any]) -> SignalInsight? {
+        let wrapper: [String: Any] = ["top": [item]]
+        return parseSignalInsights(wrapper).first
     }
 
     private func parseOrder(_ order: [String: Any]) -> ActivityLogItem {
@@ -935,11 +967,11 @@ class AgentViewModel: ObservableObject {
             variant = .alert
 
         case "news_risk_detected":
-            let sym   = anyString(payload["symbol"], fallback: "position").uppercased()
-            let delta = anyInt(payload["delta"] as Any)
-            let head  = anyString(payload["headline"], fallback: "")
-            let bearETFs: Set<String> = ["SQQQ","SPXS","SPXU","SOXS","UVXY","VIXY","SDOW","SRTY","TECS"]
-            if bearETFs.contains(sym) {
+            let sym      = anyString(payload["symbol"], fallback: "position").uppercased()
+            let delta    = anyInt(payload["delta"] as Any)
+            let head     = anyString(payload["headline"], fallback: "")
+            let isBearEtf = payload["is_bear_etf"] as? Bool ?? false
+            if isBearEtf {
                 title  = "Market risk signal"
                 detail = head.isEmpty ? "Bearish signal on \(sym) — may benefit this short position." : "\(sym): \(head.prefix(80)) · bearish news may help this position"
                 variant = .alert

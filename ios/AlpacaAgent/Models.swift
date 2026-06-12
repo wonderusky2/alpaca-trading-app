@@ -144,7 +144,9 @@ struct SignalInsight: Identifiable {
     let priceVsTrendPct: Double
     let fibPosition: String
     let lastPrice: Double
+    let side: String
     let reasons: [String]
+    var news: [SignalNewsItem] = []
     /// Keyed by indicator name: "rsi" | "macd" | "avwap" | "ema" | "trend" | "price_action"
     var signalBreakdown: [String: SignalIndicator] = [:]
 
@@ -231,12 +233,15 @@ struct ChatMessage: Identifiable {
     let text: String          // plain text (no HTML)
     let variant: MessageVariant
     let time: Date
+    let signalInsight: SignalInsight?   // non-nil when the reply carries a scored signal
 
-    init(_ text: String, role: MessageRole, variant: MessageVariant = .normal) {
+    init(_ text: String, role: MessageRole, variant: MessageVariant = .normal,
+         signalInsight: SignalInsight? = nil) {
         self.text = text
         self.role = role
         self.variant = variant
         self.time = Date()
+        self.signalInsight = signalInsight
     }
 }
 
@@ -254,6 +259,14 @@ struct TradeOrder: Identifiable {
     var isSell: Bool {
         side.lowercased() == "sell"
     }
+}
+
+struct SignalNewsItem: Identifiable {
+    let id: String
+    let headline: String
+    let source: String
+    let url: String
+    let createdAt: String
 }
 
 struct PendingTradeProposal: Identifiable {

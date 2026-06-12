@@ -63,6 +63,124 @@ def _save_trader_control(state: dict) -> None:
         log.warning("save trader_control failed: %s", e)
 
 
+def _auto_entry_gate() -> dict:
+    """Mirror trader.py entry-only gates for honest dashboard/chat explanations."""
+    ctrl = _load_trader_control()
+    if ctrl.get("paused"):
+        return {
+            "blocked": True,
+            "reason": "auto_paused",
+            "summary": "Auto-trading is paused.",
+        }
+
+    now = trader._now_et()
+    if not trader.is_market_open():
+        if trader.is_eod():
+            return {
+                "blocked": True,
+                "reason": "eod_flat",
+                "summary": "Auto entries are blocked because the system is in the EOD flatten window.",
+            }
+        return {
+            "blocked": True,
+            "reason": "market_closed",
+            "summary": "Auto entries are blocked because the market is closed.",
+        }
+
+    mins = now.hour * 60 + now.minute
+    open_mins = trader.MARKET_OPEN_HOUR * 60 + trader.MARKET_OPEN_MIN
+    eod_mins = trader.EOD_FLAT_HOUR * 60 + trader.EOD_FLAT_MIN
+    open_until = open_mins + trader.NO_ENTRY_OPEN_MINS
+    eod_block_start = eod_mins - trader.NO_ENTRY_EOD_MINS
+
+    def _hhmm(total_mins: int) -> str:
+        hour = total_mins // 60
+        minute = total_mins % 60
+        suffix = "AM" if hour < 12 else "PM"
+        hour12 = hour % 12 or 12
+        return f"{hour12}:{minute:02d} {suffix} ET"
+
+    if mins < open_until:
+        return {
+            "blocked": True,
+            "reason": "opening_no_entry_window",
+            "next_eligible": _hhmm(open_until),
+            "summary": (
+                "Auto entries are blocked during the first "
+                f"{trader.NO_ENTRY_OPEN_MINS} minutes after the open. "
+                f"Next eligible auto-trading tick is after {_hhmm(open_until)}."
+            ),
+        }
+    if mins >= eod_block_start:
+        return {
+            "blocked": True,
+            "reason": "pre_eod_no_entry_window",
+            "summary": (
+                "Auto entries are blocked in the pre-EOD window so the system "
+                f"can flatten before {_hhmm(eod_mins)}."
+            ),
+        }
+    return {
+        "blocked": False,
+        "reason": "eligible",
+        "summary": "Auto entries are eligible on the next trader tick.",
+    }
+
+
+def _chat_order_gate(
+    qualifying_signals: list[dict],
+    positions: list[dict],
+    acct_snap: dict,
+    acctg_snap: dict,
+    scores_snap: dict,
+) -> dict:
+    """Return the risk gate that would apply to chat-described signal entries."""
+    if not qualifying_signals:
+        return {"ok": True, "errors": [], "warnings": []}
+
+    model = strategy_model.load_model()
+    equity = float((acct_snap or {}).get("equity") or 0)
+    cash = float((acct_snap or {}).get("cash") or 0)
+    regime = str((scores_snap or {}).get("regime") or "").upper()
+    regime_mult = 0.5 if regime in ("CHOPPY", "CHOP") else 1.0
+    alloc = equity * float(model.get("position_size_pct", 0.05)) * regime_mult
+
+    orders = []
+    deployed = 0.0
+    for sig in qualifying_signals:
+        price = float((sig.get("quote") or {}).get("price") or 0)
+        if price <= 0:
+            continue
+        qty = max(1, int(alloc / price))
+        cost = qty * price
+        if cash > 0 and deployed + cost > cash * 0.95:
+            break
+        deployed += cost
+        orders.append({
+            "symbol": str(sig.get("symbol") or "").upper(),
+            "side": "buy",
+            "qty": qty,
+            "estimated_value": round(cost, 2),
+        })
+
+    broker_positions = {
+        str(p.get("symbol") or "").upper(): p
+        for p in (positions or [])
+        if str(p.get("symbol") or "").strip()
+    }
+    snapshot = {
+        "account": acct_snap,
+        "accounting": acctg_snap,
+        "clock": (acctg_snap or {}).get("clock") or {},
+        "positions": broker_positions,
+    }
+    try:
+        snapshot["clock"] = get_client().get_clock()
+    except Exception:
+        pass
+    return RiskAgent().order_gate(orders, snapshot)
+
+
 # ── Push notification device token store (#41) ────────────────────────────────
 _PUSH_TOKENS_PATH = strategy_model.STATE_DIR / "push_tokens.json"
 
@@ -279,7 +397,7 @@ def _load_event_state() -> dict:
         raw["news_symbols"] = set(raw.get("news_symbols") or [])
         return raw
     except Exception:
-        return {"regime": "", "exit_symbols": set(), "news_symbols": set(), "risk_action": ""}
+        return {"regime": "", "exit_symbols": set(), "news_symbols": set(), "risk_action": "", "last_regime_event_ts": None}
 
 def _save_event_state(state: dict) -> None:
     try:
@@ -1598,14 +1716,23 @@ def _detect_and_emit_portfolio_events(
     global _last_event_state
     prev = _last_event_state
 
-    # Regime change
+    # Regime change — debounced: suppress if a regime_change event fired within the last 5 min.
+    # Prevents log spam from BEAR↔UNKNOWN oscillation on volatile open/close.
     prev_regime = prev.get("regime", "")
-    if prev_regime and prev_regime != regime:
+    last_regime_event_ts = prev.get("last_regime_event_ts")
+    regime_cooldown_secs = 5 * 60  # 5 minutes
+    now_ts = datetime.now(timezone.utc).timestamp()
+    regime_cooled = (
+        last_regime_event_ts is None
+        or (now_ts - last_regime_event_ts) >= regime_cooldown_secs
+    )
+    if prev_regime and prev_regime != regime and regime_cooled:
         _append_event("regime_change", {
             "from": prev_regime,
             "to":   regime,
             "reason": f"Market regime shifted from {prev_regime} to {regime}. Signal universe and weights updated.",
         })
+        prev["last_regime_event_ts"] = now_ts
 
     # New news risk symbols
     news_syms  = {str(n.get("symbol") or "") for n in news_risk}
@@ -1614,10 +1741,11 @@ def _detect_and_emit_portfolio_events(
     for sym in new_news:
         nr = next((n for n in news_risk if n.get("symbol") == sym), {})
         _append_event("news_risk_detected", {
-            "symbol":   sym,
-            "delta":    nr.get("delta", 0),
-            "headline": nr.get("headline", ""),
-            "reason":   f"Negative news detected on {sym} — sentiment delta {nr.get('delta', 0):+d}.",
+            "symbol":     sym,
+            "delta":      nr.get("delta", 0),
+            "headline":   nr.get("headline", ""),
+            "is_bear_etf": sym in sg.BEAR_ETF,
+            "reason":     f"Negative news detected on {sym} — sentiment delta {nr.get('delta', 0):+d}.",
         })
 
     # New exit recommendations
@@ -1750,6 +1878,31 @@ def _llm_explain_decision(decision: dict, overview: dict) -> str:
 
 _coordinator = DecisionCoordinator()
 
+# ── Global error handler — always return JSON, never HTML ─────────────────────
+
+@app.errorhandler(Exception)
+def handle_unhandled_exception(e):
+    import traceback as _tb
+    tb = _tb.format_exc()
+    log.error("Unhandled exception in request %s %s: %s\n%s",
+              request.method, request.path, e, tb)
+    return jsonify({
+        "ok": False,
+        "error": str(e),
+        "type": type(e).__name__,
+    }), 500
+
+
+@app.errorhandler(404)
+def handle_404(e):
+    return jsonify({"ok": False, "error": "Not found", "path": request.path}), 404
+
+
+@app.errorhandler(405)
+def handle_405(e):
+    return jsonify({"ok": False, "error": "Method not allowed"}), 405
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.route("/api/status")
@@ -1764,7 +1917,8 @@ def api_status():
     try:
         clock = get_client().get_clock()
         payload["broker_connected"] = True
-        payload["market_open"] = bool(getattr(clock, "is_open", False))
+        payload["market_open"] = bool(clock.get("is_open"))
+        payload["clock"] = clock
     except Exception as e:
         payload["broker_error"] = str(e)
     return jsonify(payload)
@@ -2051,6 +2205,20 @@ def api_lab_orders_preview():
         scores = _coordinator.market_news.live_scores(force=False)
         snap = _coordinator.portfolio.snapshot(live_scores=scores)
         preview = _coordinator.trading.preview(plan_type, custom_orders, snap, scores)
+        entry_gate = _auto_entry_gate()
+        decision = preview["decision"]
+        if (
+            entry_gate.get("blocked")
+            and plan_type == "build"
+            and preview.get("orders")
+            and str(decision.get("action") or "") == "enter"
+        ):
+            decision = {
+                **decision,
+                "action": "wait",
+                "severity": "warning",
+                "summary": entry_gate["summary"],
+            }
 
         return jsonify({
             "ok":         True,
@@ -2060,7 +2228,8 @@ def api_lab_orders_preview():
             "regime":     (scores or {}).get("regime"),
             "scored_at":  (scores or {}).get("scored_at"),
             "risk_gate":  preview["risk_gate"],
-            "decision":   preview["decision"],
+            "entry_gate": entry_gate,
+            "decision":   decision,
         })
     except Exception as e:
         log.warning("preview error: %s", e)
@@ -2190,6 +2359,46 @@ def api_lab_live_scores_trigger():
     return jsonify({"ok": True, "message": "Signal scoring started."})
 
 
+@app.route("/api/lab/score/<symbol>")
+@require_api_key
+def api_lab_score_symbol(symbol):
+    """On-demand full signal score for any ticker — not limited to the agent's universe.
+
+    Response: {"ok": true, "signal": { same shape as live_scores.top[] }}
+    """
+    symbol = symbol.upper().strip()
+    try:
+        _cl    = get_client()
+        cached = _live_scores_cache.get("data") or {}
+        regime = str(cached.get("regime") or "CHOPPY").upper()
+        quotes = trader.fetch_quotes([symbol], client=_cl)
+        quotes = sg.enrich_quotes_with_indicators(quotes, [symbol], alpaca_client=_cl)
+        score, breakdown = sg.score_symbol(symbol, quotes, regime)
+        technical_reasons = [bd["label"] for bd in breakdown.values() if bd.get("label")]
+        q    = quotes.get(symbol) or {}
+        news = _get_news_for_symbols([symbol]).get(symbol, [])
+        return jsonify({
+            "ok": True,
+            "signal": {
+                "symbol":            symbol,
+                "score":             score,
+                "base_score":        score,
+                "news_delta":        0,
+                "news_terms":        [],
+                "regime":            regime,
+                "side":              "buy",
+                "quote":             q,
+                "technicals":        q.get("technicals") or {},
+                "technical_reasons": technical_reasons,
+                "signal_breakdown":  breakdown,
+                "news":              news[:5],
+            },
+        })
+    except Exception as e:
+        log.warning("api_lab_score_symbol(%s) failed: %s", symbol, e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/lab/chat/message", methods=["POST"])
 @require_api_key
 def api_lab_chat_message():
@@ -2203,20 +2412,20 @@ def api_lab_chat_message():
     if not text:
         return jsonify({"ok": False, "error": "No text provided."}), 400
 
-    # ── Snapshot current state ────────────────────────────────────────────────
-    cache_snap = _overview_cache.get("data")
-    if not cache_snap:
-        try:
-            cache_snap = _coordinator.overview()
-            _overview_cache["ts"]   = time.time()
-            _overview_cache["data"] = cache_snap
-        except Exception as e:
-            log.warning("chat context fallback fetch failed: %s", e)
-            cache_snap = {}
+    cache_snap = _overview_cache.get("data") or {}
 
-    acct_snap   = cache_snap.get("account")    or {}
-    acctg_snap  = cache_snap.get("accounting") or {}
-    scores_snap = (cache_snap.get("live_scores") or {})
+    # Match the trading preview path so chat explanations use the same score
+    # and risk snapshot as the actual order gate.
+    try:
+        scores_snap = _coordinator.market_news.live_scores(force=False) or {}
+        trade_snap = _coordinator.portfolio.snapshot(live_scores=scores_snap)
+    except Exception as e:
+        log.warning("chat context fetch failed: %s", e)
+        scores_snap = cache_snap.get("live_scores") or {}
+        trade_snap = cache_snap
+
+    acct_snap   = trade_snap.get("account")    or {}
+    acctg_snap  = trade_snap.get("accounting") or {}
 
     def _flt(d, key, default=0.0):
         v = d.get(key, default)
@@ -2292,6 +2501,105 @@ def api_lab_chat_message():
             )
 
     text_low = text.lower()
+    entry_gate = _auto_entry_gate()
+    held_symbols = {str(p.get("symbol") or "").upper() for p in positions}
+    qualifying_signals = [
+        s for s in (scores_snap.get("signals") or scores_snap.get("top") or [])
+        if int(float(s.get("score") or 0)) >= int(model_state.get("min_conviction", 75))
+        and str(s.get("symbol") or "").upper() not in held_symbols
+    ]
+
+    why_not_keywords = {
+        "why are you not buying", "why aren't you buying", "why not buying",
+        "why no buy", "why no trade", "nothing to trade", "why aren't you trading",
+        "why are you not trading", "why not trading",
+    }
+    if any(k in text_low for k in why_not_keywords):
+        if not (scores_snap.get("signals") or scores_snap.get("top")):
+            try:
+                scores_snap = _coordinator.market_news.live_scores(force=True) or {}
+                trade_snap = _coordinator.portfolio.snapshot(live_scores=scores_snap)
+                acct_snap = trade_snap.get("account") or {}
+                acctg_snap = trade_snap.get("accounting") or {}
+                positions = acctg_snap.get("positions") or []
+            except Exception as e:
+                log.warning("chat forced score refresh failed: %s", e)
+        try:
+            preview = _coordinator.trading.preview("build", None, trade_snap, scores_snap)
+        except Exception as e:
+            log.warning("chat preview fetch failed: %s", e)
+            preview = {}
+        preview_orders = preview.get("orders") or []
+        preview_gate = preview.get("risk_gate") or {}
+
+        if entry_gate.get("blocked"):
+            top = preview_orders[0] if preview_orders else (qualifying_signals[0] if qualifying_signals else None)
+            lead = (
+                f"{top.get('symbol')} qualifies at score {int(float(top.get('score') or 0))}, but "
+                if top else
+                ""
+            )
+            return jsonify({"ok": True, "reply": lead + entry_gate["summary"]})
+        if preview_orders:
+            top = preview_orders[0]
+            if not preview_gate.get("ok"):
+                err = (preview_gate.get("errors") or [{}])[0].get("error") or "Risk gate blocks new buys."
+                return jsonify({
+                    "ok": True,
+                    "reply": (
+                        f"{top.get('symbol')} qualifies at score {int(float(top.get('score') or 0))}, "
+                        f"but new buys are blocked: {err}"
+                    ),
+                })
+            return jsonify({
+                "ok": True,
+                "reply": (
+                    f"{top.get('symbol')} qualifies at score {int(float(top.get('score') or 0))}. "
+                    "Auto entries are eligible on the next trader tick."
+                ),
+            })
+        if qualifying_signals:
+            top = qualifying_signals[0]
+            order_gate = _chat_order_gate(qualifying_signals, positions, acct_snap, acctg_snap, scores_snap)
+            if not order_gate.get("ok"):
+                err = (order_gate.get("errors") or [{}])[0].get("error") or "Risk gate blocks new buys."
+                return jsonify({
+                    "ok": True,
+                    "reply": (
+                        f"{top.get('symbol')} qualifies at score {int(float(top.get('score') or 0))}, "
+                        f"but new buys are blocked: {err}"
+                    ),
+                })
+            return jsonify({
+                "ok": True,
+                "reply": (
+                    f"{top.get('symbol')} qualifies at score {int(float(top.get('score') or 0))}. "
+                    "Auto entries are eligible on the next 5-minute trader tick."
+                ),
+            })
+        return jsonify({"ok": True, "reply": "No qualifying signal is currently above the entry threshold."})
+
+    # ── Fast-path: unusual volume ────────────────────────────────────────────
+    vol_keywords = {"unusual volume", "high volume", "volume spike", "volume spikes",
+                    "what has volume", "volume alert", "top volume", "most volume"}
+    if any(k in text_low for k in vol_keywords):
+        all_sigs = scores_snap.get("signals") or scores_snap.get("top") or []
+        vol_hits = []
+        for s in all_sigs:
+            tech = (s.get("technicals") or {})
+            vr = float(tech.get("volume_ratio") or 0)
+            if vr >= 1.5:
+                price = float((s.get("quote") or {}).get("price") or 0)
+                chg   = float((s.get("quote") or {}).get("change_pct") or 0)
+                vol_hits.append((s["symbol"], vr, price, chg, s.get("score", 0)))
+        vol_hits.sort(key=lambda x: -x[1])
+        if vol_hits:
+            lines = [f"{sym}: {vr:.1f}x avg vol, ${price:.2f} ({chg:+.1f}%), score={score}"
+                     for sym, vr, price, chg, score in vol_hits[:8]]
+            return jsonify({"ok": True, "reply":
+                "Unusual volume (≥1.5× average):\n" + "\n".join(lines)})
+        return jsonify({"ok": True, "reply":
+            "No unusual volume detected in the current signal universe. Run a scan to refresh data."})
 
     # ── Fast-path: "run live scores / scan" intent ───────────────────────────
     scan_keywords = {"run live scores", "run scores", "do it now", "trigger scan", "trigger scores",
@@ -2369,6 +2677,21 @@ def api_lab_chat_message():
                 f"No eligible signals above conviction {min_conv} that aren't already held."
             )
             return jsonify({"ok": True, "reply": no_sig_reply})
+        if entry_gate.get("blocked"):
+            return jsonify({"ok": True, "reply": entry_gate["summary"]})
+        order_gate = _chat_order_gate(
+            [
+                s for s in cached_signals
+                if str(s.get("symbol") or "").upper() in {o["symbol"] for o in orders}
+            ],
+            positions,
+            acct_snap,
+            acctg_snap,
+            scores_snap,
+        )
+        if not order_gate.get("ok"):
+            err = (order_gate.get("errors") or [{}])[0].get("error") or "Risk gate blocks new buys."
+            return jsonify({"ok": True, "reply": f"New buys are blocked: {err}"})
         regime_note = " at 50% size (CHOPPY)" if regime_mult < 1 else ""
         return jsonify({"ok": True, "trade_proposal": {
             "orders": orders,
@@ -2397,10 +2720,12 @@ Regime: BULL when QQQ ≥+0.4%, BEAR when QQQ ≤-0.5%, CHOPPY otherwise.
 Be concise and direct — talk like a prop trader, not a financial advisor. Use plain numbers.
 Dollar amounts with $ and commas. Percentages with one decimal.
 
-When user asks to BUY or SELL (e.g. "buy 10 NVDA", "sell my TSLA"):
+When user asks to BUY or SELL a specific stock (e.g. "buy 10 NVDA", "sell my TSLA", "buy AAPL"):
   Respond with ONLY this JSON (no markdown, no extra text):
-  {"trade_proposal": {"orders": [{"symbol": "NVDA", "side": "buy", "qty": 10}], "summary": "Brief reason"}}
-  - qty must be a positive integer; side must be "buy" or "sell"
+  {"trade_proposal": {"orders": [{"symbol": "NVDA", "side": "buy", "qty": 0}], "summary": "Brief reason"}}
+  - Set qty=0 to mean "auto-calculate from portfolio sizing" — the server will calculate qty from position_size_pct.
+  - Only set qty > 0 if the user explicitly specifies a share count.
+  - side must be "buy" or "sell"
 
 When user says to place/enter/execute orders or "go ahead" or "just do it" (e.g. "place orders", "enter positions", "go for it", "deploy capital"):
   Respond with ONLY this JSON using the top qualifying signals from context (no markdown, no extra text):
@@ -2410,9 +2735,65 @@ When user asks to run/trigger/start a scan or live scores (e.g. "run live scores
   Respond with ONLY this JSON (no markdown, no extra text):
   {"action": "trigger_live_scores"}
 
+When user asks to score, analyze, or get signal details for any specific stock (e.g. "score ZS", "analyze NVDA", "what's the signal on AAPL", "score this for me: MSFT", "get signal for TSLA"):
+  Respond with ONLY this JSON (no markdown, no extra text):
+  {"action": "score_symbol", "symbol": "ZS"}
+
+When user asks about unusual volume, high volume stocks, or volume spikes (e.g. "what has unusual volume", "any volume spikes", "high volume today"):
+  Respond with ONLY this JSON (no markdown, no extra text):
+  {"action": "unusual_volume"}
+
 For all other queries respond in plain text. Never fabricate data not in context. This is paper trading."""
 
     # ── Context block ─────────────────────────────────────────────────────────
+    # ── SPY / QQQ market context ──────────────────────────────────────────────
+    index_context = ""
+    try:
+        _cl = get_client()
+        _idx_snaps = _cl.get_snapshots(["SPY", "QQQ"])
+        _idx_lines = []
+        for _idx_sym in ("SPY", "QQQ"):
+            _sn = (_idx_snaps or {}).get(_idx_sym) or {}
+            _dp = _sn.get("dailyBar") or _sn.get("daily_bar") or {}
+            _lp = float(_sn.get("latestTrade", {}).get("p") or _dp.get("c") or 0)
+            _prev = float(_dp.get("vw") or _dp.get("o") or _lp)
+            _chg = ((_lp - _prev) / _prev * 100) if _prev else 0
+            if _lp:
+                _idx_lines.append(f"{_idx_sym} ${_lp:.2f} ({_chg:+.1f}%)")
+        if _idx_lines:
+            index_context = "Market indices: " + " | ".join(_idx_lines)
+    except Exception as _ie:
+        log.debug("index context fetch failed: %s", _ie)
+
+    # ── Ad-hoc ticker mentioned in the query (not in universe) ───────────────
+    import re as _re
+    _ticker_pat = _re.compile(r'\b([A-Z]{2,5})\b')
+    _mentioned = {m.group(1) for m in _ticker_pat.finditer(text.upper())} - {
+        "BUY", "SELL", "ETF", "USD", "EOD", "ATR", "RSI", "EMA", "THE", "AND",
+        "NOT", "FOR", "ALL", "TOP", "SPY", "QQQ", "GET", "WHY", "RUN", "NOW",
+        "ANY", "ASK", "LET", "OUT",
+    }
+    _universe = {str(s.get("symbol") or "").upper() for s in (scores_snap.get("signals") or scores_snap.get("top") or [])}
+    _adhoc_syms = _mentioned - _universe - held_symbols
+    adhoc_context = ""
+    if _adhoc_syms:
+        try:
+            _cl2 = get_client()
+            _adhoc_snaps = _cl2.get_snapshots(list(_adhoc_syms)[:5])
+            _adhoc_lines = []
+            for _as in list(_adhoc_syms)[:5]:
+                _sn2 = (_adhoc_snaps or {}).get(_as) or {}
+                _dp2 = _sn2.get("dailyBar") or _sn2.get("daily_bar") or {}
+                _lp2 = float(_sn2.get("latestTrade", {}).get("p") or _dp2.get("c") or 0)
+                _prev2 = float(_dp2.get("o") or _lp2)
+                _chg2 = ((_lp2 - _prev2) / _prev2 * 100) if _prev2 else 0
+                if _lp2:
+                    _adhoc_lines.append(f"{_as} ${_lp2:.2f} ({_chg2:+.1f}%)")
+            if _adhoc_lines:
+                adhoc_context = "Ad-hoc quote(s): " + " | ".join(_adhoc_lines)
+        except Exception as _ae:
+            log.debug("adhoc ticker fetch failed: %s", _ae)
+
     # ── Recent orders ──────────────────────────────────────────────────────────
     try:
         _recent_raw = get_client().get_recent_orders(limit=10)
@@ -2450,11 +2831,14 @@ For all other queries respond in plain text. Never fabricate data not in context
         f"=== Portfolio State ===\n"
         f"Equity: ${equity:,.0f} | Cash: ${cash:,.0f} | Daily P&L: ${daily_pnl:+,.0f}\n"
         f"Gross exposure: {gross_exp:.1f}% | Max weight drift: {drift_max:.1f}% | Next rebalance: {next_reb}\n"
-        f"Market regime: {regime}\n"
+        f"Market regime: {regime}"
+        + (f" | {index_context}" if index_context else "")
+        + "\n"
         f"Open positions ({len(positions)}): {', '.join(pos_lines) if pos_lines else 'none'}\n"
         f"Position technicals:\n{pos_tech_str}\n"
         f"Exit recommendations: {', '.join(exit_lines) if exit_lines else 'none'}\n"
         f"Risk: {risk_state.get('status','?')} — {risk_state.get('message','')}\n"
+        f"Auto entry gate: {'BLOCKED' if entry_gate.get('blocked') else 'ELIGIBLE'} — {entry_gate.get('summary','')}\n"
         f"\n=== Recent Orders ===\n"
         f"{chr(10).join(recent_order_lines)}\n"
         f"\n=== News Risk ===\n"
@@ -2463,7 +2847,8 @@ For all other queries respond in plain text. Never fabricate data not in context
         f"Generation {generation} | Active variant: {variant} | Min conviction: {conviction}/100 | Max hold: {max_hold}d\n"
         f"\n=== Variant Win Rates (last 90 days) ===\n"
         f"{chr(10).join(variant_lines)}\n"
-        f"\n=== Top Signal Candidates (with indicator breakdown) ===\n"
+        + (f"\n{adhoc_context}\n" if adhoc_context else "")
+        + f"\n=== Top Signal Candidates (with indicator breakdown) ===\n"
         f"{chr(10).join(sig_lines) if sig_lines else 'No signals cached — run live scores first.'}\n"
     )
 
@@ -2472,7 +2857,7 @@ For all other queries respond in plain text. Never fabricate data not in context
     if not gemini_key:
         reply = _simple_chat_response(text_low, equity, daily_pnl, cash, regime, pos_lines, sig_lines,
                                       variant_lines=variant_lines, recent_order_lines=recent_order_lines,
-                                      model_state=model_state)
+                                      model_state=model_state, entry_gate=entry_gate)
         return jsonify({"ok": True, "reply": reply, "variant": "keyword_fallback"})
 
     try:
@@ -2494,6 +2879,59 @@ For all other queries respond in plain text. Never fabricate data not in context
                     threading.Thread(target=_run_live_scores, daemon=True).start()
                     return jsonify({"ok": True, "reply":
                         "Signal scan started. Takes ~30 seconds. Ask me 'what are the top signals?' when done."})
+                if parsed.get("action") == "unusual_volume":
+                    all_sigs = scores_snap.get("signals") or scores_snap.get("top") or []
+                    vol_hits = []
+                    for s in all_sigs:
+                        vr = float((s.get("technicals") or {}).get("volume_ratio") or 0)
+                        if vr >= 1.5:
+                            price = float((s.get("quote") or {}).get("price") or 0)
+                            chg   = float((s.get("quote") or {}).get("change_pct") or 0)
+                            vol_hits.append((s["symbol"], vr, price, chg, s.get("score", 0)))
+                    vol_hits.sort(key=lambda x: -x[1])
+                    if vol_hits:
+                        lines = [f"{sym}: {vr:.1f}x avg vol, ${price:.2f} ({chg:+.1f}%), score={score}"
+                                 for sym, vr, price, chg, score in vol_hits[:8]]
+                        return jsonify({"ok": True, "reply":
+                            "Unusual volume (≥1.5× average):\n" + "\n".join(lines)})
+                    return jsonify({"ok": True, "reply":
+                        "No unusual volume detected in the current signal universe. Run a scan to refresh data."})
+                if parsed.get("action") == "score_symbol":
+                    _score_sym = str(parsed.get("symbol") or "").upper().strip()
+                    if not _score_sym:
+                        return jsonify({"ok": True, "reply": "Couldn't identify the ticker to score."})
+                    try:
+                        _cl3   = get_client()
+                        _c3    = _live_scores_cache.get("data") or {}
+                        _reg3  = str(_c3.get("regime") or regime or "CHOPPY").upper()
+                        _q3    = trader.fetch_quotes([_score_sym], client=_cl3)
+                        _q3    = sg.enrich_quotes_with_indicators(_q3, [_score_sym], alpaca_client=_cl3)
+                        _sc3, _bd3 = sg.score_symbol(_score_sym, _q3, _reg3)
+                        _reas3 = [bd["label"] for bd in _bd3.values() if bd.get("label")]
+                        _qd3   = _q3.get(_score_sym) or {}
+                        _news3 = _get_news_for_symbols([_score_sym]).get(_score_sym, [])
+                        _signal3 = {
+                            "symbol": _score_sym, "score": _sc3, "base_score": _sc3,
+                            "news_delta": 0, "news_terms": [], "regime": _reg3,
+                            "side": "buy", "quote": _qd3,
+                            "technicals": _qd3.get("technicals") or {},
+                            "technical_reasons": _reas3,
+                            "signal_breakdown": _bd3,
+                            "news": _news3[:5],
+                        }
+                        _ind_summary = []
+                        for _iname in ("rsi", "macd", "avwap", "ema", "trend", "price_action"):
+                            _ind = _bd3.get(_iname) or {}
+                            if _ind.get("label"):
+                                _ind_summary.append(f"{_iname.upper()}: {_ind['label']} ({_ind.get('score',0)}/{_ind.get('weight',0)}pts)")
+                        _reply3 = (
+                            f"{_score_sym} scores {_sc3}/100 (regime: {_reg3})\n"
+                            + ("\n".join(_ind_summary) if _ind_summary else "No indicator breakdown available.")
+                        )
+                        return jsonify({"ok": True, "reply": _reply3, "signal_insight": _signal3})
+                    except Exception as _se:
+                        log.warning("chat score_symbol(%s) failed: %s", _score_sym, _se)
+                        return jsonify({"ok": True, "reply": f"Couldn't score {_score_sym}: {_se}"})
                 if parsed.get("action") == "place_top_signals":
                     # Redirect to the same logic as the fast-path enter block
                     cached_signals = (scores_snap.get("signals") or scores_snap.get("top") or [])
@@ -2522,6 +2960,21 @@ For all other queries respond in plain text. Never fabricate data not in context
                         _orders.append({"symbol": _sym, "side": "buy", "qty": _qty,
                                         "estimated_value": round(_cost, 2)})
                     if _orders:
+                        if entry_gate.get("blocked"):
+                            return jsonify({"ok": True, "reply": entry_gate["summary"]})
+                        order_gate = _chat_order_gate(
+                            [
+                                s for s in cached_signals
+                                if str(s.get("symbol") or "").upper() in {o["symbol"] for o in _orders}
+                            ],
+                            positions,
+                            acct_snap,
+                            acctg_snap,
+                            scores_snap,
+                        )
+                        if not order_gate.get("ok"):
+                            err = (order_gate.get("errors") or [{}])[0].get("error") or "Risk gate blocks new buys."
+                            return jsonify({"ok": True, "reply": f"New buys are blocked: {err}"})
                         _regime_note = " at 50% size (CHOPPY)" if regime_mult < 1 else ""
                         return jsonify({"ok": True, "trade_proposal": {
                             "orders": _orders,
@@ -2541,13 +2994,27 @@ For all other queries respond in plain text. Never fabricate data not in context
                 orders = proposal.get("orders") or []
                 # Sanitize orders
                 clean_orders = []
+                _tp_model    = strategy_model.load_model()
+                _tp_size_pct = float(_tp_model.get("position_size_pct", 0.05))
+                _tp_regime_m = 0.5 if regime in ("CHOPPY", "CHOP") else 1.0
                 for o in orders:
                     sym  = str(o.get("symbol") or "").upper().strip()
                     side = str(o.get("side") or "buy").lower()
                     qty  = int(float(o.get("qty") or 0))
-                    if sym and side in {"buy", "sell"} and qty > 0:
-                        clean_orders.append({"symbol": sym, "side": side, "qty": qty,
-                                             "estimated_value": 0})
+                    if sym and side in {"buy", "sell"}:
+                        if qty == 0 and side == "buy":
+                            # auto-calculate from portfolio sizing
+                            try:
+                                _price_tp = get_client().get_current_price(sym) or 0
+                            except Exception:
+                                _price_tp = 0
+                            if _price_tp > 0:
+                                _alloc_tp = equity * _tp_size_pct * _tp_regime_m
+                                qty = max(1, int(_alloc_tp / _price_tp))
+                        if qty > 0:
+                            _est = round(qty * float(o.get("price") or 0), 2)
+                            clean_orders.append({"symbol": sym, "side": side, "qty": qty,
+                                                 "estimated_value": _est})
                 if clean_orders:
                     return jsonify({"ok": True, "trade_proposal": {
                         "orders": clean_orders,
@@ -2563,13 +3030,27 @@ For all other queries respond in plain text. Never fabricate data not in context
         log.warning("Gemini chat error: %s", e)
         reply = _simple_chat_response(text_low, equity, daily_pnl, cash, regime, pos_lines, sig_lines,
                                       variant_lines=variant_lines, recent_order_lines=recent_order_lines,
-                                      model_state=model_state)
+                                      model_state=model_state, entry_gate=entry_gate)
         return jsonify({"ok": True, "reply": f"(LLM unavailable: {type(e).__name__}) {reply}",
                         "variant": "keyword_fallback"})
 
 
 def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_lines,
-                          variant_lines=None, recent_order_lines=None, model_state=None):
+                          variant_lines=None, recent_order_lines=None, model_state=None,
+                          entry_gate=None):
+    entry_gate = entry_gate or {}
+
+    if any(k in text for k in (
+        "why are you not buying", "why aren't you buying", "why not buying",
+        "why no buy", "why no trade", "nothing to trade", "why aren't you trading",
+        "why are you not trading", "why not trading",
+    )):
+        if entry_gate.get("blocked"):
+            return entry_gate.get("summary") or "Auto entries are currently blocked by the trader gate."
+        if sig_lines:
+            return "Auto entries are eligible on the next trader tick. Top signals: " + "; ".join(sig_lines[:2]) + "."
+        return "No qualifying signal is currently above the entry threshold."
+
     if any(k in text for k in ("p&l", "pnl", "profit", "loss", "how am i doing", "performance", "return")):
         sign = "+" if daily_pnl >= 0 else ""
         return (f"Equity ${equity:,.0f}, daily P&L {sign}${daily_pnl:,.0f}. "

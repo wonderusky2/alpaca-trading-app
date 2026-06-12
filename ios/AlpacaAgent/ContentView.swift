@@ -981,6 +981,7 @@ struct CashPanel: View {
 struct RobinhoodPositionsList: View {
     @ObservedObject var vm: AgentViewModel
     @State private var showHistory = false
+    @State private var detailSig: SignalInsight?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1020,6 +1021,8 @@ struct RobinhoodPositionsList: View {
                                 id: \.element.id) { i, sig in
                             RobinhoodWatchlistRow(sig: sig,
                                                   minScore: vm.strategyModel.minConviction)
+                                .contentShape(Rectangle())
+                                .onTapGesture { detailSig = sig }
                             if i < min(vm.signalInsights.count, 6) - 1 { Divider() }
                         }
                     }
@@ -1027,17 +1030,28 @@ struct RobinhoodPositionsList: View {
             } else {
                 VStack(spacing: 0) {
                     ForEach(Array(vm.positions.enumerated()), id: \.element.id) { i, pos in
+                        let insight = vm.heldInsights[pos.symbol]
                         RobinhoodPositionRow(
                             pos: pos,
-                            insight: vm.heldInsights[pos.symbol],
+                            insight: insight,
                             hasExit: vm.exitRecommendations.contains { $0.symbol == pos.symbol }
                         )
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            if let sig = insight { detailSig = sig }
+                            else if let sig = vm.signalInsights.first(where: { $0.symbol == pos.symbol }) {
+                                detailSig = sig
+                            }
+                        }
                         if i < vm.positions.count - 1 { Divider() }
                     }
                 }
             }
         }
         .sheet(isPresented: $showHistory) { historySheet }
+        .sheet(item: $detailSig) { sig in
+            StockDetailSheet(sig: sig)
+        }
     }
 
     @ViewBuilder
@@ -1074,6 +1088,169 @@ struct RobinhoodPositionsList: View {
 }
 
 // ── Robinhood watchlist row: symbol+info | sparkline | score pill ─────────────
+// ── Stock detail sheet — tap any watchlist/position row ───────────────────────
+struct StockDetailSheet: View {
+    let sig: SignalInsight
+    @Environment(\.dismiss) private var dismiss
+
+    private var scoreColor: Color {
+        sig.score >= 80 ? Color.appGreen : sig.score >= 63 ? Color.appAmber : Color(.systemGray3)
+    }
+
+    private var indicatorOrder: [(key: String, label: String)] {
+        [("rsi","RSI"),("macd","MACD"),("ema","EMA"),("avwap","AVWAP"),("trend","Trend"),("price_action","Price Action")]
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+
+                    // ── Hero ──────────────────────────────────────────────────
+                    HStack(alignment: .top) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 8) {
+                                Text(sig.symbol)
+                                    .font(.system(size: 28, weight: .black))
+                                Text(sig.side.uppercased())
+                                    .font(.system(size: 11, weight: .black))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 8).padding(.vertical, 4)
+                                    .background(sig.side.lowercased() == "buy" ? Color.appGreen : Color.appRed)
+                                    .clipShape(Capsule())
+                            }
+                            Text(sig.regime + " regime")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        VStack(alignment: .trailing, spacing: 4) {
+                            Text(String(format: "$%.2f", sig.lastPrice))
+                                .font(.system(size: 22, weight: .bold))
+                            let pct = sig.changePct
+                            Text(String(format: pct >= 0 ? "+%.2f%%" : "%.2f%%", pct))
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(pct >= 0 ? Color.appGreen : Color.appRed)
+                        }
+                    }
+                    .padding(.horizontal, 20).padding(.top, 20).padding(.bottom, 16)
+
+                    Divider()
+
+                    // ── Score breakdown ───────────────────────────────────────
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("WHY SCORE \(sig.score)?")
+                                .font(.system(size: 11, weight: .black))
+                                .foregroundStyle(.secondary)
+                                .kerning(1)
+                            Spacer()
+                            Text("\(sig.score)")
+                                .font(.system(size: 22, weight: .black))
+                                .foregroundStyle(scoreColor)
+                            Text("/ 100")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        ForEach(indicatorOrder, id: \.key) { item in
+                            if let ind = sig.signalBreakdown[item.key] {
+                                HStack(spacing: 10) {
+                                    Circle()
+                                        .fill(ind.status == "bullish" ? Color.appGreen
+                                              : ind.status == "bearish" ? Color.appRed
+                                              : Color(.systemGray4))
+                                        .frame(width: 8, height: 8)
+                                    Text(item.label)
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .frame(width: 80, alignment: .leading)
+                                        .foregroundStyle(.secondary)
+                                    Text(ind.label)
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(.primary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    Text("\(ind.points)/\(ind.weight)")
+                                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                        .foregroundStyle(ind.points == ind.weight ? Color.appGreen
+                                                         : ind.points == 0 ? Color(.systemGray3)
+                                                         : Color.appAmber)
+                                }
+                                .padding(.vertical, 4)
+                            }
+                        }
+                    }
+                    .padding(20)
+
+                    Divider()
+
+                    // ── News ──────────────────────────────────────────────────
+                    if !sig.news.isEmpty {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("NEWS (\(sig.news.count))")
+                                .font(.system(size: 11, weight: .black))
+                                .foregroundStyle(.secondary)
+                                .kerning(1)
+
+                            ForEach(sig.news) { article in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(article.headline)
+                                        .font(.system(size: 14))
+                                        .foregroundStyle(.primary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    HStack {
+                                        Text(article.source.uppercased())
+                                            .font(.system(size: 10, weight: .semibold))
+                                            .foregroundStyle(.secondary)
+                                        Spacer()
+                                        if let url = URL(string: article.url), !article.url.isEmpty {
+                                            Link("Open ↗", destination: url)
+                                                .font(.system(size: 11, weight: .semibold))
+                                                .foregroundStyle(Color.appGreen)
+                                        }
+                                    }
+                                }
+                                .padding(.vertical, 6)
+                                if article.id != sig.news.last?.id { Divider() }
+                            }
+                        }
+                        .padding(20)
+
+                        Divider()
+                    }
+
+                    // ── Summary ───────────────────────────────────────────────
+                    if !sig.reasons.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("SIGNAL FACTORS")
+                                .font(.system(size: 11, weight: .black))
+                                .foregroundStyle(.secondary)
+                                .kerning(1)
+                            ForEach(sig.reasons, id: \.self) { reason in
+                                HStack(alignment: .top, spacing: 8) {
+                                    Text("·").foregroundStyle(Color.appGreen)
+                                    Text(reason).font(.system(size: 13))
+                                }
+                            }
+                        }
+                        .padding(20)
+                    }
+                }
+            }
+            .background(Color.appBackground)
+            .navigationTitle(sig.symbol)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                        .foregroundStyle(Color.appGreen)
+                }
+            }
+        }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+    }
+}
+
 struct RobinhoodWatchlistRow: View {
     let sig: SignalInsight
     let minScore: Int
@@ -2524,6 +2701,7 @@ struct ChatView: View {
     @ObservedObject var vm: AgentViewModel
     let goToMonitor: () -> Void
     @FocusState private var focused: Bool
+    @State private var chatDetailSig: SignalInsight?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2531,7 +2709,9 @@ struct ChatView: View {
                 ScrollView {
                     LazyVStack(spacing: 10) {
                         ForEach(vm.messages) { message in
-                            ActivityRow(message: message)
+                            ActivityRow(message: message, onInsightTap: { sig in
+                                chatDetailSig = sig
+                            })
                                 .id(message.id)
                         }
                         if vm.isThinking {
@@ -2563,6 +2743,9 @@ struct ChatView: View {
                     Label("Monitor", systemImage: "chevron.left")
                 }
             }
+        }
+        .sheet(item: $chatDetailSig) { sig in
+            StockDetailSheet(sig: sig)
         }
     }
 }
@@ -2730,6 +2913,7 @@ struct ActivityLogRow: View {
 struct ActivityRow: View {
     let message: ChatMessage
     var compact = false
+    var onInsightTap: ((SignalInsight) -> Void)? = nil
 
     private var tint: Color {
         switch message.variant {
@@ -2751,6 +2935,16 @@ struct ActivityRow: View {
                     .font(compact ? .subheadline : .body)
                     .foregroundStyle(.primary)
                     .fixedSize(horizontal: false, vertical: true)
+                if let insight = message.signalInsight, let handler = onInsightTap {
+                    Button {
+                        handler(insight)
+                    } label: {
+                        Label("View Score (\(insight.symbol) \(insight.score)/100)", systemImage: "chart.bar.fill")
+                            .font(.caption)
+                            .foregroundStyle(.appBlue)
+                    }
+                    .buttonStyle(.plain)
+                }
                 Text(message.time, style: .time)
                     .font(.caption2)
                     .foregroundStyle(.secondary)

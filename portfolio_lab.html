@@ -17,7 +17,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);
 button{font:inherit;cursor:pointer}
 
 /* ── Layout ── */
-#app{display:grid;grid-template-columns:220px 1fr;height:100vh}
+#app{display:grid;grid-template-columns:240px 1fr;height:100vh}
 
 /* ── Sidebar ── */
 #sidebar{
@@ -48,7 +48,106 @@ button{font:inherit;cursor:pointer}
 .dot.red{background:var(--red)}
 .dot.amber{background:var(--amber)}
 .dot.gray{background:var(--dim)}
-#last-updated{font-size:10px;color:var(--dim);margin-top:auto;padding-top:8px}
+#last-updated{font-size:10px;color:var(--dim);padding-top:4px}
+
+/* ── Stock detail modal ── */
+#stock-modal{
+  display:none;position:fixed;inset:0;z-index:9000;
+  background:rgba(0,0,0,.72);align-items:center;justify-content:center
+}
+#stock-modal.open{display:flex}
+#stock-modal-box{
+  background:var(--sidebar);border:1px solid var(--border);border-radius:14px;
+  width:min(480px,94vw);max-height:86vh;display:flex;flex-direction:column;
+  overflow:hidden
+}
+#smd-header{
+  display:flex;align-items:flex-start;gap:12px;padding:18px 20px 14px;
+  border-bottom:1px solid var(--border);flex-shrink:0
+}
+#smd-hero{flex:1}
+#smd-sym{font-size:26px;font-weight:800;letter-spacing:-.02em}
+#smd-meta{font-size:11px;color:var(--muted);margin-top:3px}
+#smd-price-block{text-align:right}
+#smd-price{font-size:20px;font-weight:700;font-family:var(--mono)}
+#smd-chg{font-size:12px;font-weight:600;margin-top:2px}
+#smd-close{
+  background:none;border:none;color:var(--muted);font-size:20px;
+  cursor:pointer;padding:0 0 0 8px;line-height:1;flex-shrink:0
+}
+#smd-close:hover{color:var(--text)}
+#smd-body{overflow-y:auto;flex:1}
+#smd-body::-webkit-scrollbar{width:4px}
+#smd-body::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+.smd-section{padding:16px 20px;border-bottom:1px solid var(--border)}
+.smd-section:last-child{border-bottom:none}
+.smd-section-label{
+  font-size:10px;font-weight:800;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px
+}
+.smd-score-header{display:flex;align-items:center;gap:6px;margin-bottom:12px}
+.smd-score-num{font-size:24px;font-weight:900;line-height:1}
+.smd-score-denom{font-size:12px;color:var(--muted)}
+.smd-ind-row{
+  display:grid;grid-template-columns:8px 64px 1fr auto;
+  align-items:center;gap:8px;padding:5px 0
+}
+.smd-ind-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.smd-ind-dot.bullish{background:var(--green)}
+.smd-ind-dot.bearish{background:var(--red)}
+.smd-ind-dot.neutral{background:var(--dim)}
+.smd-ind-name{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase}
+.smd-ind-label{font-size:12px;color:var(--text)}
+.smd-ind-pts{font-size:11px;font-weight:700;font-family:var(--mono);white-space:nowrap}
+.smd-ind-pts.full{color:var(--green)}
+.smd-ind-pts.zero{color:var(--dim)}
+.smd-ind-pts.partial{color:var(--amber)}
+.smd-news-item{padding:8px 0;border-bottom:1px solid var(--border)}
+.smd-news-item:last-child{border-bottom:none}
+.smd-news-headline{font-size:13px;color:var(--text);line-height:1.45;margin-bottom:4px}
+.smd-news-meta{display:flex;align-items:center;gap:8px;font-size:10px;color:var(--dim)}
+.smd-news-link{
+  margin-left:auto;font-size:11px;font-weight:600;
+  color:var(--green);text-decoration:none
+}
+.smd-news-link:hover{text-decoration:underline}
+.smd-reasons{display:flex;flex-direction:column;gap:6px}
+.smd-reason{display:flex;gap:8px;font-size:12px;color:var(--text)}
+.smd-reason-dot{color:var(--green);flex-shrink:0;margin-top:1px}
+/* Watchlist / Positions panel ── */
+#watchlist-section{display:flex;flex-direction:column;gap:8px;min-height:0}
+.wl-label{
+  font-size:10px;color:var(--muted);text-transform:uppercase;
+  letter-spacing:.08em;font-weight:700
+}
+.wl-empty{font-size:12px;color:var(--dim);padding:6px 0}
+.wl-row{
+  display:flex;flex-direction:column;gap:3px;padding:8px 0;
+  border-bottom:1px solid var(--border);cursor:default
+}
+.wl-row:last-child{border-bottom:none}
+.wl-top{display:flex;align-items:center;justify-content:space-between;gap:4px}
+.wl-sym{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--text)}
+.wl-score{
+  font-size:10px;font-weight:700;padding:2px 7px;border-radius:10px;
+  flex-shrink:0;letter-spacing:.04em
+}
+.wl-score.hot{background:rgba(63,185,80,.18);color:var(--green)}
+.wl-score.warm{background:rgba(210,153,34,.18);color:var(--amber)}
+.wl-score.cold{background:rgba(139,148,158,.12);color:var(--muted)}
+.wl-mid{display:flex;align-items:center;justify-content:space-between;gap:4px}
+.wl-price{font-family:var(--mono);font-size:12px;color:var(--text)}
+.wl-chg{font-size:11px;font-weight:600}
+.wl-chg.up{color:var(--green)}
+.wl-chg.dn{color:var(--red)}
+.wl-chg.flat{color:var(--muted)}
+.wl-reason{font-size:11px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* Position-mode rows */
+.wl-row.pos-row .wl-sym{font-size:13px}
+.wl-pnl{font-size:11px;font-weight:600}
+.wl-pnl.pos{color:var(--green)}
+.wl-pnl.neg{color:var(--red)}
+.wl-meta{font-size:11px;color:var(--muted)}
 
 /* ── Chat area ── */
 #chat{display:flex;flex-direction:column;height:100vh;min-width:0}
@@ -176,8 +275,9 @@ button{font:inherit;cursor:pointer}
 
 /* ── Quick commands ── */
 #quick-bar{
-  padding:8px 16px 6px;display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0;
-  border-top:1px solid var(--border)}
+  padding:8px 16px 6px;display:flex;gap:6px;flex-wrap:nowrap;flex-shrink:0;
+  overflow-x:auto;scrollbar-width:none;border-top:1px solid var(--border)}
+#quick-bar::-webkit-scrollbar{display:none}
 .qbtn{
   font-size:11px;padding:4px 11px;border-radius:16px;
   background:var(--panel);border:1px solid var(--border);color:var(--muted)
@@ -256,6 +356,11 @@ button{font:inherit;cursor:pointer}
       <div id="s-market"><span class="pill closed"><span class="dot gray"></span>—</span></div>
     </div>
     <div id="last-updated"></div>
+    <div class="divider"></div>
+    <div id="watchlist-section">
+      <div class="wl-label" id="watchlist-label">WATCHLIST</div>
+      <div id="watchlist-rows"><div class="wl-empty">Scanning…</div></div>
+    </div>
   </aside>
 
   <!-- ── Chat ── -->
@@ -308,6 +413,11 @@ button{font:inherit;cursor:pointer}
       <button class="qbtn" onclick="quickSend('show me the top signals')">Top signals</button>
       <button class="qbtn" onclick="quickSend('what are my open positions')">Positions</button>
       <button class="qbtn" onclick="quickSend('what is the current regime')">Regime</button>
+      <button class="qbtn" onclick="quickSend('what has unusual volume today')">Unusual volume</button>
+      <button class="qbtn" onclick="quickSend('what is the market doing today, SPY and QQQ')">SPY / QQQ</button>
+      <button class="qbtn" onclick="quickSend('score NVDA')">Score stock…</button>
+      <button class="qbtn" onclick="quickSend('show top momentum names right now')">Momentum</button>
+      <button class="qbtn" onclick="quickSend('why are you not buying anything')">Why no buys?</button>
       <button class="qbtn" onclick="quickSend('exit all positions now')">Exit all</button>
     </div>
 
@@ -317,6 +427,28 @@ button{font:inherit;cursor:pointer}
     </div>
   </main>
 
+</div>
+
+<!-- ── Stock detail modal ── -->
+<div id="stock-modal" onclick="if(event.target===this)closeStockModal()">
+  <div id="stock-modal-box">
+    <div id="smd-header">
+      <div id="smd-hero">
+        <div id="smd-sym">—</div>
+        <div id="smd-meta">—</div>
+      </div>
+      <div id="smd-price-block">
+        <div id="smd-price">—</div>
+        <div id="smd-chg">—</div>
+      </div>
+      <button id="smd-close" onclick="closeStockModal()">✕</button>
+    </div>
+    <div id="smd-body">
+      <div class="smd-section" id="smd-breakdown"></div>
+      <div class="smd-section" id="smd-news" style="display:none"></div>
+      <div class="smd-section" id="smd-reasons" style="display:none"></div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -458,6 +590,180 @@ function updateSidebar(data) {
   }
 
   $('last-updated').textContent = 'Updated ' + now12();
+  updateWatchlist(data);
+}
+
+// ── Stock detail modal ────────────────────────────────────────────────────────
+let latestOverview = {};
+
+function showStockDetail(sym) {
+  const scores  = latestOverview.live_scores || {};
+  const allSigs = [...(scores.top || []), ...(scores.signals || []), ...(scores.held_scores || [])];
+  const sig     = allSigs.find(s => (s.symbol || '').toUpperCase() === sym.toUpperCase());
+  if (!sig) return;
+
+  const quote   = sig.quote || {};
+  const price   = parseFloat(quote.price || 0);
+  const chgPct  = parseFloat(quote.change_pct || 0);
+  const score   = parseInt(sig.score || 0);
+  const side    = (sig.side || 'buy').toUpperCase();
+  const regime  = sig.regime || '—';
+  const bd      = sig.signal_breakdown || {};
+  const news    = sig.news || [];
+  const reasons = sig.technical_reasons || [];
+  const minConv = parseInt((latestOverview.model || {}).min_conviction || 63);
+
+  // Score color
+  const scoreCol = score >= 80 ? 'var(--green)' : score >= minConv ? 'var(--amber)' : 'var(--muted)';
+  const chgCol   = chgPct >= 0 ? 'var(--green)' : 'var(--red)';
+  const sideCol  = side === 'BUY' ? 'var(--green)' : 'var(--red)';
+
+  $('smd-sym').innerHTML =
+    `${sym} <span style="font-size:12px;font-weight:700;color:${sideCol};
+      background:${sideCol}22;padding:2px 8px;border-radius:20px">${side}</span>`;
+  $('smd-meta').textContent = `${regime} regime`;
+  $('smd-price').textContent = price > 0 ? fmt$(price) : '—';
+  $('smd-chg').innerHTML =
+    `<span style="color:${chgCol}">${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%</span>`;
+
+  // ── Signal breakdown ──────────────────────────────────────────────────────
+  const indOrder = [
+    {key:'rsi',name:'RSI'},{key:'macd',name:'MACD'},{key:'ema',name:'EMA'},
+    {key:'avwap',name:'AVWAP'},{key:'trend',name:'Trend'},{key:'price_action',name:'P.Action'}
+  ];
+  let bdHtml = `
+    <div class="smd-section-label">
+      Why score <span style="color:${scoreCol}">${score}</span>?
+    </div>
+    <div class="smd-score-header">
+      <span class="smd-score-num" style="color:${scoreCol}">${score}</span>
+      <span class="smd-score-denom">/ 100</span>
+    </div>`;
+  for (const {key, name} of indOrder) {
+    const ind = bd[key];
+    if (!ind) continue;
+    const pts  = parseInt(ind.points || 0);
+    const wt   = parseInt(ind.weight || 0);
+    const dotCls  = ind.status || 'neutral';
+    const ptsCls  = pts === wt ? 'full' : pts === 0 ? 'zero' : 'partial';
+    bdHtml += `<div class="smd-ind-row">
+      <span class="smd-ind-dot ${dotCls}"></span>
+      <span class="smd-ind-name">${name}</span>
+      <span class="smd-ind-label">${ind.label || '—'}</span>
+      <span class="smd-ind-pts ${ptsCls}">${pts}/${wt}</span>
+    </div>`;
+  }
+  $('smd-breakdown').innerHTML = bdHtml;
+
+  // ── News ──────────────────────────────────────────────────────────────────
+  const newsEl = $('smd-news');
+  if (news.length > 0) {
+    newsEl.style.display = '';
+    newsEl.innerHTML = `<div class="smd-section-label">NEWS (${news.length})</div>` +
+      news.slice(0,5).map(n => {
+        const ts = n.created_at ? new Date(n.created_at).toLocaleDateString('en-US',
+          {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:true}) : '';
+        return `<div class="smd-news-item">
+          <div class="smd-news-headline">${n.headline || ''}</div>
+          <div class="smd-news-meta">
+            <span>${(n.source||'').toUpperCase()}</span>
+            <span>${ts}</span>
+            ${n.url ? `<a class="smd-news-link" href="${n.url}" target="_blank" rel="noopener">Open ↗</a>` : ''}
+          </div>
+        </div>`;
+      }).join('');
+  } else {
+    newsEl.style.display = 'none';
+  }
+
+  // ── Signal factors ────────────────────────────────────────────────────────
+  const reasonsEl = $('smd-reasons');
+  if (reasons.length > 0) {
+    reasonsEl.style.display = '';
+    reasonsEl.innerHTML = `<div class="smd-section-label">SIGNAL FACTORS</div>
+      <div class="smd-reasons">${reasons.map(r =>
+        `<div class="smd-reason"><span class="smd-reason-dot">·</span>${r}</div>`).join('')}
+      </div>`;
+  } else {
+    reasonsEl.style.display = 'none';
+  }
+
+  $('stock-modal').classList.add('open');
+}
+
+function closeStockModal() {
+  $('stock-modal').classList.remove('open');
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeStockModal(); });
+
+// ── Watchlist / Positions panel ───────────────────────────────────────────────
+function updateWatchlist(data) {
+  latestOverview = data;
+  const acctg  = data.accounting  || {};
+  const scores = data.live_scores || {};
+  const minConv = parseInt((data.model || {}).min_conviction || 63);
+  const positions = acctg.positions || [];
+  const label = $('watchlist-label');
+  const rows  = $('watchlist-rows');
+
+  if (positions.length > 0) {
+    // ── Positions mode ────────────────────────────────────────────────────────
+    label.textContent = 'POSITIONS';
+    rows.innerHTML = positions.map(pos => {
+      const sym    = (pos.symbol || '?').toUpperCase();
+      const pnl    = parseFloat(pos.unrealized_pnl || 0);
+      const pnlPct = parseFloat(pos.unrealized_pnl_pct || 0);
+      const val    = parseFloat(pos.current_value || 0);
+      const wt     = parseFloat(pos.current_weight_pct || 0);
+      const pnlCls = pnl >= 0 ? 'pos' : 'neg';
+      const pnlSign = pnl >= 0 ? '+' : '';
+      return `
+        <div class="wl-row pos-row" onclick="showStockDetail('${sym}')" style="cursor:pointer">
+          <div class="wl-top">
+            <span class="wl-sym">${sym}</span>
+            <span class="wl-pnl ${pnlCls}">${pnlSign}${fmt$(pnl)}</span>
+          </div>
+          <div class="wl-mid">
+            <span class="wl-meta">${fmt$(val)} · ${wt.toFixed(1)}%</span>
+            <span class="wl-pnl ${pnlCls}" style="font-size:10px">${pnlSign}${pnlPct.toFixed(2)}%</span>
+          </div>
+        </div>`;
+    }).join('');
+
+  } else {
+    // ── Watchlist (signal candidates) mode ────────────────────────────────────
+    label.textContent = 'WATCHLIST';
+    const signals = (scores.top || scores.signals || []).slice(0, 6);
+    if (!signals.length) {
+      rows.innerHTML = '<div class="wl-empty">Scanning for setups…</div>';
+      return;
+    }
+    rows.innerHTML = signals.map(sig => {
+      const sym     = (sig.symbol || '?').toUpperCase();
+      const score   = parseInt(sig.score || 0);
+      const quote   = sig.quote || {};
+      const price   = parseFloat(quote.price || 0);
+      const chgPct  = parseFloat(quote.change_pct || 0);
+      const reasons = sig.technical_reasons || [];
+      const reason  = reasons[0] || '';
+      const scoreCls = score >= minConv ? 'hot' : score >= minConv * 0.85 ? 'warm' : 'cold';
+      const chgCls  = chgPct > 0 ? 'up' : chgPct < 0 ? 'dn' : 'flat';
+      const chgSign = chgPct > 0 ? '+' : '';
+      return `
+        <div class="wl-row" onclick="showStockDetail('${sym}')" style="cursor:pointer">
+          <div class="wl-top">
+            <span class="wl-sym">${sym}</span>
+            <span class="wl-score ${scoreCls}">${score}</span>
+          </div>
+          <div class="wl-mid">
+            <span class="wl-price">${fmt$(price)}</span>
+            <span class="wl-chg ${chgCls}">${chgSign}${chgPct.toFixed(2)}%</span>
+          </div>
+          ${reason ? `<div class="wl-reason">${reason}</div>` : ''}
+        </div>`;
+    }).join('');
+  }
 }
 
 // ── Proactive change detection ────────────────────────────────────────────────
@@ -578,9 +884,30 @@ async function sendMessage(text) {
     const data = await r.json();
     typing.style.display = 'none';
 
-    if (data.trade_proposal) {
+    if (!r.ok) {
+      const _esc = s => String(s).replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+      addMsg(`Server error (${r.status}): ${_esc(data.error || data.type || 'unknown')}`, 'agent', 'danger');
+    } else if (data.trade_proposal) {
       const tp = data.trade_proposal;
       addTradeProposal(tp.orders, tp.context || tp.regime || null);
+    } else if (data.signal_insight) {
+      // On-demand score response — inject into latestOverview and show reply + drill-down link
+      const sig = data.signal_insight;
+      const sym = sig.symbol;
+      // Inject so showStockDetail can find it
+      if (!latestOverview.live_scores) latestOverview.live_scores = {};
+      if (!latestOverview.live_scores.top) latestOverview.live_scores.top = [];
+      const existing = latestOverview.live_scores.top.findIndex(s => s.symbol === sym);
+      if (existing >= 0) latestOverview.live_scores.top[existing] = sig;
+      else latestOverview.live_scores.top.unshift(sig);
+      const _esc = s => String(s).replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+      const replyText = _esc(data.reply || `${sym} scored ${sig.score}/100`).replace(/\n/g, '<br>');
+      addMsg(
+        replyText +
+        `<br><br><a href="#" onclick="showStockDetail('${sym}');return false;" ` +
+        `style="color:var(--accent);font-size:0.82rem;">View full breakdown ↗</a>`,
+        'agent', data.variant || ''
+      );
     } else {
       addMsg(data.reply || data.error || '(no response)', 'agent',
              data.variant || '');
@@ -589,7 +916,9 @@ async function sendMessage(text) {
     poll();
   } catch(e) {
     typing.style.display = 'none';
-    addMsg(`Request failed: ${e.message}`, 'agent', 'danger');
+    const _esc = s => String(s).replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+    // If server returned JSON error (from our errorhandler), show that; otherwise raw message
+    addMsg(`Request failed: ${_esc(e.message)}`, 'agent', 'danger');
   } finally {
     $('send-btn').disabled = false;
     $('msg-input').focus();
