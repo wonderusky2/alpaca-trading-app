@@ -3047,9 +3047,11 @@ def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_
     )):
         if entry_gate.get("blocked"):
             return entry_gate.get("summary") or "Auto entries are currently blocked by the trader gate."
+        regime_note = " Position size at 50% due to CHOPPY regime." if regime in ("CHOPPY", "CHOP") else ""
         if sig_lines:
-            return "Auto entries are eligible on the next trader tick. Top signals: " + "; ".join(sig_lines[:2]) + "."
-        return "No qualifying signal is currently above the entry threshold."
+            return ("Auto entries are eligible on the next trader tick. Top signals: "
+                    + "; ".join(sig_lines[:2]) + "." + regime_note)
+        return "No qualifying signal is currently above the entry threshold." + regime_note
 
     if any(k in text for k in ("p&l", "pnl", "profit", "loss", "how am i doing", "performance", "return")):
         sign = "+" if daily_pnl >= 0 else ""
