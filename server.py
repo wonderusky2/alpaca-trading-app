@@ -36,7 +36,7 @@ import strategy_model
 import trade_ledger
 import trader
 from alpaca_client import AlpacaClient
-from logger import get_logger
+from logger import get_logger, set_error_push_callback, get_error_log
 
 log = get_logger("server")
 app = Flask(__name__)
@@ -243,11 +243,54 @@ def send_push_notification(title: str, body: str, data: dict | None = None) -> i
                                 device_token[:8], r.status_code, r.text)
         return sent
     except ImportError:
-        log.debug("APNs push skipped — jwt/httpx not installed")
+        log.error("APNs push FAILED — PyJWT or httpx not installed. "
+                  "Add PyJWT>=2.8.0 and httpx[http2]>=0.27.0 to requirements.txt")
         return 0
     except Exception as e:
-        log.warning("APNs push failed: %s", e)
+        log.error("APNs push FAILED: %s", e, exc_info=True)
         return 0
+
+
+def _maybe_push_gemini_alerts(signals: list[dict], held_set: set[str]) -> None:
+    """Fire iOS push notifications for notable Gemini sentiment events.
+
+    - BEARISH (boost ≤ -10) on a held position  → warn to review
+    - BULLISH (boost ≥ +8) with score ≥ 70      → entry opportunity
+    30-min per-symbol dedup prevents alert spam.
+    """
+    now = time.time()
+    for sig in signals:
+        sym   = str(sig.get("symbol") or "")
+        boost = float(sig.get("gemini_boost") or 0.0)
+        score = int(sig.get("score") or 0)
+
+        if not sym or boost == 0.0:
+            continue
+
+        # Dedup: skip symbols alerted within the TTL window
+        if now - _gemini_alert_cache.get(sym, 0.0) < _GEMINI_ALERT_TTL:
+            continue
+
+        if boost <= -10 and sym in held_set:
+            sent = send_push_notification(
+                title=f"⚠️ {sym}: Gemini BEARISH",
+                body=f"Sentiment flagged negative — review your position (score {score})",
+                data={"symbol": sym, "alert_type": "gemini_bearish"},
+            )
+            _gemini_alert_cache[sym] = now
+            log.info("Gemini BEARISH push sent=%d for held %s (boost=%.1f, score=%d)",
+                     sent, sym, boost, score)
+
+        elif boost >= 8 and score >= 70:
+            sent = send_push_notification(
+                title=f"📈 {sym}: Gemini BULLISH",
+                body=f"Strong sentiment — score {score}",
+                data={"symbol": sym, "alert_type": "gemini_bullish"},
+            )
+            _gemini_alert_cache[sym] = now
+            log.info("Gemini BULLISH push sent=%d for %s (boost=%.1f, score=%d)",
+                     sent, sym, boost, score)
+
 
 # ── API key auth ───────────────────────────────────────────────────────────────
 _LAB_API_KEY: str = os.environ.get("LAB_API_KEY", "").strip()
@@ -353,6 +396,33 @@ _LIVE_SCORE_TTL    = 300
 _NEWS_TTL          = 600
 _live_scores_lock  = threading.Lock()   # prevent overlapping score runs
 
+# ── Gemini sentiment push-alert dedup cache ────────────────────────────────────
+_gemini_alert_cache: dict[str, float] = {}   # sym → last-alerted epoch
+_GEMINI_ALERT_TTL   = 1800                   # 30 min — same as Gemini cache TTL
+
+# ── Error push-notification dedup (10-min window to avoid spam) ───────────────
+_error_push_dedup: dict[str, float] = {}     # msg_key → last-pushed epoch
+_ERROR_PUSH_TTL   = 600                      # 10 min
+
+def _push_on_error(entry: dict) -> None:
+    """Called by _ErrorBufferHandler on every ERROR-level log line.
+
+    Deduplicates by (logger, first-80-chars-of-msg) so a tight error loop
+    doesn't flood the phone.
+    """
+    key = f"{entry.get('logger', '')}:{entry.get('msg', '')[:80]}"
+    now = time.time()
+    if now - _error_push_dedup.get(key, 0.0) < _ERROR_PUSH_TTL:
+        return
+    _error_push_dedup[key] = now
+    send_push_notification(
+        title="🚨 Server ERROR",
+        body=entry.get("msg", "")[:100],
+        data={"alert_type": "server_error", "logger": entry.get("logger", "")},
+    )
+
+set_error_push_callback(_push_on_error)
+
 # ── Background live-score refresh loop ────────────────────────────────────────
 def _live_score_refresh_loop() -> None:
     """Auto-refresh live scores every 10 min during market hours, hourly otherwise.
@@ -381,7 +451,7 @@ def _live_score_refresh_loop() -> None:
                     finally:
                         _live_scores_lock.release()
             except Exception as e:
-                log.warning("live-score refresh loop error: %s", e)
+                log.error("live-score refresh loop error: %s", e, exc_info=True)
             time.sleep(MARKET_INTERVAL)
         else:
             time.sleep(60)   # check every minute until market opens
@@ -897,8 +967,10 @@ def _run_live_scores() -> dict:
             technical_reasons = [bd["label"] for bd in breakdown.values() if bd.get("label")]
 
             # Gemini sentiment boost — cached, fires for borderline scores (#34)
+            gemini_boost = 0.0
             if 40 <= base_score <= 72:
-                base_score += sg.gemini_sentiment_boost_cached(sym, base_score)
+                gemini_boost = float(sg.gemini_sentiment_boost_cached(sym, base_score))
+                base_score  += gemini_boost
 
             # Alpaca news delta
             articles = news_map.get(sym, [])
@@ -909,6 +981,7 @@ def _run_live_scores() -> dict:
                 "symbol":            sym,
                 "score":             final_score,
                 "base_score":        base_score,
+                "gemini_boost":      gemini_boost,   # stored for push-alert logic
                 "news_delta":        news_delta,
                 "news_terms":        news_terms,
                 "regime":            regime,
@@ -921,6 +994,14 @@ def _run_live_scores() -> dict:
             })
 
         signals.sort(key=lambda x: x["score"], reverse=True)
+
+        # iOS push — BEARISH on held positions, BULLISH on strong entries
+        try:
+            _held = set((_cl.get_positions() or {}).keys())
+        except Exception:
+            _held = set()
+        _maybe_push_gemini_alerts(signals, _held)
+
         result = {
             "ok":         True,
             "scored_at":  datetime.now(timezone.utc).isoformat(),
@@ -929,7 +1010,7 @@ def _run_live_scores() -> dict:
             "top":        signals[:5],
         }
     except Exception as e:
-        log.warning("live scores failed: %s", e)
+        log.error("live scores failed: %s", e, exc_info=True)
         result = {"ok": False, "error": str(e), "signals": [], "top": []}
 
     _live_scores_cache["ts"]   = time.time()
@@ -973,10 +1054,10 @@ def _score_held_positions(held_symbols: list[str], regime: str) -> list[dict]:
                     "news":              [],
                 })
             except Exception as _se:
-                log.debug("held-position score failed for %s: %s", sym, _se)
+                log.warning("held-position score failed for %s: %s", sym, _se, exc_info=True)
         return scored
     except Exception as e:
-        log.warning("_score_held_positions failed: %s", e)
+        log.error("_score_held_positions failed: %s", e, exc_info=True)
         return []
 
 
@@ -1479,7 +1560,7 @@ class DecisionCoordinator:
                 risk_state=accounting.get("risk_state") or {},
             )
         except Exception as _ev_err:
-            log.debug("event detection error: %s", _ev_err)
+            log.error("event detection error: %s", _ev_err, exc_info=True)
         narrative = _portfolio_narrative(accounting, live_scores, news_risk, model, decision)
         combined_scores = dict(live_scores or {})
         combined_scores["held_scores"] = held_scores
@@ -1501,6 +1582,13 @@ class DecisionCoordinator:
     def activity(self) -> dict:
         snap = self.portfolio.snapshot(live_scores=_live_scores_cache.get("data"), recent_limit=100)
         orders = snap.get("recent_orders") or []
+        # Filter out orders submitted before the last clear — they already showed, user wiped them
+        if _activity_cleared_at > 0:
+            cleared_iso = datetime.fromtimestamp(_activity_cleared_at, tz=timezone.utc).isoformat()
+            orders = [
+                o for o in orders
+                if str(o.get("submitted_at") or o.get("filled_at") or "9999") >= cleared_iso
+            ]
         open_o = snap.get("open_orders") or []
         acctg = snap.get("accounting") or {}
         rows = acctg.get("positions") or []
@@ -1872,11 +1960,31 @@ def _llm_explain_decision(decision: dict, overview: dict) -> str:
         text = (response.text or "").strip()
         return text or fallback
     except Exception as e:
-        log.warning("decision explanation error: %s", e)
+        log.error("decision explanation error: %s", e, exc_info=True)
         return fallback
 
 
 _coordinator = DecisionCoordinator()
+
+
+def _startup_health_check() -> None:
+    """Log ERROR for any required env vars that are missing at startup.
+
+    These errors flow into the in-memory buffer → iOS error sheet + push notification,
+    so missing config is visible immediately after a pod restart.
+    """
+    required = {
+        "APNS_AUTH_KEY":  "APNs push key (ES256 private key content)",
+        "APNS_KEY_ID":    "APNs key ID (10-char string)",
+        "APNS_TEAM_ID":   "Apple Developer Team ID",
+        "GEMINI_API_KEY": "Gemini API key for sentiment scoring",
+        "LAB_API_KEY":    "API key for iOS ↔ server auth",
+    }
+    for var, desc in required.items():
+        if not os.environ.get(var, "").strip():
+            log.error("STARTUP: %s is not set — %s will not work", var, desc)
+
+_startup_health_check()
 
 # ── Global error handler — always return JSON, never HTML ─────────────────────
 
@@ -1936,7 +2044,7 @@ def api_lab_overview():
         _overview_cache["data"] = data
         return jsonify(data)
     except Exception as e:
-        log.warning("overview error: %s", e)
+        log.error("overview error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -2013,14 +2121,28 @@ def api_lab_health():
     })
 
 
+_activity_cleared_at: float = 0.0   # epoch — orders before this are hidden after clear
+
+
+@app.route("/api/lab/errors")
+@require_api_key
+def api_lab_errors():
+    """Return the last 100 WARNING/ERROR log entries from the in-memory ring buffer."""
+    return jsonify({"ok": True, "errors": get_error_log()})
+
+
 @app.route("/api/lab/events", methods=["DELETE"])
 @require_api_key
 def api_lab_events_clear():
-    """Truncate the events log. Safe to call at any time — clears the activity feed."""
+    """Truncate the events log and stamp a clear time so old orders don't resurface."""
+    global _activity_cleared_at
     try:
         LAB_EVENTS_PATH.write_text("", encoding="utf-8")
-        return jsonify({"ok": True, "message": "Events log cleared."})
+        _activity_cleared_at = time.time()
+        log.info("Activity log cleared at %s", datetime.now(timezone.utc).isoformat())
+        return jsonify({"ok": True, "message": "Events log cleared.", "cleared_at": _activity_cleared_at})
     except Exception as e:
+        log.error("Failed to clear events log: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -2030,7 +2152,7 @@ def api_lab_activity():
     try:
         return jsonify(_coordinator.activity())
     except Exception as e:
-        log.warning("activity error: %s", e)
+        log.error("activity error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -2066,7 +2188,7 @@ def api_lab_portfolio_history():
             "history": history,
         })
     except Exception as e:
-        log.warning("portfolio history error: %s", e)
+        log.error("portfolio history error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -2088,7 +2210,7 @@ def api_lab_agents_decision():
             result["explanation"] = _llm_explain_decision(decision, overview)
         return jsonify(result)
     except Exception as e:
-        log.warning("agent decision error: %s", e)
+        log.error("agent decision error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -2102,7 +2224,7 @@ def api_lab_model():
             "bounds": strategy_model.BOUNDS,
         })
     except Exception as e:
-        log.warning("model status error: %s", e)
+        log.error("model status error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -2121,8 +2243,80 @@ def api_lab_backtest():
     try:
         return jsonify(_coordinator.backtest.run(period=period, timeframe=timeframe))
     except Exception as e:
-        log.warning("backtest error: %s", e)
+        log.error("backtest error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+_WALKFORWARD_CACHE_PATH = strategy_model.STATE_DIR / "walkforward_cache.json"
+_walkforward_running    = False
+
+
+@app.route("/api/lab/walkforward", methods=["GET", "POST"])
+@require_api_key
+def api_lab_walkforward():
+    """Walk-forward validation endpoint.
+
+    GET  — return cached results (or {"ok":false,"status":"not_run"} if none).
+    POST — trigger a new run (async background thread).
+           Body: {"start_date": "2022-01-01", "window_months": 3}
+           Returns immediately with {"ok":true,"status":"running"} or cached result.
+    """
+    global _walkforward_running
+
+    if request.method == "GET":
+        if _walkforward_running:
+            return jsonify({"ok": True, "status": "running"})
+        if _WALKFORWARD_CACHE_PATH.exists():
+            try:
+                data = json.loads(_WALKFORWARD_CACHE_PATH.read_text(encoding="utf-8"))
+                data["status"] = "done"
+                return jsonify(data)
+            except Exception:
+                pass
+        return jsonify({"ok": False, "status": "not_run"})
+
+    # POST — trigger run
+    if _walkforward_running:
+        return jsonify({"ok": True, "status": "running", "message": "Already running — check back in ~60s."})
+
+    body          = request.get_json(silent=True) or {}
+    start_date    = str(body.get("start_date")    or "2022-01-01")
+    window_months = int(body.get("window_months") or 3)
+
+    import threading
+
+    def _run():
+        global _walkforward_running
+        _walkforward_running = True
+        try:
+            import backtest as bt
+            result = bt.run_walk_forward(
+                start_date=start_date,
+                window_months=window_months,
+            )
+            strategy_model.STATE_DIR.mkdir(parents=True, exist_ok=True)
+            _WALKFORWARD_CACHE_PATH.write_text(
+                json.dumps(result, indent=2, default=str),
+                encoding="utf-8",
+            )
+            log.info("Walk-forward complete: sharpe=%.3f windows=%d verdict=%s",
+                     result.get("sharpe", 0), result.get("total_windows", 0), result.get("verdict", "?"))
+        except Exception as e:
+            log.error("Walk-forward failed: %s", e)
+            try:
+                _WALKFORWARD_CACHE_PATH.write_text(
+                    json.dumps({"ok": False, "error": str(e)}, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        finally:
+            _walkforward_running = False
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return jsonify({"ok": True, "status": "running",
+                    "message": f"Walk-forward started ({start_date} → today, {window_months}M windows). Poll GET in ~60s."})
 
 
 @app.route("/api/lab/variants")
@@ -2155,7 +2349,7 @@ def api_lab_variants():
             "win_rates": strategy_model.variant_win_rates(),
         })
     except Exception as e:
-        log.warning("variants error: %s", e)
+        log.error("variants error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -2169,7 +2363,7 @@ def api_lab_ledger():
         summary = trade_ledger.win_loss_summary(limit=limit)
         return jsonify({"ok": True, "trades": trades, "summary": summary})
     except Exception as e:
-        log.warning("ledger error: %s", e)
+        log.error("ledger error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -2190,7 +2384,7 @@ def api_lab_model_learn():
             "learning": result,
         })
     except Exception as e:
-        log.warning("model learn error: %s", e)
+        log.error("model learn error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -2232,7 +2426,7 @@ def api_lab_orders_preview():
             "decision":   decision,
         })
     except Exception as e:
-        log.warning("preview error: %s", e)
+        log.error("preview error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -2343,7 +2537,7 @@ def api_lab_news():
             "held_articles":      held_deduped[:20],
         })
     except Exception as e:
-        log.warning("news error: %s", e)
+        log.error("news error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -2395,7 +2589,7 @@ def api_lab_score_symbol(symbol):
             },
         })
     except Exception as e:
-        log.warning("api_lab_score_symbol(%s) failed: %s", symbol, e)
+        log.error("api_lab_score_symbol(%s) failed: %s", symbol, e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -2420,7 +2614,7 @@ def api_lab_chat_message():
         scores_snap = _coordinator.market_news.live_scores(force=False) or {}
         trade_snap = _coordinator.portfolio.snapshot(live_scores=scores_snap)
     except Exception as e:
-        log.warning("chat context fetch failed: %s", e)
+        log.error("chat context fetch failed: %s", e, exc_info=True)
         scores_snap = cache_snap.get("live_scores") or {}
         trade_snap = cache_snap
 
@@ -2508,6 +2702,51 @@ def api_lab_chat_message():
         if int(float(s.get("score") or 0)) >= int(model_state.get("min_conviction", 75))
         and str(s.get("symbol") or "").upper() not in held_symbols
     ]
+
+    # Walk-forward backtest shortcut
+    wf_keywords = {"walk-forward", "walk forward", "walkforward", "run backtest", "run walk"}
+    if any(k in text_low for k in wf_keywords):
+        global _walkforward_running
+        if _walkforward_running:
+            return jsonify({"ok": True, "reply": "Walk-forward is already running — check the Backtest panel in ~60s."})
+        if _WALKFORWARD_CACHE_PATH.exists():
+            try:
+                cached = json.loads(_WALKFORWARD_CACHE_PATH.read_text(encoding="utf-8"))
+                if cached.get("ok"):
+                    sharpe   = cached.get("sharpe", 0)
+                    verdict  = cached.get("verdict", "?")
+                    total_r  = cached.get("total_return_pct", 0)
+                    max_dd   = cached.get("max_drawdown_pct", 0)
+                    win_rate = cached.get("avg_win_rate", 0)
+                    n_win    = cached.get("profitable_windows", 0)
+                    n_total  = cached.get("total_windows", 0)
+                    run_at   = (cached.get("run_at") or "")[:10]
+                    lines = [
+                        f"Walk-Forward Results ({cached.get('start_date')} → {cached.get('end_date')}, {cached.get('window_months')}M windows):",
+                        f"  Verdict: {verdict}",
+                        f"  Sharpe: {sharpe}  |  Total return: {total_r:+.1f}%  |  Max drawdown: {max_dd:.1f}%",
+                        f"  Profitable windows: {n_win}/{n_total} ({round(n_win/max(n_total,1)*100)}%)  |  Avg win rate: {win_rate}%",
+                        f"  (Run {run_at}. Open the Backtest panel for the equity curve and window breakdown.)",
+                    ]
+                    return jsonify({"ok": True, "reply": "\n".join(lines), "open_backtest": True})
+            except Exception:
+                pass
+        # Trigger a new run
+        import threading as _threading
+        def _wf_run():
+            global _walkforward_running
+            _walkforward_running = True
+            try:
+                import backtest as _bt
+                result = _bt.run_walk_forward(start_date="2022-01-01", window_months=3)
+                strategy_model.STATE_DIR.mkdir(parents=True, exist_ok=True)
+                _WALKFORWARD_CACHE_PATH.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+            except Exception as _e:
+                log.error("Chat walk-forward failed: %s", _e)
+            finally:
+                _walkforward_running = False
+        _threading.Thread(target=_wf_run, daemon=True).start()
+        return jsonify({"ok": True, "reply": "Walk-forward started — loading 2022–today from yfinance and scoring across 3-month windows. Open the Backtest panel and check back in ~60s.", "open_backtest": True})
 
     why_not_keywords = {
         "why are you not buying", "why aren't you buying", "why not buying",
@@ -2923,7 +3162,7 @@ For all other queries respond in plain text. Never fabricate data not in context
                         for _iname in ("rsi", "macd", "avwap", "ema", "trend", "price_action"):
                             _ind = _bd3.get(_iname) or {}
                             if _ind.get("label"):
-                                _ind_summary.append(f"{_iname.upper()}: {_ind['label']} ({_ind.get('score',0)}/{_ind.get('weight',0)}pts)")
+                                _ind_summary.append(f"{_iname.upper()}: {_ind['label']} ({_ind.get('points',0)}/{_ind.get('weight',0)}pts)")
                         _reply3 = (
                             f"{_score_sym} scores {_sc3}/100 (regime: {_reg3})\n"
                             + ("\n".join(_ind_summary) if _ind_summary else "No indicator breakdown available.")
@@ -3224,7 +3463,7 @@ def api_lab_gaps():
         gaps = sg.scan_premarket_gaps(min_gap_pct=min_gap, alpaca_client=client)
         return jsonify({"ok": True, "gaps": gaps, "min_gap_pct": min_gap})
     except Exception as e:
-        log.warning("gaps error: %s", e)
+        log.error("gaps error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -3363,8 +3602,27 @@ def root():
 
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
+def _startup_walkforward():
+    """Run walk-forward on startup only if no cached result exists on the PVC."""
+    import time as _time
+    _time.sleep(60)  # let Flask fully boot first
+    if _WALKFORWARD_CACHE_PATH.exists():
+        log.info("Walk-forward cache found on PVC — skipping startup run.")
+        return
+    log.info("No walk-forward cache on PVC — running startup walk-forward.")
+    try:
+        import backtest as _bt
+        result = _bt.run_walk_forward(model=strategy_model.sanitize_model(strategy_model.load_model()))
+        _WALKFORWARD_CACHE_PATH.write_text(__import__("json").dumps(result))
+        log.info("Startup walk-forward complete: %s", result.get("verdict", "?"))
+    except Exception as _e:
+        log.warning("Startup walk-forward failed: %s", _e)
+
+
 if __name__ == "__main__":
     import os as _os
+    import threading as _threading
+    _threading.Thread(target=_startup_walkforward, daemon=True).start()
     _host = _os.environ.get("FLASK_HOST", "127.0.0.1")
     _port = int(_os.environ.get("FLASK_PORT", "5001"))
     app.run(host=_host, port=_port, debug=False)

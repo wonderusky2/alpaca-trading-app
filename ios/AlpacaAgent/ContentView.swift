@@ -122,6 +122,20 @@ struct DashboardStatusStrip: View {
         return Date().timeIntervalSince(last) > 90 ? .appAmber : .appGreen
     }
 
+    private var scoreFreshnessText: String {
+        guard let last = vm.lastScoredAt else { return "—" }
+        let s = max(0, Int(Date().timeIntervalSince(last)))
+        if s < 60  { return "now" }
+        if s < 120 { return "1m ago" }
+        return "\(s / 60)m ago"
+    }
+
+    private var scoreFreshnessTint: Color {
+        guard let last = vm.lastScoredAt else { return .appAmber }
+        let age = Date().timeIntervalSince(last)
+        return age < 360 ? .appGreen : age < 600 ? .appAmber : .appRed
+    }
+
     var body: some View {
         HStack(spacing: 8) {
             StatusChip(title: "Mode", value: "Paper", tint: .appAmber)
@@ -131,6 +145,7 @@ struct DashboardStatusStrip: View {
                 tint: vm.autoExecuteOrders ? .appRed : .appGreen
             )
             StatusChip(title: "Data", value: freshnessText, tint: freshnessTint)
+            StatusChip(title: "Scored", value: scoreFreshnessText, tint: scoreFreshnessTint)
         }
     }
 }
@@ -477,10 +492,32 @@ struct MarketPulsePanel: View {
 
                 Text(vm.positions.isEmpty ? "NO POS" : "\(vm.positions.count) POS")
                     .font(.system(size: 13, weight: .bold, design: .monospaced))
-                    .foregroundStyle(vm.positions.isEmpty ? Color.appMuted : Color.appBlue)
+                    .foregroundStyle(vm.positions.isEmpty ? Color.appRed : Color.appBlue)
                     .padding(.horizontal, 12)
 
                 Spacer()
+
+                // Error dot — tap to see server error log
+                if vm.overviewError != nil || vm.activityError != nil || !vm.serverErrors.isEmpty {
+                    Button {
+                        Task { await vm.fetchErrorLog() }
+                        vm.showErrorLog = true
+                    } label: {
+                        HStack(spacing: 3) {
+                            Circle()
+                                .fill(Color.appRed)
+                                .frame(width: 6, height: 6)
+                            Text("ERR")
+                                .font(.system(size: 11, weight: .black, design: .monospaced))
+                                .foregroundStyle(Color.appRed)
+                        }
+                        .padding(.horizontal, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .sheet(isPresented: $vm.showErrorLog) {
+                        ServerErrorLogSheet(vm: vm)
+                    }
+                }
 
                 if !vm.exitRecommendations.isEmpty {
                     HStack(spacing: 4) {
@@ -981,6 +1018,14 @@ struct CashPanel: View {
 struct RobinhoodPositionsList: View {
     @ObservedObject var vm: AgentViewModel
     @State private var showHistory = false
+    @AppStorage("pill_mode") private var pillModeRaw: String = PillMode.price.rawValue
+
+    private var pillModeBinding: Binding<PillMode> {
+        Binding(
+            get: { PillMode(rawValue: pillModeRaw) ?? .price },
+            set: { pillModeRaw = $0.rawValue }
+        )
+    }
     @State private var detailSig: SignalInsight?
 
     var body: some View {
@@ -1011,16 +1056,21 @@ struct RobinhoodPositionsList: View {
 
             if vm.positions.isEmpty {
                 if vm.signalInsights.isEmpty {
-                    Text("Scanning for setups…")
-                        .font(.subheadline).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.vertical, 24)
+                    if vm.isLoadingOverview {
+                        WatchlistSkeleton()
+                    } else {
+                        Text("Scanning for setups…")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.vertical, 24)
+                    }
                 } else {
                     VStack(spacing: 0) {
                         ForEach(Array(vm.signalInsights.prefix(6).enumerated()),
                                 id: \.element.id) { i, sig in
                             RobinhoodWatchlistRow(sig: sig,
-                                                  minScore: vm.strategyModel.minConviction)
+                                                  minScore: vm.strategyModel.minConviction,
+                                                  pillMode: pillModeBinding)
                                 .contentShape(Rectangle())
                                 .onTapGesture { detailSig = sig }
                             if i < min(vm.signalInsights.count, 6) - 1 { Divider() }
@@ -1034,7 +1084,8 @@ struct RobinhoodPositionsList: View {
                         RobinhoodPositionRow(
                             pos: pos,
                             insight: insight,
-                            hasExit: vm.exitRecommendations.contains { $0.symbol == pos.symbol }
+                            hasExit: vm.exitRecommendations.contains { $0.symbol == pos.symbol },
+                            pillMode: pillModeBinding
                         )
                         .contentShape(Rectangle())
                         .onTapGesture {
@@ -1251,60 +1302,108 @@ struct StockDetailSheet: View {
     }
 }
 
+enum PillMode: String { case price, pct, dollar }
+
 struct RobinhoodWatchlistRow: View {
     let sig: SignalInsight
     let minScore: Int
+    @Binding var pillMode: PillMode
 
     private var above: Bool { sig.score >= minScore }
-    private var pillColor: Color {
+    private var scoreColor: Color {
         sig.score >= 85 ? Color.appGreen : sig.score >= minScore ? Color.appAmber : Color(.systemGray3)
     }
+    // Pill background: green if up since open, red if down
+    private var pillBg: Color { sig.changePct >= 0 ? Color.appGreen : Color.appRed }
+
+    private var pillLabel: String {
+        let pct = sig.changePct
+        let price = sig.lastPrice
+        switch pillMode {
+        case .price:
+            return price > 0 ? String(format: "$%.2f", price) : "–"
+        case .pct:
+            return String(format: pct >= 0 ? "+%.1f%%" : "%.1f%%", pct)
+        case .dollar:
+            guard price > 0, pct != 0 else { return "–" }
+            let delta = price * pct / 100.0
+            return String(format: delta >= 0 ? "+$%.2f" : "-$%.2f", abs(delta))
+        }
+    }
+
+    private func cyclePill() {
+        switch pillMode {
+        case .price:  pillMode = .pct
+        case .pct:    pillMode = .dollar
+        case .dollar: pillMode = .price
+        }
+    }
+
 
     var body: some View {
         HStack(spacing: 10) {
-            // Symbol + subtitle
-            VStack(alignment: .leading, spacing: 3) {
+            // Score on the left (large) + symbol name
+            HStack(spacing: 12) {
+                Text("\(sig.score)")
+                    .font(.system(size: 22, weight: .black, design: .monospaced))
+                    .foregroundStyle(scoreColor)
+                    .frame(minWidth: 32, alignment: .leading)
+
                 Text(sig.symbol)
                     .font(.system(size: 17, weight: .bold))
                     .foregroundStyle(above ? .primary : .secondary)
-                Text(sig.topLabel)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                NewsDot(boost: sig.geminiBoost)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            // Mini sparkline
-            MiniSparkline(indicators: sig.orderedIndicators,
-                          isPositive: sig.changePct >= 0)
-                .frame(width: 72, height: 36)
+            // 6 signal circles: R · M · A · E · T · P
+            SignalDots(indicators: sig.orderedIndicators)
 
-            // Price pill + change%
+            // Tappable pill: cycles price → % → $Δ
             VStack(alignment: .trailing, spacing: 3) {
-                Text(sig.lastPrice > 0 ? String(format: "$%.2f", sig.lastPrice) : "–")
+                Text(pillLabel)
                     .font(.system(size: 14, weight: .bold))
                     .foregroundStyle(.white)
-                    .frame(minWidth: 64)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                    .frame(minWidth: 72)
                     .padding(.horizontal, 10).padding(.vertical, 7)
-                    .background(pillColor)
+                    .background(pillBg)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
-                let pct = sig.changePct
-                Text(String(format: pct >= 0 ? "+%.1f%%" : "%.1f%%", pct))
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(pct >= 0 ? Color.appGreen : Color.appRed)
+                    .onTapGesture { cyclePill() }
             }
         }
-        .padding(.vertical, 14)
+        .padding(.vertical, 12)
     }
 }
 
-// ── Robinhood position row: symbol+entry | sparkline | value pill ─────────────
+// ── Robinhood position row: symbol+entry | signal dots | value pill ───────────
 struct RobinhoodPositionRow: View {
     let pos: PositionRow
     let insight: SignalInsight?
     let hasExit: Bool
+    @Binding var pillMode: PillMode
 
     private var pillColor: Color { pos.unrealizedPnl >= 0 ? Color.appGreen : Color.appRed }
+
+    private var pillLabel: String {
+        switch pillMode {
+        case .price:
+            return money(pos.currentValue)
+        case .pct:
+            return signedPercent(pos.unrealizedPnlPct)
+        case .dollar:
+            return signedMoney(pos.unrealizedPnl)
+        }
+    }
+
+    private func cyclePill() {
+        switch pillMode {
+        case .price:  pillMode = .pct
+        case .pct:    pillMode = .dollar
+        case .dollar: pillMode = .price
+        }
+    }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -1313,6 +1412,7 @@ struct RobinhoodPositionRow: View {
                 HStack(spacing: 6) {
                     Text(pos.symbol)
                         .font(.system(size: 17, weight: .bold))
+                    NewsDot(boost: insight?.geminiBoost ?? 0)
                     if hasExit {
                         Text("EXIT")
                             .font(.system(size: 9, weight: .black))
@@ -1328,92 +1428,135 @@ struct RobinhoodPositionRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            // Mini sparkline from signal indicators
-            if let sig = insight {
-                MiniSparkline(indicators: sig.orderedIndicators,
-                              isPositive: pos.unrealizedPnl >= 0)
-                    .frame(width: 72, height: 36)
-            } else {
-                Spacer().frame(width: 72)
-            }
+            // 6 signal circles: R · M · A · E · T · P
+            SignalDots(indicators: insight?.orderedIndicators ?? [])
 
-            // Value pill + P&L
-            VStack(alignment: .trailing, spacing: 3) {
-                Text(money(pos.currentValue))
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(minWidth: 72)
-                    .padding(.horizontal, 10).padding(.vertical, 7)
-                    .background(pillColor)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                HStack(spacing: 3) {
-                    Text(signedMoney(pos.unrealizedPnl))
-                    Text("(\(signedPercent(pos.unrealizedPnlPct)))")
-                }
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(pillColor)
-            }
+            // Tappable pill — synced with watchlist via binding
+            Text(pillLabel)
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .frame(minWidth: 72)
+                .padding(.horizontal, 10).padding(.vertical, 7)
+                .background(pillColor)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .onTapGesture { cyclePill() }
         }
         .padding(.vertical, 14)
     }
 }
 
-// ── Mini sparkline built from signal indicator sequence ───────────────────────
-struct MiniSparkline: View {
-    let indicators: [NamedIndicator]
-    let isPositive: Bool
+// ── Skeleton loading rows shown while first data fetch is in flight ───────────
+struct WatchlistSkeleton: View {
+    @State private var phase: CGFloat = -1
 
-    /// Build pseudo price points (0–1) from indicator states
-    private var points: [CGFloat] {
-        var pts: [CGFloat] = [0.5]
-        var cur: CGFloat = 0.5
-        for ind in indicators {
-            switch ind.indicator.status {
-            case "bullish": cur = min(1.0, cur + 0.18)
-            case "bearish": cur = max(0.0, cur - 0.18)
-            default:        cur = cur + (isPositive ? 0.02 : -0.02)
-            }
-            pts.append(cur)
-        }
-        return pts
-    }
-
-    private var lineColor: Color { isPositive ? Color.appGreen : Color.appRed }
+    private let symbols = ["████", "███", "█████", "████", "███"]
 
     var body: some View {
-        GeometryReader { geo in
-            let w = geo.size.width
-            let h = geo.size.height
-            let pts = points
-            let minY = (pts.min() ?? 0) - 0.05
-            let maxY = (pts.max() ?? 1) + 0.05
-            let range = max(maxY - minY, 0.01)
-            let xStep = w / CGFloat(max(pts.count - 1, 1))
-            // Use closure instead of func to stay ViewBuilder-compatible (Swift 6)
-            let pt: (Int) -> CGPoint = { i in
-                CGPoint(
-                    x: CGFloat(i) * xStep,
-                    y: h - h * CGFloat((pts[i] - minY) / range)
-                )
+        VStack(spacing: 0) {
+            ForEach(0..<5, id: \.self) { i in
+                HStack(spacing: 12) {
+                    // Score placeholder
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color(.systemGray5))
+                        .frame(width: 28, height: 20)
+                    // Symbol placeholder
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color(.systemGray5))
+                        .frame(width: CGFloat(40 + i * 8), height: 16)
+                    Spacer()
+                    // Dots placeholder — 6 lettered circles matching SignalDots
+                    HStack(spacing: 5) {
+                        ForEach(0..<6, id: \.self) { _ in
+                            Circle().fill(Color(.systemGray5)).frame(width: 17, height: 17)
+                        }
+                    }
+                    Spacer()
+                    // Price pill placeholder
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color(.systemGray5))
+                        .frame(width: 72, height: 32)
+                }
+                .padding(.vertical, 14)
+                .opacity(0.4 + 0.2 * Double(i % 3))
+                if i < 4 { Divider() }
             }
-
-            // Baseline
-            Path { p in
-                let by = h * CGFloat((0.5 - minY) / range)
-                p.move(to: CGPoint(x: 0, y: h - by))
-                p.addLine(to: CGPoint(x: w, y: h - by))
-            }
-            .stroke(Color.secondary.opacity(0.25),
-                    style: StrokeStyle(lineWidth: 0.5, dash: [2, 2]))
-
-            // Sparkline
-            Path { p in
-                guard pts.count > 1 else { return }
-                p.move(to: pt(0))
-                for i in 1..<pts.count { p.addLine(to: pt(i)) }
-            }
-            .stroke(lineColor, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
         }
+        .redacted(reason: .placeholder)
+        .shimmering()
+    }
+}
+
+extension View {
+    @ViewBuilder func shimmering() -> some View {
+        self.overlay(
+            GeometryReader { geo in
+                LinearGradient(
+                    gradient: Gradient(colors: [
+                        .clear,
+                        Color.white.opacity(0.06),
+                        .clear,
+                    ]),
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(width: geo.size.width * 2)
+                .offset(x: -geo.size.width)
+                .animation(.linear(duration: 1.4).repeatForever(autoreverses: false), value: UUID())
+            }
+            .clipped()
+        )
+    }
+}
+
+// ── 6 signal circles: R·M·A·E·T·P ───────────────────────────────────────────
+struct SignalDots: View {
+    let indicators: [NamedIndicator]
+
+    private func dotColor(_ status: String) -> Color {
+        switch status {
+        case "bullish": return Color.appGreen
+        case "bearish": return Color.appRed
+        default:        return Color(.systemGray4)
+        }
+    }
+
+    private func letter(for name: String) -> String { String(name.prefix(1)) }
+
+    @ViewBuilder
+    private func dot(letter: String, color: Color) -> some View {
+        ZStack {
+            Circle().fill(color.opacity(0.18))
+            Circle().strokeBorder(color, lineWidth: 1.2)
+            Text(letter)
+                .font(.system(size: 7, weight: .black, design: .monospaced))
+                .foregroundStyle(color)
+        }
+        .frame(width: 17, height: 17)
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(indicators.prefix(6)) { ni in
+                dot(letter: letter(for: ni.name), color: dotColor(ni.indicator.status))
+            }
+        }
+    }
+}
+
+/// Small colored dot placed inline with the ticker — green/red/gray based on Gemini news sentiment.
+struct NewsDot: View {
+    let boost: Double
+    private var color: Color {
+        if boost > 0 { return Color.appGreen }
+        if boost < 0 { return Color.appRed }
+        return Color(.systemGray4)
+    }
+    var body: some View {
+        Circle()
+            .fill(color)
+            .frame(width: 7, height: 7)
     }
 }
 
@@ -2941,7 +3084,7 @@ struct ActivityRow: View {
                     } label: {
                         Label("View Score (\(insight.symbol) \(insight.score)/100)", systemImage: "chart.bar.fill")
                             .font(.caption)
-                            .foregroundStyle(.appBlue)
+                            .foregroundStyle(Color.appBlue)
                     }
                     .buttonStyle(.plain)
                 }
@@ -3287,6 +3430,77 @@ struct ModelRow: View {
             Text(value)
                 .font(.subheadline.weight(.semibold))
                 .foregroundColor(Color.appBlue)
+        }
+    }
+}
+
+// ── Server Error Log Sheet ────────────────────────────────────────────────────
+struct ServerErrorLogSheet: View {
+    @ObservedObject var vm: AgentViewModel
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if vm.serverErrors.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 44))
+                            .foregroundStyle(Color.appGreen)
+                        Text("No errors in log")
+                            .font(.headline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List(vm.serverErrors) { item in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 6) {
+                                Text(item.level)
+                                    .font(.system(size: 10, weight: .black, design: .monospaced))
+                                    .foregroundStyle(item.level == "ERROR" ? Color.appRed : Color.appAmber)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 2)
+                                    .background((item.level == "ERROR" ? Color.appRed : Color.appAmber).opacity(0.12))
+                                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                                Text(item.ts)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text(item.logger.replacingOccurrences(of: "rht.", with: ""))
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                            }
+                            Text(item.msg)
+                                .font(.system(size: 13, design: .monospaced))
+                                .foregroundStyle(.primary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(.vertical, 4)
+                        .listRowBackground(Color.appSurface)
+                    }
+                    .listStyle(.plain)
+                }
+            }
+            .navigationTitle("Server Errors")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Refresh") {
+                        Task { await vm.fetchErrorLog() }
+                    }
+                    .foregroundStyle(Color.appGreen)
+                }
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Done") { vm.showErrorLog = false }
+                        .foregroundStyle(Color.appGreen)
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .preferredColorScheme(.dark)
+        .onAppear {
+            Task { await vm.fetchErrorLog() }
         }
     }
 }

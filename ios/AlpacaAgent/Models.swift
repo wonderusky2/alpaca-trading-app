@@ -146,6 +146,7 @@ struct SignalInsight: Identifiable {
     let lastPrice: Double
     let side: String
     let reasons: [String]
+    var geminiBoost: Double = 0.0   // Gemini sentiment boost applied to this signal
     var news: [SignalNewsItem] = []
     /// Keyed by indicator name: "rsi" | "macd" | "avwap" | "ema" | "trend" | "price_action"
     var signalBreakdown: [String: SignalIndicator] = [:]
@@ -267,6 +268,14 @@ struct SignalNewsItem: Identifiable {
     let source: String
     let url: String
     let createdAt: String
+}
+
+struct ServerErrorItem: Identifiable {
+    let id    = UUID()
+    let ts:    String
+    let level: String
+    let logger: String
+    let msg:   String
 }
 
 struct PendingTradeProposal: Identifiable {

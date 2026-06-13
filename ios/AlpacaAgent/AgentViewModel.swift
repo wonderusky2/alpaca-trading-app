@@ -12,6 +12,7 @@ class AgentViewModel: ObservableObject {
     @Published var isPlacingOrder = false
     @Published var autoExecuteOrders = false
     @Published var lastOverviewAt: Date?
+    @Published var lastScoredAt: Date?          // when signalInsights were last updated
     @Published var overviewError: String?
     @Published var selectedPortfolioRange: PortfolioRange = .day
     @Published var customRangeStart: Date = Calendar.current.date(byAdding: .month, value: -1, to: Date()) ?? Date()
@@ -34,11 +35,14 @@ class AgentViewModel: ObservableObject {
     @Published var variantWinRates: [VariantWinRate] = []
     @Published var todayVariantWinner: String = ""
     @Published var lastOptimizedAt: String = ""
+    @Published var serverErrors: [ServerErrorItem] = []
+    @Published var showErrorLog: Bool = false
 
     // ── Trading control (#43, #44) ─────────────────────────────────────────
     @Published var tradingPaused: Bool = false
     @Published var tradingPaper:  Bool = true      // false = live (real $)
     @Published var traderControlLoaded: Bool = false
+    @Published var isLoadingOverview: Bool = true  // true until first data (cache or live)
 
 
     private var pollTask: Task<Void, Never>?
@@ -48,13 +52,28 @@ class AgentViewModel: ObservableObject {
     private var prevVariant: String = ""
     private var initialized        = false
 
+    private static let overviewCacheKey = "agent_overview_cache_v1"
+
     init() {
+        // Show last-known state immediately — no spinner on launch
+        restoreCachedOverview()
         startPolling()
         Task {
             await fetchPortfolioHistory(for: selectedPortfolioRange)
             await fetchActivity()
             await fetchVariants()
         }
+    }
+
+    /// Restore the last good overview JSON from UserDefaults synchronously.
+    /// Called on init so the UI is populated before the first network round-trip.
+    private func restoreCachedOverview() {
+        guard let data = UserDefaults.standard.data(forKey: Self.overviewCacheKey),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let ok = json["ok"] as? Bool, ok
+        else { return }
+        applyOverviewJSON(json, fromCache: true)
+        isLoadingOverview = false   // cache hit — UI is ready immediately
     }
 
     // ── Notifications ─────────────────────────────────────────────────────────
@@ -105,68 +124,78 @@ class AgentViewModel: ObservableObject {
                 overviewError = "Overview unavailable"
                 return
             }
-
-            let acct   = json["account"]    as? [String: Any] ?? [:]
-            let acctg  = json["accounting"] as? [String: Any] ?? [:]
-            let clock  = json["clock"]      as? [String: Any] ?? [:]
-            let scores = json["live_scores"] as? [String: Any] ?? [:]
-            let decisionJson = json["decision"] as? [String: Any] ?? [:]
-            let narrativeJson = json["portfolio_narrative"] as? [String: Any] ?? [:]
-            let modelJson = json["model"] as? [String: Any] ?? [:]
-            let newsRisks = json["news_risk"] as? [[String: Any]] ?? []
-
-            let eq      = anyDouble(acct["equity"])
-            let lastEq  = anyDouble(acct["last_equity"])
-            let cash    = anyDouble(acct["cash"])
-            let openPnl = anyDouble(acctg["unrealized_pnl"])
-            let posCount = anyInt(acctg["filled_position_count"])
-            let positionRows = acctg["positions"] as? [[String: Any]] ?? []
-            let currentSymbols = positionRows.compactMap { $0["symbol"] as? String }.map { $0.uppercased() }
-            let exitRows = acctg["exit_recommendations"] as? [[String: Any]] ?? []
-            let regime  = scores["regime"] as? String ?? "CHOPPY"
-            let isOpen  = clock["is_open"] as? Bool ?? false
-            var nextOpenStr = ""
-            if let nextOpenISO = clock["next_open"] as? String,
-               let nextDate = ISO8601DateFormatter().date(from: nextOpenISO) {
-                let fmt = DateFormatter()
-                fmt.dateFormat = "EEE h:mm a"
-                nextOpenStr = fmt.string(from: nextDate)
-            }
-
-            overview = OverviewData(
-                equity: eq, lastEquity: lastEq, cash: cash,
-                posCount: posCount, openPnl: openPnl,
-                regime: regime, isOpen: isOpen, nextOpen: nextOpenStr
-            )
-            positions = positionRows.map(parsePosition)
-            exitRecommendations = exitRows.map(parseExitRecommendation)
-            decision = parseDecision(decisionJson)
-            strategyModel = parseStrategyModel(modelJson)
-            signalInsights = parseSignalInsights(scores)
-            // Parse held-position scores keyed by symbol (always populated, even on weekends)
-            let heldRows = scores["held_scores"] as? [[String: Any]] ?? []
-            heldInsights = Dictionary(
-                uniqueKeysWithValues: parseHeldInsights(heldRows).map { ($0.symbol, $0) }
-            )
-            portfolioNarrative = parsePortfolioNarrative(narrativeJson)
-            lastOverviewAt = Date()
-            overviewError = nil
-
-            if !initialized {
-                let greetingPnl = overview.hasDailyPnl ? overview.dailyPnl : openPnl
-                postGreeting(regime: regime, isOpen: isOpen, equity: eq,
-                             pnl: greetingPnl, posCount: posCount, newsRisks: newsRisks)
-                prevRegime   = regime
-                prevPosCount = posCount
-                prevSymbols  = Set(currentSymbols)
-                initialized  = true
-            } else {
-                detectChanges(regime: regime, posCount: posCount,
-                              symbols: currentSymbols, openPnl: openPnl,
-                              newsRisks: newsRisks, variant: strategyModel.activeVariant)
-            }
+            // Persist to cache so next launch is instant
+            UserDefaults.standard.set(data, forKey: Self.overviewCacheKey)
+            UserDefaults.standard.synchronize()
+            applyOverviewJSON(json, fromCache: false)
+            isLoadingOverview = false
         } catch {
             overviewError = error.localizedDescription
+        }
+    }
+
+    /// Parse and apply a full overview JSON dict to all @Published properties.
+    /// fromCache=true skips greeting/detectChanges (stale data shouldn't trigger alerts).
+    private func applyOverviewJSON(_ json: [String: Any], fromCache: Bool) {
+        let acct   = json["account"]    as? [String: Any] ?? [:]
+        let acctg  = json["accounting"] as? [String: Any] ?? [:]
+        let clock  = json["clock"]      as? [String: Any] ?? [:]
+        let scores = json["live_scores"] as? [String: Any] ?? [:]
+        let decisionJson  = json["decision"]             as? [String: Any] ?? [:]
+        let narrativeJson = json["portfolio_narrative"]  as? [String: Any] ?? [:]
+        let modelJson     = json["model"]                as? [String: Any] ?? [:]
+        let newsRisks     = json["news_risk"]            as? [[String: Any]] ?? []
+
+        let eq       = anyDouble(acct["equity"])
+        let lastEq   = anyDouble(acct["last_equity"])
+        let cash     = anyDouble(acct["cash"])
+        let openPnl  = anyDouble(acctg["unrealized_pnl"])
+        let posCount = anyInt(acctg["filled_position_count"])
+        let positionRows   = acctg["positions"]              as? [[String: Any]] ?? []
+        let currentSymbols = positionRows.compactMap { $0["symbol"] as? String }.map { $0.uppercased() }
+        let exitRows       = acctg["exit_recommendations"]   as? [[String: Any]] ?? []
+        let regime  = scores["regime"] as? String ?? "CHOPPY"
+        let isOpen  = clock["is_open"] as? Bool ?? false
+        var nextOpenStr = ""
+        if let nextOpenISO = clock["next_open"] as? String,
+           let nextDate = ISO8601DateFormatter().date(from: nextOpenISO) {
+            let fmt = DateFormatter()
+            fmt.dateFormat = "EEE h:mm a"
+            nextOpenStr = fmt.string(from: nextDate)
+        }
+
+        overview = OverviewData(
+            equity: eq, lastEquity: lastEq, cash: cash,
+            posCount: posCount, openPnl: openPnl,
+            regime: regime, isOpen: isOpen, nextOpen: nextOpenStr
+        )
+        positions           = positionRows.map(parsePosition)
+        exitRecommendations = exitRows.map(parseExitRecommendation)
+        decision            = parseDecision(decisionJson)
+        strategyModel       = parseStrategyModel(modelJson)
+        signalInsights      = parseSignalInsights(scores)
+        lastScoredAt        = fromCache ? lastScoredAt : Date()
+        let heldRows        = scores["held_scores"] as? [[String: Any]] ?? []
+        heldInsights        = Dictionary(
+            uniqueKeysWithValues: parseHeldInsights(heldRows).map { ($0.symbol, $0) }
+        )
+        portfolioNarrative  = parsePortfolioNarrative(narrativeJson)
+        lastOverviewAt      = fromCache ? lastOverviewAt : Date()
+        overviewError       = nil
+
+        guard !fromCache else { return }   // don't greet or detect-changes from stale cache
+        if !initialized {
+            let greetingPnl = overview.hasDailyPnl ? overview.dailyPnl : openPnl
+            postGreeting(regime: regime, isOpen: isOpen, equity: eq,
+                         pnl: greetingPnl, posCount: posCount, newsRisks: newsRisks)
+            prevRegime   = regime
+            prevPosCount = posCount
+            prevSymbols  = Set(currentSymbols)
+            initialized  = true
+        } else {
+            detectChanges(regime: regime, posCount: posCount,
+                          symbols: currentSymbols, openPnl: openPnl,
+                          newsRisks: newsRisks, variant: strategyModel.activeVariant)
         }
     }
 
@@ -312,11 +341,23 @@ class AgentViewModel: ObservableObject {
     }
 
     func clearEvents() {
-        // Wipe locally immediately — visible right away.
+        // Optimistically wipe locally so the UI clears immediately.
         activityItems = []
-        // Fire DELETE in background; no re-fetch so the cleared state sticks.
         Task {
-            _ = try? await URLSession.shared.data(for: Config.request("/api/lab/events", method: "DELETE"))
+            do {
+                let (data, _) = try await URLSession.shared.data(
+                    for: Config.request("/api/lab/events", method: "DELETE"))
+                // Confirm server acknowledged — if it failed, restore by re-fetching.
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   json["ok"] as? Bool == true {
+                    // Success — leave the local wipe in place. Activity stays empty
+                    // until the next real event is written by the scoring loop.
+                } else {
+                    await fetchActivity()   // server rejected — show real state
+                }
+            } catch {
+                await fetchActivity()       // network error — show real state
+            }
         }
     }
 
@@ -334,11 +375,21 @@ class AgentViewModel: ObservableObject {
 
     func setTradingPaused(_ paused: Bool) {
         let endpoint = paused ? "/api/lab/trader/pause" : "/api/lab/trader/resume"
-        Task {
-            _ = try? await URLSession.shared.data(for: Config.request(endpoint, method: "POST"))
-            await fetchTraderControl()
-        }
         tradingPaused = paused   // optimistic local update
+        Task {
+            do {
+                let (data, resp) = try await URLSession.shared.data(for: Config.request(endpoint, method: "POST"))
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if code != 200 {
+                    let msg = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String ?? "HTTP \(code)"
+                    await MainActor.run { overviewError = "Pause/resume failed: \(msg)" }
+                    await fetchTraderControl()   // revert optimistic update
+                }
+            } catch {
+                await MainActor.run { overviewError = "Pause/resume failed: \(error.localizedDescription)" }
+                await fetchTraderControl()
+            }
+        }
     }
 
     /// Switch to live mode. Requires explicit user confirmation string.
@@ -358,12 +409,22 @@ class AgentViewModel: ObservableObject {
     }
 
     func setPaperMode() {
+        tradingPaper = true   // optimistic
         Task {
-            _ = try? await URLSession.shared.data(
-                for: Config.request("/api/lab/trader/mode", method: "POST", body: ["paper": true]))
-            await fetchTraderControl()
+            do {
+                let (data, resp) = try await URLSession.shared.data(
+                    for: Config.request("/api/lab/trader/mode", method: "POST", body: ["paper": true]))
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if code != 200 {
+                    let msg = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String ?? "HTTP \(code)"
+                    await MainActor.run { overviewError = "Switch to paper failed: \(msg)" }
+                }
+                await fetchTraderControl()
+            } catch {
+                await MainActor.run { overviewError = "Switch to paper failed: \(error.localizedDescription)" }
+                await fetchTraderControl()
+            }
         }
-        tradingPaper = true
     }
 
     func selectPortfolioRange(_ range: PortfolioRange) {
@@ -464,6 +525,24 @@ class AgentViewModel: ObservableObject {
             // On failure, preserve the last good activity data — don't pollute the feed with error rows.
             // activityError is shown as a non-intrusive indicator in the UI instead.
             activityError = error.localizedDescription
+        }
+    }
+
+    func fetchErrorLog() async {
+        do {
+            let (data, _) = try await URLSession.shared.data(for: Config.request("/api/lab/errors"))
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let raw = json["errors"] as? [[String: Any]] else { return }
+            serverErrors = raw.map { e in
+                ServerErrorItem(
+                    ts:     e["ts"]     as? String ?? "",
+                    level:  e["level"]  as? String ?? "ERROR",
+                    logger: e["logger"] as? String ?? "",
+                    msg:    e["msg"]    as? String ?? ""
+                )
+            }
+        } catch {
+            // Non-critical — silent
         }
     }
 
@@ -869,6 +948,7 @@ class AgentViewModel: ObservableObject {
                 side: anyString(item["side"], fallback: "buy"),
                 reasons: item["technical_reasons"] as? [String] ?? []
             )
+            insight.geminiBoost = anyDouble(item["gemini_boost"])
             insight.signalBreakdown = breakdown
             insight.news = (item["news"] as? [[String: Any]] ?? []).prefix(5).map { n in
                 SignalNewsItem(
