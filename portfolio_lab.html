@@ -143,58 +143,46 @@ button{font:inherit;cursor:pointer}
 .wl-pnl.neg{color:var(--red)}
 .wl-meta{font-size:11px;color:var(--muted)}
 
-/* ── Signal circles (1×6 lettered, matches iOS) ── */
-.sig-circles{display:flex;gap:4px;align-items:center;flex-shrink:0}
+/* ── Signal circles — compact for 240px sidebar ── */
+.sig-circles{display:flex;gap:2px;align-items:center}
 .sig-circle{
-  width:16px;height:16px;border-radius:50%;
+  width:13px;height:13px;border-radius:50%;
   display:flex;align-items:center;justify-content:center;
-  font-family:var(--mono);font-size:7px;font-weight:900;
+  font-family:var(--mono);font-size:6px;font-weight:900;
   flex-shrink:0;
 }
-.sig-circle.bullish{
-  background:rgba(63,185,80,.18);
-  border:1.2px solid var(--green);
-  color:var(--green);
-}
-.sig-circle.bearish{
-  background:rgba(248,81,73,.18);
-  border:1.2px solid var(--red);
-  color:var(--red);
-}
-.sig-circle.neutral{
-  background:rgba(139,148,158,.10);
-  border:1.2px solid var(--dim);
-  color:var(--dim);
-}
+.sig-circle.bullish{background:rgba(63,185,80,.18);border:1px solid var(--green);color:var(--green)}
+.sig-circle.bearish{background:rgba(248,81,73,.18);border:1px solid var(--red);color:var(--red)}
+.sig-circle.neutral{background:rgba(139,148,158,.10);border:1px solid var(--dim);color:var(--dim)}
 
 /* ── News sentiment dot ── */
 .news-dot{
-  width:7px;height:7px;border-radius:50%;
-  display:inline-block;flex-shrink:0;margin-left:5px;
+  width:6px;height:6px;border-radius:50%;
+  display:inline-block;flex-shrink:0;margin-left:4px;vertical-align:middle;
 }
 .news-dot.pos{background:var(--green)}
 .news-dot.neg{background:var(--red)}
 .news-dot.flat{background:var(--dim)}
 
-/* ── Price pill (tappable, cycles modes) ── */
+/* ── Price pill ── */
 .price-pill{
   font-family:var(--mono);font-size:11px;font-weight:700;
-  padding:3px 9px;border-radius:12px;cursor:pointer;
-  border:none;flex-shrink:0;user-select:none;
-  transition:opacity .15s;
+  padding:2px 7px;border-radius:10px;cursor:pointer;
+  border:none;flex-shrink:0;user-select:none;transition:opacity .15s;
 }
 .price-pill:hover{opacity:.82}
 .price-pill.up{background:rgba(63,185,80,.18);color:var(--green)}
 .price-pill.dn{background:rgba(248,81,73,.18);color:var(--red)}
 
-/* Updated wl-row layout */
+/* ── Two-line wl-row — fits 240px sidebar ── */
 .wl-row{
-  display:flex;align-items:center;gap:6px;padding:8px 0;
-  border-bottom:1px solid var(--border);cursor:default;min-width:0;
+  display:flex;flex-direction:column;gap:4px;padding:7px 0;
+  border-bottom:1px solid var(--border);cursor:default;
 }
 .wl-row:last-child{border-bottom:none}
-.wl-sym-wrap{display:flex;align-items:center;gap:0;flex-shrink:0}
-.wl-mid-fill{flex:1;display:flex;align-items:center;justify-content:center}
+.wl-top{display:flex;align-items:center;gap:5px;min-width:0}
+.wl-sym-wrap{display:flex;align-items:center;min-width:0;flex:1}
+.wl-bottom{display:flex;align-items:center;gap:4px;padding-left:1px}
 
 /* ── Chat area ── */
 #chat{display:flex;flex-direction:column;height:100vh;min-width:0}
@@ -835,20 +823,20 @@ function updateWatchlist(data) {
 
       return `
         <div class="wl-row pos-row" style="cursor:pointer" onclick="showStockDetail('${sym}')">
-          ${sig.score ? `<span class="wl-score ${scoreCls}" style="flex-shrink:0">${sig.score}</span>` : ''}
-          <div class="wl-sym-wrap">
-            <span class="wl-sym">${sym}</span>
-            ${newsDotHtml(boost)}
+          <div class="wl-top">
+            ${sig.score ? `<span class="wl-score ${scoreCls}">${sig.score}</span>` : ''}
+            <div class="wl-sym-wrap">
+              <span class="wl-sym">${sym}</span>
+              ${newsDotHtml(boost)}
+            </div>
+            <button class="price-pill ${isUp ? 'up' : 'dn'}"
+              data-sym="${sym}" data-price="${val}" data-chgpct="${pnlPct}"
+              onclick="cycleWlPill(event); return false"
+              title="Tap to cycle: value / % P&amp;L / $ P&amp;L">
+              ${pillLabel(val, pnlPct, wlPillMode)}
+            </button>
           </div>
-          <div class="wl-mid-fill">
-            ${sigCirclesHtml(bd)}
-          </div>
-          <button class="price-pill ${isUp ? 'up' : 'dn'}"
-            data-sym="${sym}" data-price="${val}" data-chgpct="${pnlPct}"
-            onclick="cycleWlPill(event); return false"
-            title="Tap to cycle: value / % P&amp;L / $ P&amp;L">
-            ${pillLabel(val, pnlPct, wlPillMode)}
-          </button>
+          <div class="wl-bottom">${sigCirclesHtml(bd)}</div>
         </div>`;
     }).join('');
 
@@ -873,20 +861,20 @@ function updateWatchlist(data) {
 
       return `
         <div class="wl-row" style="cursor:pointer" onclick="showStockDetail('${sym}')">
-          <span class="wl-score ${scoreCls}" style="flex-shrink:0">${score}</span>
-          <div class="wl-sym-wrap">
-            <span class="wl-sym">${sym}</span>
-            ${newsDotHtml(boost)}
+          <div class="wl-top">
+            <span class="wl-score ${scoreCls}">${score}</span>
+            <div class="wl-sym-wrap">
+              <span class="wl-sym">${sym}</span>
+              ${newsDotHtml(boost)}
+            </div>
+            <button class="price-pill ${isUp ? 'up' : 'dn'}"
+              data-sym="${sym}" data-price="${price}" data-chgpct="${chgPct}"
+              onclick="cycleWlPill(event); return false"
+              title="Tap to cycle: price / % change / $ change">
+              ${pillLabel(price, chgPct, wlPillMode)}
+            </button>
           </div>
-          <div class="wl-mid-fill">
-            ${sigCirclesHtml(bd)}
-          </div>
-          <button class="price-pill ${isUp ? 'up' : 'dn'}"
-            data-sym="${sym}" data-price="${price}" data-chgpct="${chgPct}"
-            onclick="cycleWlPill(event); return false"
-            title="Tap to cycle: price / % change / $ change">
-            ${pillLabel(price, chgPct, wlPillMode)}
-          </button>
+          <div class="wl-bottom">${sigCirclesHtml(bd)}</div>
         </div>`;
     }).join('');
   }
