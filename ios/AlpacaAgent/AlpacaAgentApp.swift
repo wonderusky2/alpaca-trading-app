@@ -13,6 +13,7 @@ struct AlpacaAgentApp: App {
 }
 
 // ── Push notification delegate (#41) ─────────────────────────────────────────
+@MainActor
 class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
 
     func application(
@@ -44,7 +45,7 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
     }
 
     // Show alert even when app is in foreground
-    func userNotificationCenter(
+    nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
         withCompletionHandler handler: @escaping (UNNotificationPresentationOptions) -> Void

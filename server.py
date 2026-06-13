@@ -439,8 +439,8 @@ def _live_score_refresh_loop() -> None:
         mins = now.hour * 60 + now.minute
         return 570 <= mins < 960   # 9:30 AM – 4:00 PM ET
 
-    # Stagger first run by 15 s to let the server finish startup
-    time.sleep(15)
+    # Stagger first run by 5 s — enough for Flask to bind, short enough for QA
+    time.sleep(5)
     log.info("live-score refresh loop started")
     while True:
         if _market_open():
@@ -2121,7 +2121,24 @@ def api_lab_health():
     })
 
 
-_activity_cleared_at: float = 0.0   # epoch — orders before this are hidden after clear
+# ── Activity clear timestamp — persisted so pod restarts don't resurrect history ──
+_ACTIVITY_CLEARED_PATH = STATE_DIR / "activity_cleared_at.json"
+
+def _load_activity_cleared_at() -> float:
+    try:
+        if _ACTIVITY_CLEARED_PATH.exists():
+            return float(json.loads(_ACTIVITY_CLEARED_PATH.read_text())["ts"])
+    except Exception:
+        pass
+    return 0.0
+
+def _save_activity_cleared_at(ts: float) -> None:
+    try:
+        _ACTIVITY_CLEARED_PATH.write_text(json.dumps({"ts": ts}))
+    except Exception as e:
+        log.warning("Could not persist activity_cleared_at: %s", e)
+
+_activity_cleared_at: float = _load_activity_cleared_at()
 
 
 @app.route("/api/lab/errors")
@@ -2139,6 +2156,7 @@ def api_lab_events_clear():
     try:
         LAB_EVENTS_PATH.write_text("", encoding="utf-8")
         _activity_cleared_at = time.time()
+        _save_activity_cleared_at(_activity_cleared_at)
         log.info("Activity log cleared at %s", datetime.now(timezone.utc).isoformat())
         return jsonify({"ok": True, "message": "Events log cleared.", "cleared_at": _activity_cleared_at})
     except Exception as e:

@@ -7,3 +7,5 @@ py2app>=0.28.0
 alpaca-py>=0.8.0
 flask>=3.0.0
 flask-cors>=4.0.0
+PyJWT>=2.8.0
+httpx[http2]>=0.27.0

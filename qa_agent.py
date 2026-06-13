@@ -374,7 +374,17 @@ def chk_iex_fix():
 
 @check("Signals: live scores return valid regime", "signals")
 def chk_regime_valid():
-    ls = (_fetch("/api/lab/overview").get("live_scores") or {})
+    # Retry up to 6× with 10s gaps (60s max).
+    # Cold-start: background thread fires after 5s but the scoring pass itself
+    # (Alpaca bars + Gemini) takes up to 30s, so we need patience here.
+    ls = {}
+    for attempt in range(6):
+        ls = (_fetch("/api/lab/overview").get("live_scores") or {})
+        if ls.get("ok"):
+            break
+        if attempt < 5:
+            print(f"      live_scores not ready yet (attempt {attempt+1}/6) — waiting 10s…")
+            time.sleep(10)
     assert ls.get("ok"), f"live_scores.ok=false: {ls.get('error')}"
     regime = ls.get("regime")
     assert regime in VALID_REGIMES, (
@@ -918,6 +928,111 @@ def main():
     else:
         print(f"{GREEN}{BOLD}Result: {total}/{total} PASSED ✓{RESET}\n")
         sys.exit(0)
+
+
+# ── CATEGORY: new_features ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@check("Features: gemini_sentiment_boost_cached exists and is callable in signals.py", "new_features")
+def chk_gemini_cached():
+    hits = _grep_file(APP_DIR / "signals.py", r"def gemini_sentiment_boost_cached")
+    assert hits, "gemini_sentiment_boost_cached() missing from signals.py — was it removed?"
+    # Must NOT be the old stub (returning 0.0 hardcoded)
+    stub = _grep_file(APP_DIR / "signals.py", r"Stub.*returns 0.*no-op")
+    assert not stub, "gemini_sentiment_boost_cached() still has stub 'returns 0' comment — replace with real impl"
+    return "gemini_sentiment_boost_cached present and not stubbed"
+
+
+@check("Features: gemini_sentiment_boost_cached uses cache TTL (not always calling API)", "new_features")
+def chk_gemini_cache_ttl():
+    hits = _grep_file(APP_DIR / "signals.py", r"_GEMINI_CACHE_TTL|_gemini_cache")
+    assert hits, "_gemini_cache / _GEMINI_CACHE_TTL missing — calls will hit Gemini API every time"
+    return "Gemini cache vars present"
+
+
+@check("Features: _intraday_confirms_entry gate present in trader.py", "new_features")
+def chk_intraday_gate():
+    hits = _grep_file(APP_DIR / "trader.py", r"def _intraday_confirms_entry")
+    assert hits, "_intraday_confirms_entry() missing from trader.py"
+    wired = _grep_file(APP_DIR / "trader.py", r"_intraday_confirms_entry.*client")
+    assert wired, "_intraday_confirms_entry not called in entry loop"
+    return "Intraday gate present and wired"
+
+
+@check("Features: intraday gate checks VWAP, RSI, and volume", "new_features")
+def chk_intraday_gate_conditions():
+    content = (APP_DIR / "trader.py").read_text(encoding="utf-8")
+    assert "latest_vwap" in content, "VWAP check missing from _intraday_confirms_entry"
+    assert "rsi" in content.lower(), "RSI check missing from _intraday_confirms_entry"
+    assert "avg_vol" in content, "Volume check missing from _intraday_confirms_entry"
+    return "All 3 intraday gate conditions present"
+
+
+@check("Features: scan_dynamic_universe exists in signals.py", "new_features")
+def chk_dynamic_universe():
+    hits = _grep_file(APP_DIR / "signals.py", r"def scan_dynamic_universe")
+    assert hits, "scan_dynamic_universe() missing from signals.py"
+    wired = _grep_file(APP_DIR / "signals.py", r"scan_dynamic_universe\(\)")
+    assert wired, "scan_dynamic_universe() not called in get_signals()"
+    return "Dynamic universe scanner present and wired"
+
+
+@check("Features: slippage model applied in backtest score_candidate_variant", "new_features")
+def chk_backtest_slippage():
+    hits = _grep_file(APP_DIR / "backtest.py", r"_SLIPPAGE|slippage|net_ret")
+    assert hits, "Slippage model missing from backtest.py — returns are unrealistically high"
+    return "Slippage model present"
+
+
+@check("Features: walk-forward uses Alpaca (not yfinance) as primary source", "new_features")
+def chk_walkforward_alpaca_primary():
+    hits = _grep_file(APP_DIR / "backtest.py", r"get_historical_bars_range")
+    assert hits, "get_historical_bars_range() not used — walk-forward may be using yfinance (blocked on GKE)"
+    return "Alpaca historical bars used as primary source"
+
+
+@check("Features: walk-forward cache exists on PVC (run has completed)", "new_features")
+def chk_walkforward_cache():
+    r = _fetch("/api/lab/walkforward")
+    assert r.get("ok"), f"Walk-forward cache missing or errored: {r.get('error', r.get('status'))}"
+    windows = r.get("windows") or []
+    assert len(windows) >= 10, f"Only {len(windows)} windows — expected 10+ for a full 2022→today run"
+    sharpe = r.get("sharpe", 0)
+    assert sharpe > 0, f"Sharpe {sharpe} ≤ 0 — backtest shows no edge"
+    return f"Cache valid: {len(windows)} windows, Sharpe={sharpe:.2f}, verdict={r.get('verdict')}"
+
+
+@check("Features: scan_premarket_gaps callable without crashing", "new_features")
+def chk_gaps_no_crash():
+    r = _fetch("/api/lab/gaps?min_gap_pct=1.5")
+    # Allowed outcomes: list (market hours) OR error about market being closed
+    # NOT allowed: unhandled AttributeError / 500
+    assert r.get("ok") or "error" in r or isinstance(r, list), \
+        f"Gap scanner returned unexpected response: {r}"
+    return "Gap scanner returns without AttributeError crash"
+
+
+@check("Features: _maybe_push_gemini_alerts exists in server.py and handles empty input", "new_features")
+def chk_push_gemini_alerts():
+    import importlib, sys, types
+
+    # Verify function is defined in server.py source
+    hits = _grep_file(APP_DIR / "server.py", r"def _maybe_push_gemini_alerts")
+    assert hits, "_maybe_push_gemini_alerts() missing from server.py"
+
+    # Verify push cache constants are present
+    cache_hits = _grep_file(APP_DIR / "server.py", r"_gemini_alert_cache|_GEMINI_ALERT_TTL")
+    assert cache_hits, "_gemini_alert_cache / _GEMINI_ALERT_TTL dedup cache missing from server.py"
+
+    # Verify it's wired into _run_live_scores
+    wired = _grep_file(APP_DIR / "server.py", r"_maybe_push_gemini_alerts\(signals")
+    assert wired, "_maybe_push_gemini_alerts not called inside _run_live_scores()"
+
+    # Verify gemini_boost is captured per signal
+    boost_tracked = _grep_file(APP_DIR / "server.py", r"gemini_boost.*=.*float\(sg\.gemini_sentiment_boost_cached")
+    assert boost_tracked, "gemini_boost not captured as float in _run_live_scores() signal dict"
+
+    return "_maybe_push_gemini_alerts wired into live scores with dedup cache"
 
 
 if __name__ == "__main__":

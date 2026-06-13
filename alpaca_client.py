@@ -488,3 +488,70 @@ class AlpacaClient:
 
         log.info("get_historical_bars: got bars for %d/%d symbols", len(out), len(clean))
         return out
+
+    def get_historical_bars_range(
+        self,
+        symbols: list[str],
+        start_date: str,
+        end_date: str,
+        timeframe: str = "1day",
+    ) -> dict[str, list[dict]]:
+        """
+        Fetch daily OHLCV bars for an explicit date range.
+        Returns {SYM: [bar_dicts]} — same shape as load_historical_data_yf().
+        Used by run_walk_forward() as a cloud-safe alternative to yfinance.
+        """
+        import datetime as _dt
+        _tf_map = {
+            "1min":  TimeFrame(1,  TimeFrameUnit.Minute),
+            "5min":  TimeFrame(5,  TimeFrameUnit.Minute),
+            "15min": TimeFrame(15, TimeFrameUnit.Minute),
+            "1hour": TimeFrame(1,  TimeFrameUnit.Hour),
+            "1day":  TimeFrame(1,  TimeFrameUnit.Day),
+        }
+        tf = _tf_map.get(timeframe.lower(), TimeFrame(1, TimeFrameUnit.Day))
+        feed = _make_data_feed(config.ALPACA_DATA_FEED)
+
+        def _parse_date(s: str) -> _dt.datetime:
+            d = _dt.datetime.strptime(s[:10], "%Y-%m-%d")
+            return d.replace(tzinfo=_dt.timezone.utc)
+
+        clean = sorted({str(s).upper() for s in (symbols or []) if str(s).strip()})
+        out: dict[str, list[dict]] = {}
+
+        for i in range(0, len(clean), 50):
+            batch = clean[i:i + 50]
+            try:
+                req = StockBarsRequest(
+                    symbol_or_symbols=batch,
+                    timeframe=tf,
+                    start=_parse_date(start_date),
+                    end=_parse_date(end_date),
+                    feed=feed,
+                    adjustment="split",
+                )
+                resp = self.data.get_stock_bars(req)
+                bars_dict = resp.data if hasattr(resp, "data") else (resp if isinstance(resp, dict) else {})
+                for sym, bars in bars_dict.items():
+                    sym = sym.upper()
+                    if not bars:
+                        continue
+                    rows = []
+                    for b in bars:
+                        ts = getattr(b, "timestamp", None)
+                        rows.append({
+                            "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else ts,
+                            "open":   float(getattr(b, "open",   0) or 0),
+                            "high":   float(getattr(b, "high",   0) or 0),
+                            "low":    float(getattr(b, "low",    0) or 0),
+                            "close":  float(getattr(b, "close",  0) or 0),
+                            "volume": float(getattr(b, "volume", 0) or 0),
+                            "vwap":   float(getattr(b, "vwap",   0) or 0),
+                        })
+                    if rows:
+                        out[sym] = rows
+            except Exception as e:
+                log.warning("get_historical_bars_range batch failed (%s): %s", batch, e)
+
+        log.info("get_historical_bars_range: got bars for %d/%d symbols", len(out), len(clean))
+        return out
