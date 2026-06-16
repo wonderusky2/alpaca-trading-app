@@ -248,11 +248,11 @@ input{font:inherit}
       <table id="pos-table">
         <thead>
           <tr>
-            <th>Symbol</th><th>Value</th><th>Weight</th><th>P&amp;L</th><th>Type</th><th>Note</th>
+            <th>Symbol</th><th>Qty</th><th>Value</th><th>Weight</th><th>P&amp;L</th><th>Type</th><th>Note</th>
           </tr>
         </thead>
         <tbody id="pos-body">
-          <tr><td colspan="6" style="color:var(--muted);padding:14px 16px">Loading…</td></tr>
+          <tr><td colspan="7" style="color:var(--muted);padding:14px 16px">Loading…</td></tr>
         </tbody>
       </table>
     </section>
@@ -262,10 +262,6 @@ input{font:inherit}
   <section id="feed">
     <div id="feed-hdr">
       Activity
-      <div id="feed-hdr-right">
-        <button class="feed-action" onclick="openBacktestPanel()">Backtest</button>
-        <button class="feed-action" onclick="runOptionsAutomation()">Run options</button>
-      </div>
     </div>
     <div id="feed-items">
       <div id="feed-inner"></div>
@@ -418,40 +414,70 @@ function renderPositions(data) {
   rtag.className = 'tag '+(rs==='breach'?'bad':rs==='review'?'warn':'good');
 
   if (!allPositions.length) {
-    $('pos-body').innerHTML = '<tr><td colspan="6" style="color:var(--muted);padding:14px 16px">No open positions. System is in cash.</td></tr>';
+    $('pos-body').innerHTML = '<tr><td colspan="7" style="color:var(--muted);padding:14px 16px">No open positions. System is in cash.</td></tr>';
     return;
   }
+
+  // Compute covered call coverage for QQQ
+  const qqqEq = eqPos.find(p => String(p.symbol||'').toUpperCase() === 'QQQ');
+  const qqqShares = qqqEq ? Math.floor(+(qqqEq.qty||qqqEq.quantity||qqqEq.shares||0)) : 0;
+  const qqqLots = Math.floor(qqqShares / 100); // each contract covers 100 shares
+  const coveredCallContracts = optPos.filter(p => {
+    const parsed = parseOptSym(p.symbol);
+    return parsed && parsed.root === 'QQQ' && parsed.type === 'C' && +(p.side||p.qty||0) < 0 // short call = covered call
+        || (parsed && parsed.root === 'QQQ' && parsed.type === 'C'); // include all for now; server tracks side
+  }).reduce((n, p) => n + Math.abs(+(p.qty||p.quantity||p.contracts||1)), 0);
 
   const rows = [];
 
   for (const pos of eqPos) {
     const sym = String(pos.symbol||'?').toUpperCase();
-    const val = +(pos.current_value||0);
+    const qty = +(pos.qty||pos.quantity||pos.shares||pos.num_shares||0);
+    const val = +(pos.current_value||pos.market_value||0);
     const wt = +(pos.current_weight_pct||pos.weight_pct||0);
     const pnl = +(pos.unrealized_pnl||0);
     const pnlPct = +(pos.unrealized_pnl_pct||0);
     const ex = exits[sym];
+    // For QQQ, add coverage note
+    let note = ex ? shortTxt(ex.reason||ex.summary||'Exit candidate',56) : 'Holding';
+    let qtyExtra = '';
+    if (sym === 'QQQ' && qqqLots > 0) {
+      const covered = coveredCallContracts;
+      const uncovered = Math.max(0, qqqLots - covered);
+      qtyExtra = `<div style="font-size:10px;color:var(--muted);margin-top:2px">${qqqLots} lots${covered>0?` · <span style="color:var(--blue)">${covered} covered</span>`:''}</div>`;
+      if (uncovered > 0 && covered > 0) {
+        note = `${uncovered} lot${uncovered>1?'s':''} uncovered — engine will write calls`;
+      } else if (covered === 0 && qqqLots > 0) {
+        note = `${qqqLots} lots, no covered calls yet`;
+      } else if (covered === qqqLots) {
+        note = `All ${qqqLots} lots covered`;
+      }
+    }
+    const qtyStr = qty > 0 ? Math.round(qty).toLocaleString() : '—';
     rows.push(`<tr>
-      <td><div class="sym" onclick="showStockDetail('${sym}')">${sym}</div></td>
+      <td><div class="sym" onclick="showStockDetail('${sym}')">${sym}</div>${qtyExtra}</td>
+      <td class="mono" style="color:var(--muted)">${qtyStr}</td>
       <td class="mono">${fmt$(val)}</td>
       <td class="mono">${wt.toFixed(1)}%</td>
       <td class="mono ${pnl>=0?'pos-green':'pos-red'}">${fmtPnl(pnl)} <span style="font-size:10px;opacity:.7">${fmtPct(pnlPct,2)}</span></td>
       <td><span class="tag good">Stock</span></td>
-      <td style="font-size:11px;color:var(--muted)">${esc(ex?shortTxt(ex.reason||ex.summary||'Exit candidate',56):'Holding')}</td>
+      <td style="font-size:11px;color:var(--muted)">${esc(note)}</td>
     </tr>`);
   }
 
   for (const pos of optPos) {
     const sym = String(pos.symbol||'?').toUpperCase();
+    const qty = Math.abs(+(pos.qty||pos.quantity||pos.contracts||1));
     const val = +(pos.current_value||pos.market_value||0);
     const wt = +(pos.current_weight_pct||pos.weight_pct||0);
     const pnl = +(pos.unrealized_pnl||0);
     const pnlPct = +(pos.unrealized_pnl_pct||0);
     const parsed = parseOptSym(sym);
     const typeTag = parsed ? (parsed.type==='C'?'<span class="tag call">Call</span>':'<span class="tag put">Put</span>') : '<span class="tag">Opt</span>';
-    const note = parsed ? `${parsed.root} $${parsed.strike} exp ${parsed.expiry}` : sym;
+    const note = parsed ? `${parsed.root} $${parsed.strike} · exp ${parsed.expiry}` : sym;
     rows.push(`<tr>
-      <td><div class="sym" style="font-size:12px;cursor:default">${sym}</div></td>
+      <td><div class="sym" style="font-size:11px;cursor:default;letter-spacing:-.01em">${sym}</div></td>
+      <td class="mono" style="color:var(--muted)">${qty} ct</td>
       <td class="mono">${fmt$(val)}</td>
       <td class="mono">${wt>0?wt.toFixed(1)+'%':'—'}</td>
       <td class="mono ${pnl>=0?'pos-green':'pos-red'}">${fmtPnl(pnl)} <span style="font-size:10px;opacity:.7">${fmtPct(pnlPct,2)}</span></td>
