@@ -18,6 +18,7 @@ Endpoints:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -63,6 +64,37 @@ def _save_trader_control(state: dict) -> None:
         log.warning("save trader_control failed: %s", e)
 
 
+def _recent_buy_age_minutes() -> float | None:
+    for row in trade_ledger.recent_trades(limit=50):
+        if str(row.get("side") or "").lower() != "buy":
+            continue
+        try:
+            ts = datetime.fromisoformat(str(row.get("recorded_at")).replace("Z", "+00:00"))
+            return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds() / 60)
+        except Exception:
+            return None
+    return None
+
+
+def _edge_evidence_gate() -> dict:
+    evidence = trade_ledger.edge_summary(limit=500)
+    trades = int(evidence.get("trades") or 0)
+    expectancy = float(evidence.get("expectancy") or 0.0)
+    min_trades = int(config.EDGE_GATE_MIN_CLOSED_TRADES)
+    min_expectancy = float(config.EDGE_GATE_MIN_EXPECTANCY)
+    blocked = bool(trades >= min_trades and expectancy <= min_expectancy)
+    return {
+        "blocked": blocked,
+        "evidence": evidence,
+        "summary": (
+            f"Edge gate is blocking new buys: {trades} closed trades, "
+            f"expectancy ${expectancy:.2f}. Need positive expectancy before adding risk."
+        ) if blocked else (
+            f"Edge evidence: {trades} closed trades, expectancy ${expectancy:.2f}."
+        ),
+    }
+
+
 def _auto_entry_gate() -> dict:
     """Mirror trader.py entry-only gates for honest dashboard/chat explanations."""
     ctrl = _load_trader_control()
@@ -90,8 +122,10 @@ def _auto_entry_gate() -> dict:
     mins = now.hour * 60 + now.minute
     open_mins = trader.MARKET_OPEN_HOUR * 60 + trader.MARKET_OPEN_MIN
     eod_mins = trader.EOD_FLAT_HOUR * 60 + trader.EOD_FLAT_MIN
-    open_until = open_mins + trader.NO_ENTRY_OPEN_MINS
-    eod_block_start = eod_mins - trader.NO_ENTRY_EOD_MINS
+    open_block_mins = int(getattr(trader, "NO_ENTRY_OPEN_MINS", trader.OPENING_WINDOW_MINS))
+    eod_block_mins = int(getattr(trader, "NO_ENTRY_EOD_MINS", 10))
+    open_until = open_mins + open_block_mins
+    eod_block_start = eod_mins - eod_block_mins
 
     def _hhmm(total_mins: int) -> str:
         hour = total_mins // 60
@@ -107,7 +141,7 @@ def _auto_entry_gate() -> dict:
             "next_eligible": _hhmm(open_until),
             "summary": (
                 "Auto entries are blocked during the first "
-                f"{trader.NO_ENTRY_OPEN_MINS} minutes after the open. "
+                f"{open_block_mins} minutes after the open. "
                 f"Next eligible auto-trading tick is after {_hhmm(open_until)}."
             ),
         }
@@ -120,6 +154,27 @@ def _auto_entry_gate() -> dict:
                 f"can flatten before {_hhmm(eod_mins)}."
             ),
         }
+
+    edge_gate = _edge_evidence_gate()
+    if edge_gate.get("blocked"):
+        return {
+            "blocked": True,
+            "reason": "negative_expectancy",
+            "summary": edge_gate["summary"],
+        }
+
+    last_buy_age = _recent_buy_age_minutes()
+    min_gap = int(config.MIN_MINUTES_BETWEEN_BUYS)
+    if last_buy_age is not None and last_buy_age < min_gap:
+        return {
+            "blocked": True,
+            "reason": "entry_rate_limit",
+            "summary": (
+                f"Auto entries are rate-limited. Last buy was {last_buy_age:.0f} minutes ago; "
+                f"need {min_gap} minutes between new buys."
+            ),
+        }
+
     return {
         "blocked": False,
         "reason": "eligible",
@@ -321,6 +376,7 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 LAB_EVENTS_PATH     = STATE_DIR / "lab_events.jsonl"
 LAB_PEAK_EQUITY_PATH = STATE_DIR / "lab_peak_equity.json"
 LAB_EVENT_STATE_PATH  = STATE_DIR / "lab_event_state.json"
+OPTIONS_AUTOMATION_STATE_PATH = STATE_DIR / "options_automation_state.json"
 DASHBOARD_PATH      = Path(__file__).parent / "portfolio_lab.html"
 
 MARKET_HOLIDAYS_2026 = {
@@ -659,6 +715,96 @@ def _live_risk_state(
         "redeploy_gross_threshold_pct": round(redeploy_pct, 2),
         "reentry_allowed":          reentry_ok,
         "reentry_recovery_giveback_pct": round(reentry_pct, 2),
+    }
+
+
+def _benchmark_truth(account: dict, daily_pnl: float | None = None) -> dict:
+    """Compare today's bot P&L with doing the obvious SPY/QQQ beta trade."""
+    equity = float((account or {}).get("equity") or 0)
+    last_equity = float(
+        (account or {}).get("adjusted_last_equity")
+        or (account or {}).get("last_equity")
+        or equity
+        or 0
+    )
+    if daily_pnl is None:
+        daily_pnl = equity - last_equity
+
+    out = {
+        "ok": False,
+        "bot_pnl": round(float(daily_pnl or 0), 2),
+        "base_equity": round(last_equity, 2),
+        "indices": {},
+        "best_symbol": None,
+        "best_index_pnl": 0.0,
+        "bot_vs_best": round(float(daily_pnl or 0), 2),
+        "verdict": "benchmark unavailable",
+    }
+    if last_equity <= 0:
+        return out
+
+    try:
+        snaps = get_client().get_snapshots(["SPY", "QQQ"])
+    except Exception as e:
+        log.debug("benchmark snapshot failed: %s", e)
+        return out
+
+    best_sym = None
+    best_pnl = None
+    for sym in ("SPY", "QQQ"):
+        snap = snaps.get(sym) or {}
+        pct = float(snap.get("change_pct") or 0)
+        bench_pnl = last_equity * pct / 100.0
+        out["indices"][sym] = {
+            "change_pct": round(pct, 2),
+            "pnl_if_100pct": round(bench_pnl, 2),
+            "price": snap.get("price"),
+        }
+        if best_pnl is None or bench_pnl > best_pnl:
+            best_sym = sym
+            best_pnl = bench_pnl
+
+    if best_sym is None or best_pnl is None:
+        return out
+
+    bot_vs_best = float(daily_pnl or 0) - best_pnl
+    out.update({
+        "ok": True,
+        "best_symbol": best_sym,
+        "best_index_pnl": round(best_pnl, 2),
+        "bot_vs_best": round(bot_vs_best, 2),
+        "verdict": "beating benchmark" if bot_vs_best >= 0 else f"lagging {best_sym}",
+    })
+    return out
+
+
+def _market_down_gate_from_benchmark(benchmark: dict | None = None) -> dict:
+    benchmark = benchmark or {}
+    indices = dict(benchmark.get("indices") or {})
+    if not indices:
+        try:
+            snaps = get_client().get_snapshots(["SPY", "QQQ"])
+            indices = {
+                sym: {"change_pct": float((snaps.get(sym) or {}).get("change_pct") or 0)}
+                for sym in ("SPY", "QQQ")
+            }
+        except Exception as e:
+            log.debug("market-down gate snapshot failed: %s", e)
+    spy = float((indices.get("SPY") or {}).get("change_pct") or 0)
+    qqq = float((indices.get("QQQ") or {}).get("change_pct") or 0)
+    threshold = float(config.MARKET_DOWN_BLOCK_PCT)
+    blocked = bool(spy <= threshold and qqq <= threshold)
+    return {
+        "blocked": blocked,
+        "spy_pct": round(spy, 2),
+        "qqq_pct": round(qqq, 2),
+        "threshold_pct": round(threshold, 2),
+        "summary": (
+            f"Market-down protection active: SPY {spy:.2f}%, QQQ {qqq:.2f}%. "
+            "New long buys are blocked; exits/defensive trades only."
+        ) if blocked else (
+            f"Market-down protection clear: SPY {spy:.2f}%, QQQ {qqq:.2f}%."
+        ),
     }
 
 # ── Accounting builder ─────────────────────────────────────────────────────────
@@ -1127,6 +1273,728 @@ def _plain_exit_reason(rec: dict) -> str:
 
 # ── Preview order builder ──────────────────────────────────────────────────────
 _POSITION_SIZE_PCT = 0.05   # 5% of equity per position
+_CORE_BENCHMARKS = {"QQQ", "SPY", "VT", "SQQQ", "PSQ"}
+
+def _is_option_order(order: dict) -> bool:
+    return str((order or {}).get("asset_class") or "").lower() == "option"
+
+def _looks_like_option_symbol(symbol: str) -> bool:
+    s = str(symbol or "").upper().replace(" ", "")
+    return bool(re.match(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$", s))
+
+def _parse_date(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value)[:10]).date()
+    except Exception:
+        return None
+
+def _options_hedge_state(snapshot: dict, live_scores: dict | None = None) -> dict:
+    """Deterministic gate for when QQQ put hedges are appropriate."""
+    account = snapshot.get("account") or {}
+    positions = snapshot.get("positions") or {}
+    accounting = snapshot.get("accounting") or {}
+    benchmark = snapshot.get("benchmark") or {}
+    risk_state = accounting.get("risk_state") or {}
+    market_down = _market_down_gate_from_benchmark(benchmark)
+    regime = str((live_scores or {}).get("regime") or "").upper()
+    qqq_pos = (positions or {}).get(config.OPTIONS_HEDGE_UNDERLYING.upper()) or {}
+    qqq_value = abs(float(qqq_pos.get("market_val") or 0))
+    equity = float(account.get("equity") or 0)
+    protect = risk_state.get("protect_gains") or {}
+    risk_reduction = str(risk_state.get("action") or "") == "reduce_risk"
+    appropriate = bool(
+        qqq_value > 0
+        and (
+            regime == "BEAR"
+            or market_down.get("blocked")
+            or risk_reduction
+            or bool(protect.get("breach"))
+        )
+    )
+    reasons = []
+    if regime == "BEAR":
+        reasons.append("regime is BEAR")
+    if market_down.get("blocked"):
+        reasons.append(market_down.get("summary") or "market-down gate active")
+    if risk_reduction:
+        reasons.append(risk_state.get("message") or "portfolio risk gate says reduce risk")
+    if protect.get("breach"):
+        reasons.append("protect-gains drawdown breached")
+    if not reasons:
+        reasons.append("risk gates are clear")
+    return {
+        "appropriate": appropriate,
+        "regime": regime or "UNKNOWN",
+        "qqq_value": round(qqq_value, 2),
+        "equity": round(equity, 2),
+        "market_down_gate": market_down,
+        "risk_state": risk_state,
+        "reasons": reasons,
+    }
+
+def _build_options_hedge(snapshot: dict, live_scores: dict | None = None) -> dict:
+    if not bool(getattr(config, "OPTIONS_HEDGE_ENABLED", False)):
+        return {"ok": False, "enabled": False, "error": "Options hedge lab is disabled."}
+    client = get_client()
+    state = _options_hedge_state(snapshot, live_scores)
+    capability = client.get_options_capability()
+    out = {
+        "ok": True,
+        "enabled": True,
+        "paper_only": bool(getattr(config, "OPTIONS_HEDGE_PAPER_ONLY", True)),
+        "capability": capability,
+        "state": state,
+        "orders": [],
+        "summary": "",
+    }
+    if not capability.get("enabled"):
+        out["summary"] = "Options are not enabled on this account."
+        return out
+    if not state.get("appropriate"):
+        out["summary"] = "No QQQ put hedge now: risk gates are clear. Prefer no option drag."
+        return out
+
+    underlying = config.OPTIONS_HEDGE_UNDERLYING.upper()
+    snaps = client.get_snapshots([underlying])
+    px = float((snaps.get(underlying) or {}).get("price") or 0)
+    if px <= 0:
+        out["ok"] = False
+        out["summary"] = "Cannot price QQQ; no option hedge candidate."
+        return out
+
+    target_strike = px * (1.0 - float(config.OPTIONS_HEDGE_OTM_PCT))
+    strike_band = max(px * 0.04, 5.0)
+    contracts = client.get_option_put_contracts(
+        underlying,
+        min_dte=int(config.OPTIONS_HEDGE_MIN_DTE),
+        max_dte=int(config.OPTIONS_HEDGE_MAX_DTE),
+        strike_gte=round(target_strike - strike_band, 2),
+        strike_lte=round(target_strike + strike_band, 2),
+        limit=200,
+    )
+    if not contracts:
+        contracts = client.get_option_put_contracts(
+            underlying,
+            min_dte=int(config.OPTIONS_HEDGE_MIN_DTE),
+            max_dte=int(config.OPTIONS_HEDGE_MAX_DTE),
+            strike_gte=round(px * 0.85, 2),
+            strike_lte=round(px * 1.02, 2),
+            limit=200,
+        )
+    if not contracts:
+        out["summary"] = "No active QQQ put contracts found in the configured hedge window."
+        return out
+
+    today = datetime.now(timezone.utc).date()
+    def _rank(c):
+        exp = _parse_date(c.get("expiration_date"))
+        dte = (exp - today).days if exp else 999
+        strike = float(c.get("strike_price") or 0)
+        oi = int(c.get("open_interest") or 0)
+        return (abs(dte - 35), abs(strike - target_strike), -oi)
+
+    ranked = sorted(contracts, key=_rank)[:20]
+    quotes = client.get_option_latest_quotes([c["symbol"] for c in ranked if c.get("symbol")])
+    candidates = []
+    for c in ranked:
+        q = quotes.get(c.get("symbol") or "") or {}
+        ask = float(q.get("ask") or 0)
+        bid = float(q.get("bid") or 0)
+        mid = q.get("mid")
+        if ask <= 0 and mid:
+            ask = float(mid)
+        if ask <= 0:
+            continue
+        exp = _parse_date(c.get("expiration_date"))
+        dte = (exp - today).days if exp else None
+        candidates.append({**c, "quote": q, "ask": ask, "bid": bid, "mid": mid, "dte": dte})
+    if not candidates:
+        out["summary"] = "Found QQQ puts, but no usable option quotes."
+        return out
+
+    best = sorted(candidates, key=lambda c: (abs((c.get("dte") or 999) - 35), abs(float(c.get("strike_price") or 0) - target_strike), float(c.get("ask") or 999)))[0]
+    account = snapshot.get("account") or {}
+    equity = float(account.get("equity") or 0)
+    hedge_value = float(state.get("qqq_value") or 0) * float(config.OPTIONS_HEDGE_NOTIONAL_PCT)
+    strike_notional = float(best.get("strike_price") or 0) * 100.0
+    qty = max(1, int(math.ceil(hedge_value / strike_notional))) if strike_notional > 0 else 0
+    premium = qty * float(best.get("ask") or 0) * 100.0
+    max_premium = equity * float(config.OPTIONS_HEDGE_MAX_PREMIUM_PCT)
+    if premium > max_premium and float(best.get("ask") or 0) > 0:
+        qty = int(max_premium / (float(best.get("ask")) * 100.0))
+        premium = qty * float(best.get("ask") or 0) * 100.0
+    if qty <= 0:
+        out["summary"] = (
+            f"QQQ put hedge is appropriate, but quoted premium exceeds the "
+            f"{float(config.OPTIONS_HEDGE_MAX_PREMIUM_PCT):.1%} equity cap."
+        )
+        out["candidate"] = best
+        return out
+
+    order = {
+        "symbol": best["symbol"],
+        "side": "buy",
+        "qty": qty,
+        "asset_class": "option",
+        "estimated_value": round(premium, 2),
+        "reason": (
+            f"Protective QQQ put hedge: {best.get('expiration_date')} "
+            f"${float(best.get('strike_price') or 0):.0f}P, "
+            f"{float(config.OPTIONS_HEDGE_NOTIONAL_PCT):.0%} of QQQ notional"
+        ),
+        "contract": best,
+        "signal": {"regime": state.get("regime"), "options_hedge": True},
+    }
+    out["candidate"] = best
+    out["orders"] = [order]
+    out["summary"] = (
+        f"QQQ put hedge is appropriate: {', '.join(state.get('reasons') or [])}. "
+        f"Candidate: buy {qty} {best['symbol']} for about ${premium:,.0f}."
+    )
+    return out
+
+def _build_call_income(snapshot: dict, live_scores: dict | None = None) -> dict:
+    """Build a paper-only covered-call income proposal for QQQ."""
+    if not bool(getattr(config, "OPTIONS_CALL_INCOME_ENABLED", False)):
+        return {"ok": False, "enabled": False, "error": "Covered-call income lab is disabled."}
+    client = get_client()
+    capability = client.get_options_capability()
+    account = snapshot.get("account") or {}
+    positions = snapshot.get("positions") or {}
+    accounting = snapshot.get("accounting") or {}
+    benchmark = snapshot.get("benchmark") or {}
+    risk_state = accounting.get("risk_state") or {}
+    market_down = _market_down_gate_from_benchmark(benchmark)
+    regime = str((live_scores or {}).get("regime") or "").upper()
+    underlying = config.OPTIONS_CALL_UNDERLYING.upper()
+    qqq_pos = (positions or {}).get(underlying) or {}
+    qqq_qty = abs(float(qqq_pos.get("qty") or 0))
+    qqq_value = abs(float(qqq_pos.get("market_val") or 0))
+    covered_contracts = int(qqq_qty // 100)
+    overwrite_cap = float(config.OPTIONS_CALL_MAX_OVERWRITE_PCT)
+    max_contracts = int(math.floor(covered_contracts * overwrite_cap))
+    if covered_contracts == 1 and overwrite_cap > 0:
+        max_contracts = 1
+
+    out = {
+        "ok": True,
+        "enabled": True,
+        "paper_only": bool(getattr(config, "OPTIONS_CALL_INCOME_PAPER_ONLY", True)),
+        "capability": capability,
+        "orders": [],
+        "state": {
+            "regime": regime or "UNKNOWN",
+            "qqq_qty": qqq_qty,
+            "qqq_value": round(qqq_value, 2),
+            "covered_contracts": covered_contracts,
+            "max_contracts": max_contracts,
+            "overwrite_cap_pct": round(overwrite_cap * 100.0, 2),
+            "market_down_gate": market_down,
+            "risk_state": risk_state,
+        },
+        "summary": "",
+    }
+    if not capability.get("enabled"):
+        out["summary"] = "Options are not enabled on this account."
+        return out
+    if covered_contracts < 1 or max_contracts < 1:
+        out["summary"] = f"Covered calls need at least 100 QQQ shares. Current QQQ shares: {qqq_qty:.0f}."
+        return out
+    if market_down.get("blocked") or regime == "BEAR" or str(risk_state.get("action") or "") == "reduce_risk":
+        out["summary"] = "No covered calls now: downside/risk gates are active. Use protection or reduce risk instead."
+        return out
+    if regime not in {"CHOPPY", "CHOP"}:
+        out["summary"] = (
+            f"No covered-call income now: regime is {regime or 'UNKNOWN'}. "
+            "Selling calls in BULL can cap the upside you need to catch QQQ."
+        )
+        return out
+
+    snaps = client.get_snapshots([underlying])
+    px = float((snaps.get(underlying) or {}).get("price") or 0)
+    if px <= 0:
+        out["ok"] = False
+        out["summary"] = "Cannot price QQQ; no covered-call candidate."
+        return out
+
+    target_strike = px * (1.0 + float(config.OPTIONS_CALL_OTM_PCT))
+    strike_band = max(px * 0.04, 5.0)
+    contracts = client.get_option_call_contracts(
+        underlying,
+        min_dte=int(config.OPTIONS_CALL_MIN_DTE),
+        max_dte=int(config.OPTIONS_CALL_MAX_DTE),
+        strike_gte=round(target_strike - strike_band, 2),
+        strike_lte=round(target_strike + strike_band, 2),
+        limit=200,
+    )
+    if not contracts:
+        out["summary"] = "No active QQQ call contracts found in the configured income window."
+        return out
+
+    today = datetime.now(timezone.utc).date()
+    def _rank(c):
+        exp = _parse_date(c.get("expiration_date"))
+        dte = (exp - today).days if exp else 999
+        strike = float(c.get("strike_price") or 0)
+        oi = int(c.get("open_interest") or 0)
+        return (abs(dte - 14), abs(strike - target_strike), -oi)
+
+    ranked = sorted(contracts, key=_rank)[:20]
+    quotes = client.get_option_latest_quotes([c["symbol"] for c in ranked if c.get("symbol")])
+    candidates = []
+    for c in ranked:
+        q = quotes.get(c.get("symbol") or "") or {}
+        bid = float(q.get("bid") or 0)
+        ask = float(q.get("ask") or 0)
+        mid = q.get("mid")
+        # For selling calls, bid is conservative. Fall back to mid only if bid is unavailable.
+        sell_px = bid if bid > 0 else float(mid or 0)
+        if sell_px <= 0:
+            continue
+        exp = _parse_date(c.get("expiration_date"))
+        dte = (exp - today).days if exp else None
+        premium_yield = (sell_px / px) if px > 0 else 0
+        if premium_yield < float(config.OPTIONS_CALL_MIN_PREMIUM_PCT):
+            continue
+        candidates.append({**c, "quote": q, "bid": bid, "ask": ask, "mid": mid, "sell_price": sell_px, "dte": dte, "premium_yield": premium_yield})
+    if not candidates:
+        out["summary"] = "Found QQQ calls, but no quote met the minimum premium threshold."
+        return out
+
+    best = sorted(candidates, key=lambda c: (abs((c.get("dte") or 999) - 14), abs(float(c.get("strike_price") or 0) - target_strike), -float(c.get("premium_yield") or 0)))[0]
+    qty = max(1, min(max_contracts, covered_contracts))
+    premium = qty * float(best.get("sell_price") or 0) * 100.0
+    order = {
+        "symbol": best["symbol"],
+        "side": "sell",
+        "qty": qty,
+        "asset_class": "option",
+        "estimated_value": round(premium, 2),
+        "reason": (
+            f"Covered-call income: sell {best.get('expiration_date')} "
+            f"${float(best.get('strike_price') or 0):.0f}C against QQQ shares"
+        ),
+        "contract": best,
+        "underlying": underlying,
+        "covered_call": True,
+        "signal": {"regime": regime, "call_income": True},
+    }
+    out["candidate"] = best
+    out["orders"] = [order]
+    out["summary"] = (
+        f"Covered-call income is eligible in {regime}: sell {qty} {best['symbol']} "
+        f"for about ${premium:,.0f}. Upside is capped above ${float(best.get('strike_price') or 0):.0f}."
+    )
+    return out
+
+
+def _build_call_buy(snapshot: dict, live_scores: dict | None = None) -> dict:
+    """Buy QQQ calls in BULL regime to amplify upside beyond spot QQQ.
+
+    Strategy: slightly-OTM calls (2% OTM, 21-45 DTE) sized so total premium ≤ 5% of equity.
+    Only fires when regime is BULL and no existing call positions are open.
+    Unlike covered-call income (which SELLS calls and caps upside), this BUYS calls
+    to participate in upside moves beyond what the spot QQQ allocation captures.
+    """
+    if not bool(getattr(config, "OPTIONS_CALL_BUY_ENABLED", False)):
+        return {"ok": False, "enabled": False, "error": "Directional call buying is disabled."}
+
+    client = get_client()
+    capability = client.get_options_capability()
+    account = snapshot.get("account") or {}
+    equity = float(account.get("equity") or 0)
+    regime = str((live_scores or {}).get("regime") or "").upper()
+    underlying = str(getattr(config, "OPTIONS_CALL_BUY_UNDERLYING", "QQQ")).upper()
+
+    out = {
+        "ok": True,
+        "enabled": True,
+        "paper_only": bool(getattr(config, "OPTIONS_CALL_BUY_PAPER_ONLY", True)),
+        "capability": capability,
+        "orders": [],
+        "state": {"regime": regime or "UNKNOWN"},
+        "summary": "",
+    }
+
+    if not capability.get("enabled"):
+        out["summary"] = "Options are not enabled on this account."
+        return out
+
+    # Only buy calls in BULL — in CHOPPY/BEAR the premium drag outweighs the benefit
+    if regime != "BULL":
+        out["summary"] = (
+            f"No directional call buys now: regime is {regime or 'UNKNOWN'}. "
+            "Calls are purchased only in confirmed BULL regime to amplify upside."
+        )
+        return out
+
+    # Don't add if we already hold open call contracts on this underlying
+    active_calls = _active_option_symbols(snapshot)
+    existing_call = next(
+        (s for s in active_calls
+         if s.startswith(underlying) and re.search(r"\d{6}C\d", s)),
+        None,
+    )
+    if existing_call:
+        out["summary"] = f"Already hold an open call position ({existing_call}) — no duplicate buy."
+        return out
+
+    snaps = client.get_snapshots([underlying])
+    px = float((snaps.get(underlying) or {}).get("price") or 0)
+    if px <= 0:
+        out["ok"] = False
+        out["summary"] = "Cannot price QQQ; skipping directional call buy."
+        return out
+
+    otm_pct = float(getattr(config, "OPTIONS_CALL_BUY_OTM_PCT", 0.02))
+    target_strike = px * (1.0 + otm_pct)
+    strike_band = max(px * 0.04, 5.0)
+    min_dte = int(getattr(config, "OPTIONS_CALL_BUY_MIN_DTE", 21))
+    max_dte = int(getattr(config, "OPTIONS_CALL_BUY_MAX_DTE", 45))
+
+    contracts = client.get_option_call_contracts(
+        underlying,
+        min_dte=min_dte,
+        max_dte=max_dte,
+        strike_gte=round(target_strike - strike_band, 2),
+        strike_lte=round(target_strike + strike_band, 2),
+        limit=200,
+    )
+    if not contracts:
+        # Widen strike band before giving up
+        contracts = client.get_option_call_contracts(
+            underlying,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            strike_gte=round(px * 0.98, 2),
+            strike_lte=round(px * 1.08, 2),
+            limit=200,
+        )
+    if not contracts:
+        out["summary"] = "No active QQQ call contracts found in the configured buying window."
+        return out
+
+    today = datetime.now(timezone.utc).date()
+    ideal_dte = 35
+
+    def _rank(c):
+        exp = _parse_date(c.get("expiration_date"))
+        dte = (exp - today).days if exp else 999
+        strike = float(c.get("strike_price") or 0)
+        oi = int(c.get("open_interest") or 0)
+        return (abs(dte - ideal_dte), abs(strike - target_strike), -oi)
+
+    ranked = sorted(contracts, key=_rank)[:20]
+    quotes = client.get_option_latest_quotes([c["symbol"] for c in ranked if c.get("symbol")])
+
+    candidates = []
+    for c in ranked:
+        q = quotes.get(c.get("symbol") or "") or {}
+        ask = float(q.get("ask") or 0)
+        mid = q.get("mid")
+        if ask <= 0 and mid:
+            ask = float(mid)
+        if ask <= 0:
+            continue
+        exp = _parse_date(c.get("expiration_date"))
+        dte = (exp - today).days if exp else None
+        candidates.append({**c, "quote": q, "ask": ask, "mid": mid, "dte": dte})
+
+    if not candidates:
+        out["summary"] = "Found QQQ call contracts, but no usable quotes."
+        return out
+
+    best = sorted(
+        candidates,
+        key=lambda c: (
+            abs((c.get("dte") or 999) - ideal_dte),
+            abs(float(c.get("strike_price") or 0) - target_strike),
+            float(c.get("ask") or 999),
+        ),
+    )[0]
+
+    # Size by premium budget: target 3% of equity, hard cap at 5%
+    max_premium = equity * float(getattr(config, "OPTIONS_CALL_BUY_MAX_PREMIUM_PCT", 0.05))
+    ask_per_contract = float(best.get("ask") or 0) * 100.0
+    if ask_per_contract <= 0:
+        out["summary"] = "Call ask price is zero — cannot size the order."
+        return out
+
+    qty = max(1, int(max_premium / ask_per_contract))
+    premium = qty * ask_per_contract
+
+    order = {
+        "symbol": best["symbol"],
+        "side": "buy",
+        "qty": qty,
+        "asset_class": "option",
+        "estimated_value": round(premium, 2),
+        "reason": (
+            f"BULL regime directional call: buy {qty}× {best.get('expiration_date')} "
+            f"${float(best.get('strike_price') or 0):.0f}C "
+            f"({otm_pct:.0%} OTM, {best.get('dte') or '?'} DTE)"
+        ),
+        "contract": best,
+        "signal": {"regime": regime, "call_buy": True},
+    }
+    out["candidate"] = best
+    out["orders"] = [order]
+    out["summary"] = (
+        f"BULL regime: buy {qty}× {best['symbol']} call for ~${premium:,.0f} premium "
+        f"({best.get('dte') or '?'} DTE, ${float(best.get('strike_price') or 0):.0f} strike)."
+    )
+    return out
+
+
+def _snapshot_for_options(live_scores: dict | None = None) -> dict:
+    scores = live_scores if live_scores is not None else (_coordinator.market_news.live_scores(force=False) or {})
+    snap = _coordinator.portfolio.snapshot(live_scores=scores)
+    account = snap.get("account") or {}
+    equity = float(account.get("equity") or 0)
+    last_equity = float(account.get("adjusted_last_equity") or account.get("last_equity") or equity)
+    return {**snap, "benchmark": _benchmark_truth(account, equity - last_equity)}
+
+
+def _options_decision_state(snapshot: dict, live_scores: dict | None = None) -> dict:
+    hedge = _build_options_hedge(snapshot, live_scores)
+    call_income = _build_call_income(snapshot, live_scores)
+    call_buy = _build_call_buy(snapshot, live_scores)
+    hedge_gate = RiskAgent().order_gate(hedge.get("orders") or [], snapshot)
+    call_gate = RiskAgent().order_gate(call_income.get("orders") or [], snapshot)
+    call_buy_gate = RiskAgent().order_gate(call_buy.get("orders") or [], snapshot)
+    regime = str((live_scores or {}).get("regime") or "").upper()
+    return {
+        "ok": bool(hedge.get("ok", True) and call_income.get("ok", True) and call_buy.get("ok", True)),
+        "enabled": bool(
+            getattr(config, "OPTIONS_AUTOMATION_ENABLED", False)
+            and (
+                getattr(config, "OPTIONS_HEDGE_ENABLED", False)
+                or getattr(config, "OPTIONS_CALL_INCOME_ENABLED", False)
+                or getattr(config, "OPTIONS_CALL_BUY_ENABLED", False)
+            )
+        ),
+        "paper_only": True,
+        "submit_orders": bool(getattr(config, "OPTIONS_AUTOMATION_SUBMIT_ORDERS", False)),
+        "interval_seconds": int(getattr(config, "OPTIONS_AUTOMATION_INTERVAL_SECONDS", 900)),
+        "cooldown_seconds": int(getattr(config, "OPTIONS_AUTOMATION_COOLDOWN_SECONDS", 3600)),
+        "regime": regime,
+        "active_strategy": (
+            "call_buy" if regime == "BULL"
+            else "put_hedge" if regime == "BEAR"
+            else "call_income"
+        ),
+        "hedge": {**hedge, "risk_gate": hedge_gate},
+        "call_income": {**call_income, "risk_gate": call_gate},
+        "call_buy": {**call_buy, "risk_gate": call_buy_gate},
+    }
+
+
+def _load_options_automation_state() -> dict:
+    try:
+        data = json.loads(OPTIONS_AUTOMATION_STATE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_options_automation_state(state: dict) -> None:
+    try:
+        OPTIONS_AUTOMATION_STATE_PATH.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+    except Exception as e:
+        log.warning("Could not save options automation state: %s", e)
+
+
+def _active_option_symbols(snapshot: dict) -> set[str]:
+    positions = snapshot.get("positions") or {}
+    open_orders = snapshot.get("open_orders") or []
+    syms = {
+        str(sym).upper()
+        for sym in positions.keys()
+        if _looks_like_option_symbol(str(sym))
+    }
+    syms |= {
+        str(o.get("symbol") or "").upper()
+        for o in open_orders
+        if _looks_like_option_symbol(str(o.get("symbol") or ""))
+    }
+    return {s for s in syms if s}
+
+
+def _option_orders_without_duplicates(orders: list[dict], snapshot: dict) -> tuple[list[dict], list[str]]:
+    active = _active_option_symbols(snapshot)
+    clean = []
+    skipped = []
+    for o in orders or []:
+        sym = str(o.get("symbol") or "").upper()
+        if sym in active:
+            skipped.append(sym)
+            continue
+        clean.append(o)
+    return clean, skipped
+
+
+def _run_options_automation_tick(reason: str = "timer") -> dict:
+    """Evaluate and optionally submit paper QQQ option hedge/income orders."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    state = _load_options_automation_state()
+    base = {
+        "ok": True,
+        "paper_only": True,
+        "reason": reason,
+        "checked_at": now_iso,
+        "action": "none",
+        "summary": "",
+    }
+    if not bool(getattr(config, "OPTIONS_AUTOMATION_ENABLED", False)):
+        base["summary"] = "Options automation disabled."
+        return base
+    if not config.PAPER:
+        base["action"] = "blocked"
+        base["summary"] = "Options automation is paper-only."
+        _append_event("options_automation_blocked", base)
+        return base
+
+    client = get_client()
+    scores = _coordinator.market_news.live_scores(force=False) or {}
+    snap = _snapshot_for_options(scores)
+    clock = snap.get("clock") or client.get_clock()
+    if not bool(clock.get("is_open")):
+        base["action"] = "closed"
+        base["summary"] = "Options automation checked: market closed."
+        _append_event("options_automation_checked", base)
+        return base
+
+    cooldown = int(getattr(config, "OPTIONS_AUTOMATION_COOLDOWN_SECONDS", 3600))
+    last_action_ts = float(state.get("last_action_ts") or 0)
+    if last_action_ts and (time.time() - last_action_ts) < cooldown:
+        remaining = int((cooldown - (time.time() - last_action_ts)) / 60)
+        base["action"] = "cooldown"
+        base["summary"] = f"Options automation checked: cooldown active, about {max(1, remaining)} min left."
+        _append_event("options_automation_checked", base)
+        return base
+
+    decision = _options_decision_state(snap, scores)
+    regime = str((scores or {}).get("regime") or "").upper()
+    # Candidate priority is regime-driven:
+    #   BULL  → buy calls first (amplify upside), then income as fallback
+    #   BEAR  → protective puts only
+    #   CHOPPY → covered-call income (collect premium, no directional bias)
+    if regime == "BULL":
+        candidates = [
+            ("call_buy",    decision.get("call_buy") or {}),
+            ("call_income", decision.get("call_income") or {}),
+        ]
+    elif regime == "BEAR":
+        candidates = [
+            ("put_hedge", decision.get("hedge") or {}),
+        ]
+    else:
+        candidates = [
+            ("call_income", decision.get("call_income") or {}),
+            ("put_hedge",   decision.get("hedge") or {}),
+        ]
+    for mode, block in candidates:
+        orders = block.get("orders") or []
+        gate = block.get("risk_gate") or {}
+        if not orders:
+            continue
+        orders, skipped = _option_orders_without_duplicates(orders, snap)
+        if skipped:
+            _append_event("options_automation_checked", {
+                **base,
+                "action": "duplicate_skip",
+                "mode": mode,
+                "summary": f"Options automation skipped duplicate active contract(s): {', '.join(skipped)}.",
+                "skipped": skipped,
+            })
+        if not orders:
+            continue
+        if not gate.get("ok"):
+            payload = {
+                **base,
+                "action": "blocked",
+                "mode": mode,
+                "summary": "; ".join(str(e.get("error") or e) for e in gate.get("errors") or []) or "Risk gate blocked options order.",
+                "orders": orders,
+                "risk_gate": gate,
+            }
+            _append_event("options_automation_blocked", payload)
+            return payload
+        if not bool(getattr(config, "OPTIONS_AUTOMATION_SUBMIT_ORDERS", False)):
+            payload = {
+                **base,
+                "action": "proposed",
+                "mode": mode,
+                "summary": block.get("summary") or f"Options automation found {mode} candidate.",
+                "orders": orders,
+            }
+            _append_event("options_automation_proposed", payload)
+            return payload
+
+        result = _coordinator.trading.place(orders, snap)
+        submitted = result.get("submitted") or []
+        errors = result.get("errors") or []
+        payload = {
+            **base,
+            "action": "submitted" if submitted else "failed",
+            "mode": mode,
+            "summary": block.get("summary") or f"Options automation submitted {len(submitted)} order(s).",
+            "orders": orders,
+            "submitted": submitted,
+            "errors": errors,
+            "risk_gate": result.get("risk_gate") or gate,
+        }
+        if submitted:
+            state.update({
+                "last_action_ts": time.time(),
+                "last_action_at": now_iso,
+                "last_mode": mode,
+                "last_summary": payload["summary"],
+                "last_symbols": [o.get("symbol") for o in submitted],
+            })
+            _save_options_automation_state(state)
+            _append_event("options_automation_submitted", payload)
+            _overview_cache["data"] = None
+        else:
+            _append_event("options_automation_failed", payload)
+        return payload
+
+    summary = (
+        (decision.get("hedge") or {}).get("summary")
+        or (decision.get("call_income") or {}).get("summary")
+        or "Options automation checked: no option action."
+    )
+    payload = {
+        **base,
+        "action": "checked",
+        "summary": summary,
+        "regime": (scores or {}).get("regime"),
+        "hedge_summary": (decision.get("hedge") or {}).get("summary"),
+        "call_income_summary": (decision.get("call_income") or {}).get("summary"),
+    }
+    state.update({"last_check_at": now_iso, "last_check_summary": summary})
+    _save_options_automation_state(state)
+    _append_event("options_automation_checked", payload)
+    return payload
+
+
+def _options_automation_loop() -> None:
+    time.sleep(12)
+    log.info("options automation loop started")
+    while True:
+        interval = int(getattr(config, "OPTIONS_AUTOMATION_INTERVAL_SECONDS", 900))
+        try:
+            _run_options_automation_tick("timer")
+        except Exception as e:
+            log.error("options automation loop error: %s", e, exc_info=True)
+            _append_event("options_automation_error", {
+                "summary": f"Options automation error: {e}",
+                "error": str(e),
+            })
+        time.sleep(max(60, interval))
+
 
 def _build_preview_orders(
     plan_type: str,
@@ -1140,7 +2008,7 @@ def _build_preview_orders(
     cash   = float((account or {}).get("cash") or 0)
     model = strategy_model.sanitize_model(model or strategy_model.load_model())
     min_conviction = int(model["min_conviction"])
-    position_size_pct = float(model["position_size_pct"])
+    position_size_pct = min(float(model["position_size_pct"]), float(config.MAX_POSITION_SIZE_PCT))
 
     if plan_type == "custom" and custom_orders:
         return [
@@ -1171,8 +2039,76 @@ def _build_preview_orders(
             })
         return orders
 
+    if plan_type in {"benchmark_core", "core", "index_core"}:
+        sym = str(((custom_orders or [{}])[0] if custom_orders else {}).get("symbol") or config.CORE_BENCHMARK_SYMBOL).upper()
+        if sym not in _CORE_BENCHMARKS:
+            sym = config.CORE_BENCHMARK_SYMBOL
+        target_pct = float(((custom_orders or [{}])[0] if custom_orders else {}).get("target_pct") or config.CORE_BENCHMARK_TARGET_PCT)
+        target_pct = max(0.05, min(target_pct, float(config.CORE_BENCHMARK_MAX_PCT)))
+        orders: list[dict] = []
+        sell_value = 0.0
+        if bool(getattr(config, "CORE_TRIM_SATELLITES_ENABLED", False)):
+            for held_sym, pos in (broker_positions or {}).items():
+                held_sym = str(held_sym or "").upper()
+                if held_sym in _CORE_BENCHMARKS:
+                    continue
+                qty = int(abs(float(pos.get("qty") or 0)))
+                value = abs(float(pos.get("market_val") or 0))
+                if qty <= 0 or value <= 0:
+                    continue
+                sell_value += value
+                orders.append({
+                    "symbol": held_sym,
+                    "side": "sell",
+                    "qty": qty,
+                    "estimated_value": round(value, 2),
+                    "reason": f"Rotate satellite capital into {sym} core",
+                    "score": None,
+                    "signal": {"regime": (live_scores or {}).get("regime"), "core_funding": True},
+                    "model_generation": model.get("generation"),
+                })
+        current_value = float(((broker_positions or {}).get(sym) or {}).get("market_val") or 0)
+        target_value = equity * target_pct
+        add_value = max(0.0, target_value - current_value)
+        buying_power = float(account.get("buying_power") or cash or 0)
+        usable_funding = max(cash + sell_value * 0.98, buying_power)
+        if add_value <= max(100.0, equity * 0.005) and not orders:
+            return []
+        try:
+            snap = get_client().get_snapshots([sym]).get(sym) or {}
+            price = float(snap.get("price") or 0)
+        except Exception:
+            price = 0.0
+        if price <= 0:
+            return orders
+        order_value = min(add_value, usable_funding * 0.95)
+        qty = int(order_value / price)
+        if qty <= 0:
+            return orders
+        cost = qty * price
+        if qty > 0:
+            orders.append({
+                "symbol": sym,
+                "side": "buy",
+                "qty": qty,
+                "estimated_value": round(cost, 2),
+                "reason": (
+                    f"Benchmark core allocation to {sym} "
+                    f"({current_value / equity:.0%} -> {target_pct:.0%} target)"
+                ),
+                "score": None,
+                "signal": {"regime": (live_scores or {}).get("regime"), "core_benchmark": True},
+                "model_generation": model.get("generation"),
+            })
+        return orders
+
     # build — use live scores if available, else run them now
+    if not bool(getattr(config, "SATELLITE_TRADING_ENABLED", False)):
+        return []
+
     scores = live_scores if (live_scores and live_scores.get("ok")) else _run_live_scores()
+    if str((scores or {}).get("regime") or "").upper() in ("CHOPPY", "CHOP"):
+        min_conviction = max(min_conviction, int(config.CHOPPY_ENTRY_MIN_SCORE))
     orders = []
     deployed_cash = 0.0
 
@@ -1206,9 +2142,12 @@ def _build_preview_orders(
             "estimated_value": round(cost, 2),
             "reason":          _plain_entry_reason(sig),
             "score":           sig["score"],
+            "signal":          {"regime": (scores or {}).get("regime")},
             "news":            (sig.get("news") or [])[:2],
             "model_generation": model.get("generation"),
         })
+        if len(orders) >= int(config.MAX_NEW_ENTRIES_PER_TICK):
+            break
 
     return orders
 
@@ -1305,10 +2244,31 @@ class RiskAgent:
             if side not in {"buy", "sell"}:
                 errors.append({"symbol": sym, "error": f"Unsupported side: {side}"})
 
-        if buys and not bool(clock.get("is_open")):
+        option_orders = [o for o in orders if _is_option_order(o)]
+        if option_orders and not bool(clock.get("is_open")):
+            errors.append({"error": "Options orders are blocked while market is closed."})
+        elif buys and not bool(clock.get("is_open")):
             errors.append({"error": "Market is closed. Buy orders are blocked."})
 
-        if buys and risk_state.get("action") == "reduce_risk":
+        for o in option_orders:
+            side = str(o.get("side") or "buy").lower()
+            if side == "sell":
+                underlying = str(o.get("underlying") or getattr(config, "OPTIONS_CALL_UNDERLYING", "QQQ")).upper()
+                qty = int(float(o.get("qty") or 0))
+                required_shares = qty * 100
+                held_shares = abs(float(((positions or {}).get(underlying) or {}).get("qty") or 0))
+                if not o.get("covered_call"):
+                    errors.append({
+                        "symbol": str(o.get("symbol") or "").upper(),
+                        "error": "Option sells must be explicitly marked as covered-call orders.",
+                    })
+                elif held_shares < required_shares:
+                    errors.append({
+                        "symbol": str(o.get("symbol") or "").upper(),
+                        "error": f"Covered call requires {required_shares} {underlying} shares; account has {held_shares:.0f}.",
+                    })
+
+        if any(not _is_option_order(o) for o in buys) and risk_state.get("action") == "reduce_risk":
             errors.append({"error": risk_state.get("message") or "Risk breach blocks new buy orders."})
 
         current_symbols = {str(s).upper() for s in (positions or {}).keys()}
@@ -1317,16 +2277,96 @@ class RiskAgent:
             for o in buys
             if str(o.get("symbol") or "").upper() not in current_symbols
         }
-        max_positions = int(model["max_positions"])
-        if len(current_symbols | new_buy_symbols) > max_positions:
+
+        if buys:
+            edge_gate = _edge_evidence_gate()
+            stock_buys = [o for o in buys if not _is_option_order(o)]
+            if stock_buys and edge_gate.get("blocked"):
+                errors.append({"error": edge_gate["summary"]})
+
+            market_down_gate = _market_down_gate_from_benchmark(snapshot.get("benchmark") or {})
+            long_buys = [
+                o for o in buys
+                if not _is_option_order(o)
+                and str(o.get("symbol") or "").upper() not in sg.BEAR_ETF
+            ]
+            if long_buys and market_down_gate.get("blocked"):
+                errors.append({"error": market_down_gate["summary"]})
+
+            last_buy_age = _recent_buy_age_minutes()
+            min_gap = int(config.MIN_MINUTES_BETWEEN_BUYS)
+            new_stock_buy_symbols = {
+                str(o.get("symbol") or "").upper()
+                for o in buys
+                if not _is_option_order(o)
+                and str(o.get("symbol") or "").upper() not in current_symbols
+            }
+            if new_stock_buy_symbols and last_buy_age is not None and last_buy_age < min_gap:
+                errors.append({
+                    "error": (
+                        f"Entry rate limit: last buy was {last_buy_age:.0f} minutes ago; "
+                        f"need {min_gap} minutes between new buys."
+                    )
+                })
+
+            choppy_floor = int(config.CHOPPY_ENTRY_MIN_SCORE)
+            for o in buys:
+                score = o.get("score")
+                if score is not None and int(float(score or 0)) < choppy_floor:
+                    regime = str(((o.get("signal") or {}).get("regime")) or "").upper()
+                    reason = str(o.get("reason") or "").lower()
+                    if "choppy" in reason or regime in ("CHOPPY", "CHOP"):
+                        errors.append({
+                            "symbol": str(o.get("symbol") or "").upper(),
+                            "error": f"CHOPPY entries require score >= {choppy_floor}.",
+                        })
+
+        max_positions = min(int(model["max_positions"]), int(config.MAX_AUTONOMOUS_POSITIONS))
+        counted_symbols = {
+            s for s in (current_symbols | new_buy_symbols)
+            if s not in _CORE_BENCHMARKS
+            and not _looks_like_option_symbol(s)
+        }
+        if len(counted_symbols) > max_positions:
             errors.append({
-                "error": f"Max positions would be exceeded ({len(current_symbols | new_buy_symbols)}/{max_positions})."
+                "error": f"Max satellite positions would be exceeded ({len(counted_symbols)}/{max_positions})."
             })
 
         cash = float(account.get("cash") or 0)
-        estimated_buy_value = sum(float(o.get("estimated_value") or 0) for o in buys)
-        if estimated_buy_value > cash * 0.98:
+        buying_power = float(account.get("buying_power") or cash or 0)
+        estimated_sell_value = sum(float(o.get("estimated_value") or 0) for o in sells)
+        cash_buffer = (cash + estimated_sell_value) * 0.98
+        core_benchmark_buys = [
+            o for o in buys
+            if (
+                not _is_option_order(o)
+                and str(o.get("symbol") or "").upper() in _CORE_BENCHMARKS
+                and bool((o.get("signal") or {}).get("core_benchmark"))
+            )
+        ]
+        other_buys = [o for o in buys if o not in core_benchmark_buys]
+        estimated_other_buy_value = sum(float(o.get("estimated_value") or 0) for o in other_buys)
+        estimated_core_buy_value = sum(float(o.get("estimated_value") or 0) for o in core_benchmark_buys)
+        if estimated_other_buy_value > cash_buffer:
             errors.append({"error": "Buy orders exceed available cash buffer."})
+        if estimated_core_buy_value > buying_power * 0.98:
+            errors.append({"error": "Core rebalance exceeds available buying power."})
+
+        equity = float(account.get("equity") or 0)
+        if buys and equity > 0:
+            for o in buys:
+                value = float(o.get("estimated_value") or 0)
+                sym = str(o.get("symbol") or "").upper()
+                if _is_option_order(o):
+                    cap_pct = float(config.OPTIONS_HEDGE_MAX_PREMIUM_PCT)
+                else:
+                    cap_pct = float(config.CORE_BENCHMARK_MAX_PCT) if sym in _CORE_BENCHMARKS else float(config.MAX_POSITION_SIZE_PCT)
+                max_order_value = equity * cap_pct
+                if value > max_order_value * 1.02:
+                    errors.append({
+                        "symbol": sym,
+                        "error": f"Order exceeds {cap_pct:.1%} per-position cap.",
+                    })
 
         if sells and not buys:
             warnings.append("Sell-only order set allowed even when risk is elevated.")
@@ -1344,6 +2384,11 @@ class TradingAgent:
     """Owns order previews and Alpaca submission."""
 
     def preview(self, plan_type: str, custom_orders: list[dict] | None, snapshot: dict, live_scores: dict | None) -> dict:
+        if "benchmark" not in snapshot:
+            account = snapshot.get("account") or {}
+            equity = float(account.get("equity") or 0)
+            last_equity = float(account.get("adjusted_last_equity") or account.get("last_equity") or equity)
+            snapshot = {**snapshot, "benchmark": _benchmark_truth(account, equity - last_equity)}
         orders = _build_preview_orders(
             plan_type,
             snapshot.get("account") or {},
@@ -1360,6 +2405,11 @@ class TradingAgent:
         }
 
     def place(self, orders: list[dict], snapshot: dict) -> dict:
+        if "benchmark" not in snapshot:
+            account = snapshot.get("account") or {}
+            equity = float(account.get("equity") or 0)
+            last_equity = float(account.get("adjusted_last_equity") or account.get("last_equity") or equity)
+            snapshot = {**snapshot, "benchmark": _benchmark_truth(account, equity - last_equity)}
         gate = RiskAgent().order_gate(orders, snapshot)
         if not gate.get("ok"):
             _append_event("orders_blocked_by_risk", {"orders": orders, "gate": gate})
@@ -1376,7 +2426,10 @@ class TradingAgent:
                 errors.append({"symbol": sym, "error": "Invalid symbol or qty"})
                 continue
             try:
-                result = client.place_market_order(sym, qty, side)
+                if _is_option_order(o):
+                    result = client.place_option_market_order(sym, qty, side)
+                else:
+                    result = client.place_market_order(sym, qty, side)
                 submitted.append({**o, **result})
             except Exception as e:
                 errors.append({"symbol": sym, "qty": qty, "side": side, "error": str(e)})
@@ -1562,18 +2615,40 @@ class DecisionCoordinator:
         except Exception as _ev_err:
             log.error("event detection error: %s", _ev_err, exc_info=True)
         narrative = _portfolio_narrative(accounting, live_scores, news_risk, model, decision)
+        account = snap.get("account") or {}
+        equity = float(account.get("equity") or 0)
+        last_equity = float(account.get("adjusted_last_equity") or account.get("last_equity") or equity)
+        benchmark = _benchmark_truth(account, equity - last_equity)
+        market_down_gate = _market_down_gate_from_benchmark(benchmark)
+        options_snapshot = {**snap, "benchmark": benchmark}
+        try:
+            options_state = {
+                **_options_decision_state(options_snapshot, live_scores),
+                "automation_state": _load_options_automation_state(),
+            }
+        except Exception as _opt_err:
+            log.warning("options state build failed: %s", _opt_err)
+            options_state = {
+                "ok": False,
+                "enabled": bool(getattr(config, "OPTIONS_AUTOMATION_ENABLED", False)),
+                "error": str(_opt_err),
+                "automation_state": _load_options_automation_state(),
+            }
         combined_scores = dict(live_scores or {})
         combined_scores["held_scores"] = held_scores
         return {
             "ok": True,
             "paper": config.PAPER,
-            "account": snap.get("account"),
+            "account": account,
             "clock": snap.get("clock"),
             "accounting": accounting,
+            "benchmark": benchmark,
+            "market_down_gate": market_down_gate,
             "live_scores": combined_scores,
             "news_risk": news_risk,
             "market_sentiment": None,
             "portfolio_narrative": narrative,
+            "options": options_state,
             "decision": decision,
             "agents": _agent_status(decision, accounting, live_scores),
             "model": model,
@@ -1682,6 +2757,7 @@ def _portfolio_narrative(
     top_scores     = [int(float(s.get("score") or 0)) for s in top if s.get("score")]
     avg_score      = sum(top_scores) // len(top_scores) if top_scores else 0
     min_conviction = int(model.get("min_conviction") or 75)
+    choppy_min     = max(min_conviction, int(config.CHOPPY_ENTRY_MIN_SCORE))
 
     sentiment_from = prev_regime.lower() if prev_regime and prev_regime != regime else "market"
     sentiment_to   = regime.lower() if regime != "UNKNOWN" else "unclear"
@@ -1762,9 +2838,9 @@ def _portfolio_narrative(
             else:
                 next_actions.append(f"Bear regime. Watching for SQQQ/SPXS/UVXY to score ≥ {min_conviction}.")
         elif regime in ("CHOPPY", "CHOP") and pos_count > 0:
-            next_actions.append(f"Market is choppy — system enters at 50% position size when signals score ≥ {min_conviction}.")
+            next_actions.append(f"Market is choppy — no new entries unless conviction is exceptional (score ≥ {choppy_min}).")
         elif regime in ("CHOPPY", "CHOP"):
-            next_actions.append(f"Market is choppy — scanner active. System enters at 50% size when conviction ≥ {min_conviction}.")
+            next_actions.append(f"Market is choppy — scanner active, but entries require score ≥ {choppy_min}.")
         else:
             next_actions.append("Waiting for market data before making a call.")
 
@@ -2266,7 +3342,9 @@ def api_lab_backtest():
 
 
 _WALKFORWARD_CACHE_PATH = strategy_model.STATE_DIR / "walkforward_cache.json"
+_CORE_BACKTEST_CACHE_PATH = strategy_model.STATE_DIR / "core_backtest_cache.json"
 _walkforward_running    = False
+_core_backtest_running   = False
 
 
 @app.route("/api/lab/walkforward", methods=["GET", "POST"])
@@ -2287,6 +3365,8 @@ def api_lab_walkforward():
         if _WALKFORWARD_CACHE_PATH.exists():
             try:
                 data = json.loads(_WALKFORWARD_CACHE_PATH.read_text(encoding="utf-8"))
+                if int(data.get("backtest_engine_version") or 0) < 2:
+                    return jsonify({"ok": False, "status": "stale", "message": "Walk-forward cache uses the old validation engine. Re-run required."})
                 data["status"] = "done"
                 return jsonify(data)
             except Exception:
@@ -2335,6 +3415,67 @@ def api_lab_walkforward():
     t.start()
     return jsonify({"ok": True, "status": "running",
                     "message": f"Walk-forward started ({start_date} → today, {window_months}M windows). Poll GET in ~60s."})
+
+
+@app.route("/api/lab/core-backtest", methods=["GET", "POST"])
+@require_api_key
+def api_lab_core_backtest():
+    """QQQ regime-core backtest endpoint.
+
+    GET  — return cached result.
+    POST — run async backtest from start_date to today.
+    """
+    global _core_backtest_running
+
+    if request.method == "GET":
+        if _core_backtest_running:
+            return jsonify({"ok": True, "status": "running"})
+        if _CORE_BACKTEST_CACHE_PATH.exists():
+            try:
+                data = json.loads(_CORE_BACKTEST_CACHE_PATH.read_text(encoding="utf-8"))
+                data["status"] = "done"
+                return jsonify(data)
+            except Exception:
+                pass
+        return jsonify({"ok": False, "status": "not_run"})
+
+    if _core_backtest_running:
+        return jsonify({"ok": True, "status": "running", "message": "Already running — check back in ~60s."})
+
+    body = request.get_json(silent=True) or {}
+    start_date = str(body.get("start_date") or "2022-01-01")
+
+    import threading
+
+    def _run():
+        global _core_backtest_running
+        _core_backtest_running = True
+        try:
+            result = bt.run_core_regime_backtest(start_date=start_date)
+            strategy_model.STATE_DIR.mkdir(parents=True, exist_ok=True)
+            _CORE_BACKTEST_CACHE_PATH.write_text(
+                json.dumps(result, indent=2, default=str),
+                encoding="utf-8",
+            )
+            log.info(
+                "Core backtest complete: strategy=%s benchmark=%s verdict=%s",
+                result.get("strategy_return_pct"), result.get("benchmark_return_pct"), result.get("verdict"),
+            )
+        except Exception as e:
+            log.error("Core backtest failed: %s", e, exc_info=True)
+            try:
+                _CORE_BACKTEST_CACHE_PATH.write_text(
+                    json.dumps({"ok": False, "error": str(e)}, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        finally:
+            _core_backtest_running = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "status": "running",
+                    "message": f"QQQ regime-core backtest started ({start_date} → today). Poll GET in ~60s."})
 
 
 @app.route("/api/lab/variants")
@@ -2445,6 +3586,62 @@ def api_lab_orders_preview():
         })
     except Exception as e:
         log.error("preview error: %s", e, exc_info=True)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/lab/options/hedge", methods=["GET", "POST"])
+@require_api_key
+def api_lab_options_hedge():
+    """Return paper-only QQQ put hedge state and candidate order."""
+    try:
+        scores = _coordinator.market_news.live_scores(force=False) or {}
+        snap = _coordinator.portfolio.snapshot(live_scores=scores)
+        account = snap.get("account") or {}
+        equity = float(account.get("equity") or 0)
+        last_equity = float(account.get("adjusted_last_equity") or account.get("last_equity") or equity)
+        snap = {**snap, "benchmark": _benchmark_truth(account, equity - last_equity)}
+        hedge = _build_options_hedge(snap, scores)
+        gate = RiskAgent().order_gate(hedge.get("orders") or [], snap)
+        return jsonify({**hedge, "risk_gate": gate})
+    except Exception as e:
+        log.error("options hedge error: %s", e, exc_info=True)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/lab/options/call-income", methods=["GET", "POST"])
+@require_api_key
+def api_lab_options_call_income():
+    """Return paper-only QQQ covered-call income state and candidate order."""
+    try:
+        scores = _coordinator.market_news.live_scores(force=False) or {}
+        snap = _coordinator.portfolio.snapshot(live_scores=scores)
+        account = snap.get("account") or {}
+        equity = float(account.get("equity") or 0)
+        last_equity = float(account.get("adjusted_last_equity") or account.get("last_equity") or equity)
+        snap = {**snap, "benchmark": _benchmark_truth(account, equity - last_equity)}
+        income = _build_call_income(snap, scores)
+        gate = RiskAgent().order_gate(income.get("orders") or [], snap)
+        return jsonify({**income, "risk_gate": gate})
+    except Exception as e:
+        log.error("options call income error: %s", e, exc_info=True)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/lab/options/automation", methods=["GET", "POST"])
+@require_api_key
+def api_lab_options_automation():
+    """Return options automation state or run one immediate paper-only tick."""
+    try:
+        if request.method == "POST":
+            result = _run_options_automation_tick("manual")
+            _overview_cache["data"] = None
+            return jsonify(result)
+        scores = _coordinator.market_news.live_scores(force=False) or {}
+        snap = _snapshot_for_options(scores)
+        decision = _options_decision_state(snap, scores)
+        return jsonify({**decision, "automation_state": _load_options_automation_state()})
+    except Exception as e:
+        log.error("options automation endpoint error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -2653,6 +3850,7 @@ def api_lab_chat_message():
                      _flt(acct_snap, "last_equity", equity))
     cash      = _flt(acct_snap, "cash")
     daily_pnl = equity - last_eq
+    benchmark_snap = (cache_snap.get("benchmark") or _benchmark_truth(acct_snap, daily_pnl))
 
     positions = acctg_snap.get("positions") or []
     pos_lines = []
@@ -2720,6 +3918,59 @@ def api_lab_chat_message():
         if int(float(s.get("score") or 0)) >= int(model_state.get("min_conviction", 75))
         and str(s.get("symbol") or "").upper() not in held_symbols
     ]
+
+    option_hedge_keywords = {
+        "option hedge", "options hedge", "qqq put", "qqq puts", "protective put",
+        "put hedge", "hedge with options", "buy puts", "automatic hedge",
+        "automated hedge", "auto hedge", "hedge qqq", "hedge qqq with options",
+        "how would you hedge qqq", "should qqq be hedged", "hedged right now",
+    }
+    call_income_keywords = {
+        "covered call", "covered calls", "sell call", "sell calls", "call income",
+        "income mode", "juice returns", "overwrite", "covered-call income",
+        "sell qqq call", "sell qqq calls", "qqq call income",
+    }
+    if any(k in text_low for k in call_income_keywords):
+        try:
+            snap_for_income = trade_snap
+            if "benchmark" not in snap_for_income:
+                snap_for_income = {**snap_for_income, "benchmark": benchmark_snap}
+            income = _build_call_income(snap_for_income, scores_snap)
+            orders = income.get("orders") or []
+            if orders:
+                return jsonify({"ok": True, "trade_proposal": {
+                    "orders": orders,
+                    "summary": income.get("summary") or "Paper-only QQQ covered-call proposal.",
+                    "context": (
+                        (income.get("summary") or "")
+                        + " This is paper-only, covered-call only, and caps upside above the selected strike."
+                    ),
+                }})
+            return jsonify({"ok": True, "reply": income.get("summary") or "No covered-call candidate right now."})
+        except Exception as e:
+            log.warning("covered-call chat failed: %s", e, exc_info=True)
+            return jsonify({"ok": True, "reply": f"Covered-call check failed: {e}"})
+
+    if any(k in text_low for k in option_hedge_keywords):
+        try:
+            snap_for_hedge = trade_snap
+            if "benchmark" not in snap_for_hedge:
+                snap_for_hedge = {**snap_for_hedge, "benchmark": benchmark_snap}
+            hedge = _build_options_hedge(snap_for_hedge, scores_snap)
+            orders = hedge.get("orders") or []
+            if orders:
+                return jsonify({"ok": True, "trade_proposal": {
+                    "orders": orders,
+                    "summary": hedge.get("summary") or "Paper-only QQQ put hedge proposal.",
+                    "context": (
+                        (hedge.get("summary") or "")
+                        + " This is paper-only; live options automation is not enabled."
+                    ),
+                }})
+            return jsonify({"ok": True, "reply": hedge.get("summary") or "No options hedge candidate right now."})
+        except Exception as e:
+            log.warning("options hedge chat failed: %s", e, exc_info=True)
+            return jsonify({"ok": True, "reply": f"Options hedge check failed: {e}"})
 
     # Walk-forward backtest shortcut
     wf_keywords = {"walk-forward", "walk forward", "walkforward", "run backtest", "run walk"}
@@ -2881,6 +4132,45 @@ def api_lab_chat_message():
             "orders": orders,
             "summary": f"Close all {len(orders)} position(s) — paper trade only",
         }})
+
+    # ── Fast-path: QQQ core rebalance intent ─────────────────────────────────
+    rebalance_keywords = {
+        "rebalance qqq", "rebalance qqq core", "rebalance core", "rebalance benchmark",
+        "build benchmark core allocation", "build benchmark core allocation in qqq",
+        "build qqq core", "qqq core allocation", "benchmark core allocation",
+    }
+    if any(k in text_low for k in rebalance_keywords):
+        preview = _coordinator.trading.preview("benchmark_core", None, trade_snap, scores_snap)
+        orders = preview.get("orders") or []
+        gate = preview.get("risk_gate") or {}
+        if not orders:
+            acctg = trade_snap.get("accounting") or {}
+            gross = float(acctg.get("gross_exposure_pct") or 0)
+            return jsonify({
+                "ok": True,
+                "reply": (
+                    f"QQQ core is already near target. Gross exposure is {gross:.1f}%. "
+                    "No rebalance order is needed right now."
+                ),
+            })
+        if not gate.get("ok"):
+            err = (gate.get("errors") or [{}])[0].get("error") or "Risk gate blocks the rebalance."
+            return jsonify({
+                "ok": True,
+                "trade_proposal": {
+                    "orders": orders,
+                    "summary": "Rebalance QQQ core allocation",
+                    "context": f"Planned size is shown below. Submission is currently blocked: {err}",
+                },
+            })
+        return jsonify({
+            "ok": True,
+            "trade_proposal": {
+                "orders": orders,
+                "summary": "Rebalance QQQ core allocation",
+                "context": "Core sleeve uses target exposure, not leftover cash.",
+            },
+        })
 
     # ── Fast-path: "place orders" / "enter" / "execute signals" intent ────────
     enter_keywords = {
@@ -3087,6 +4377,10 @@ For all other queries respond in plain text. Never fabricate data not in context
     context_block = (
         f"=== Portfolio State ===\n"
         f"Equity: ${equity:,.0f} | Cash: ${cash:,.0f} | Daily P&L: ${daily_pnl:+,.0f}\n"
+        f"Benchmark: {benchmark_snap.get('best_symbol') or '?'} would be "
+        f"${float(benchmark_snap.get('best_index_pnl') or 0):+,.0f}; "
+        f"bot vs benchmark ${float(benchmark_snap.get('bot_vs_best') or 0):+,.0f} "
+        f"({benchmark_snap.get('verdict') or 'unknown'})\n"
         f"Gross exposure: {gross_exp:.1f}% | Max weight drift: {drift_max:.1f}% | Next rebalance: {next_reb}\n"
         f"Market regime: {regime}"
         + (f" | {index_context}" if index_context else "")
@@ -3114,7 +4408,8 @@ For all other queries respond in plain text. Never fabricate data not in context
     if not gemini_key:
         reply = _simple_chat_response(text_low, equity, daily_pnl, cash, regime, pos_lines, sig_lines,
                                       variant_lines=variant_lines, recent_order_lines=recent_order_lines,
-                                      model_state=model_state, entry_gate=entry_gate)
+                                      model_state=model_state, entry_gate=entry_gate,
+                                      benchmark=benchmark_snap)
         return jsonify({"ok": True, "reply": reply, "variant": "keyword_fallback"})
 
     try:
@@ -3287,15 +4582,17 @@ For all other queries respond in plain text. Never fabricate data not in context
         log.warning("Gemini chat error: %s", e)
         reply = _simple_chat_response(text_low, equity, daily_pnl, cash, regime, pos_lines, sig_lines,
                                       variant_lines=variant_lines, recent_order_lines=recent_order_lines,
-                                      model_state=model_state, entry_gate=entry_gate)
+                                      model_state=model_state, entry_gate=entry_gate,
+                                      benchmark=benchmark_snap)
         return jsonify({"ok": True, "reply": f"(LLM unavailable: {type(e).__name__}) {reply}",
                         "variant": "keyword_fallback"})
 
 
 def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_lines,
                           variant_lines=None, recent_order_lines=None, model_state=None,
-                          entry_gate=None):
+                          entry_gate=None, benchmark=None):
     entry_gate = entry_gate or {}
+    benchmark = benchmark or {}
 
     if any(k in text for k in (
         "why are you not buying", "why aren't you buying", "why not buying",
@@ -3304,7 +4601,10 @@ def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_
     )):
         if entry_gate.get("blocked"):
             return entry_gate.get("summary") or "Auto entries are currently blocked by the trader gate."
-        regime_note = " Position size at 50% due to CHOPPY regime." if regime in ("CHOPPY", "CHOP") else ""
+        regime_note = (
+            f" CHOPPY regime requires score ≥ {config.CHOPPY_ENTRY_MIN_SCORE} and one new buy per hour."
+            if regime in ("CHOPPY", "CHOP") else ""
+        )
         if sig_lines:
             return ("Auto entries are eligible on the next trader tick. Top signals: "
                     + "; ".join(sig_lines[:2]) + "." + regime_note)
@@ -3312,8 +4612,16 @@ def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_
 
     if any(k in text for k in ("p&l", "pnl", "profit", "loss", "how am i doing", "performance", "return")):
         sign = "+" if daily_pnl >= 0 else ""
-        return (f"Equity ${equity:,.0f}, daily P&L {sign}${daily_pnl:,.0f}. "
-                f"Cash available: ${cash:,.0f}.")
+        bench_sym = benchmark.get("best_symbol") or "benchmark"
+        bench_pnl = float(benchmark.get("best_index_pnl") or 0)
+        bot_vs = float(benchmark.get("bot_vs_best") or 0)
+        verdict = benchmark.get("verdict") or "benchmark unavailable"
+        return (
+            f"Equity ${equity:,.0f}, daily P&L {sign}${daily_pnl:,.0f}. "
+            f"{bench_sym} equivalent: ${bench_pnl:+,.0f}. "
+            f"Bot vs benchmark: ${bot_vs:+,.0f} ({verdict}). "
+            f"Cash available: ${cash:,.0f}."
+        )
 
     if any(k in text for k in ("position", "holding", "open")):
         if pos_lines:
@@ -3329,8 +4637,8 @@ def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_
         desc = {
             "BULL":    "trending up — momentum strategies active.",
             "BEAR":    "trending down — hedges and exits favored.",
-            "CHOP":    "choppy — system trades at 50% size when signals score ≥ 63.",
-            "CHOPPY":  "choppy — system trades at 50% size when signals score ≥ 63.",
+            "CHOP":    f"choppy — new entries require exceptional conviction, score ≥ {config.CHOPPY_ENTRY_MIN_SCORE}.",
+            "CHOPPY":  f"choppy — new entries require exceptional conviction, score ≥ {config.CHOPPY_ENTRY_MIN_SCORE}.",
             "UNKNOWN": "still loading — signals refreshing.",
         }.get(regime, "still loading.")
         return f"Current market is {desc}"
@@ -3641,6 +4949,7 @@ if __name__ == "__main__":
     import os as _os
     import threading as _threading
     _threading.Thread(target=_startup_walkforward, daemon=True).start()
+    _threading.Thread(target=_options_automation_loop, daemon=True, name="options-automation").start()
     _host = _os.environ.get("FLASK_HOST", "127.0.0.1")
     _port = int(_os.environ.get("FLASK_PORT", "5001"))
     app.run(host=_host, port=_port, debug=False)

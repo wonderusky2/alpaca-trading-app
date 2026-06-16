@@ -5,6 +5,7 @@ Adapted from swing-bot; uses local config/logger.
 from __future__ import annotations
 import time
 from typing import Optional
+from datetime import date, timedelta
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -85,6 +86,7 @@ class AlpacaClient:
             config.ALPACA_API_KEY,
             config.ALPACA_API_SECRET,
         )
+        self._option_data = None
         log.info("AlpacaClient initialized — PAPER mode")
 
     @staticmethod
@@ -128,10 +130,36 @@ class AlpacaClient:
             "ignored_position_val":  ignored_val,
             "cash":                  float(acct.cash),
             "buying_power":          float(acct.buying_power),
+            "options_buying_power":  float(getattr(acct, "options_buying_power", 0) or 0),
+            "options_approved_level": int(getattr(acct, "options_approved_level", 0) or 0),
+            "options_trading_level": int(getattr(acct, "options_trading_level", 0) or 0),
             "daytrade_count":        int(acct.daytrade_count),
             "pdt":                   bool(acct.pattern_day_trader),
             "status":                acct.status.value,
         }
+
+    def get_options_capability(self) -> dict:
+        """Return account-level options capability without implying suitability."""
+        try:
+            acct = self.trading.get_account()
+            cfg = self.trading.get_account_configurations()
+            approved = int(getattr(acct, "options_approved_level", 0) or 0)
+            trading = int(getattr(acct, "options_trading_level", 0) or 0)
+            max_level = int(getattr(cfg, "max_options_trading_level", 0) or 0)
+            buying_power = float(getattr(acct, "options_buying_power", 0) or 0)
+            return {
+                "ok": True,
+                "paper": bool(config.PAPER),
+                "enabled": approved > 0 or trading > 0 or bool(config.PAPER),
+                "approved_level": approved,
+                "trading_level": trading,
+                "max_options_trading_level": max_level,
+                "options_buying_power": buying_power,
+                "paper_note": "Paper accounts generally support options testing; live accounts require approval.",
+            }
+        except Exception as e:
+            log.warning("options capability check failed: %s", e)
+            return {"ok": False, "enabled": False, "error": str(e), "paper": bool(config.PAPER)}
 
     def get_portfolio_history(self, period: str = "1M", timeframe: str = "1D") -> dict:
         req = GetPortfolioHistoryRequest(period=period, timeframe=timeframe)
@@ -280,6 +308,177 @@ class AlpacaClient:
             "symbol":   symbol,
             "qty":      qty,
             "side":     side_enum.value,
+        }
+
+    def _get_option_data_client(self):
+        if self._option_data is None:
+            from alpaca.data.historical.option import OptionHistoricalDataClient
+            self._option_data = OptionHistoricalDataClient(
+                config.ALPACA_API_KEY,
+                config.ALPACA_API_SECRET,
+            )
+        return self._option_data
+
+    @staticmethod
+    def _contract_to_dict(contract) -> dict:
+        def _value(attr, default=None):
+            value = getattr(contract, attr, default)
+            return getattr(value, "value", value)
+
+        expiration = getattr(contract, "expiration_date", None)
+        if hasattr(expiration, "isoformat"):
+            expiration_s = expiration.isoformat()
+        else:
+            expiration_s = str(expiration or "")
+        return {
+            "id": str(getattr(contract, "id", "") or ""),
+            "symbol": str(getattr(contract, "symbol", "") or ""),
+            "underlying_symbol": str(getattr(contract, "underlying_symbol", "") or ""),
+            "type": str(_value("type", "") or "").lower(),
+            "status": str(_value("status", "") or "").lower(),
+            "expiration_date": expiration_s,
+            "strike_price": float(getattr(contract, "strike_price", 0) or 0),
+            "root_symbol": str(getattr(contract, "root_symbol", "") or ""),
+            "open_interest": (
+                int(float(getattr(contract, "open_interest", 0) or 0))
+                if getattr(contract, "open_interest", None) is not None else None
+            ),
+        }
+
+    def get_option_contracts(
+        self,
+        underlying: str,
+        contract_type: str,
+        min_dte: int = 21,
+        max_dte: int = 60,
+        strike_gte: float | None = None,
+        strike_lte: float | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Return active option contracts for an underlying, filtered by DTE/strike."""
+        from alpaca.trading.requests import GetOptionContractsRequest
+        from alpaca.trading.enums import AssetStatus, ContractType
+
+        ctype = ContractType.CALL if str(contract_type).lower().startswith("c") else ContractType.PUT
+        today = date.today()
+        req = GetOptionContractsRequest(
+            underlying_symbols=[underlying.upper()],
+            status=AssetStatus.ACTIVE,
+            type=ctype,
+            expiration_date_gte=today + timedelta(days=max(1, int(min_dte))),
+            expiration_date_lte=today + timedelta(days=max(int(min_dte), int(max_dte))),
+            strike_price_gte=str(round(float(strike_gte), 2)) if strike_gte is not None else None,
+            strike_price_lte=str(round(float(strike_lte), 2)) if strike_lte is not None else None,
+            limit=max(1, min(int(limit or 100), 1000)),
+        )
+        resp = self.trading.get_option_contracts(req)
+        contracts = getattr(resp, "option_contracts", None)
+        if contracts is None:
+            contracts = getattr(resp, "contracts", None)
+        if contracts is None and isinstance(resp, dict):
+            contracts = resp.get("option_contracts") or resp.get("contracts") or []
+        return [self._contract_to_dict(c) for c in (contracts or [])]
+
+    def get_option_put_contracts(
+        self,
+        underlying: str,
+        min_dte: int = 21,
+        max_dte: int = 60,
+        strike_gte: float | None = None,
+        strike_lte: float | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Return active put contracts for an underlying, filtered by DTE/strike."""
+        return self.get_option_contracts(
+            underlying,
+            "put",
+            min_dte=min_dte,
+            max_dte=max_dte,
+            strike_gte=strike_gte,
+            strike_lte=strike_lte,
+            limit=limit,
+        )
+
+    def get_option_call_contracts(
+        self,
+        underlying: str,
+        min_dte: int = 7,
+        max_dte: int = 21,
+        strike_gte: float | None = None,
+        strike_lte: float | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Return active call contracts for an underlying, filtered by DTE/strike."""
+        return self.get_option_contracts(
+            underlying,
+            "call",
+            min_dte=min_dte,
+            max_dte=max_dte,
+            strike_gte=strike_gte,
+            strike_lte=strike_lte,
+            limit=limit,
+        )
+
+    @staticmethod
+    def _option_quote_to_dict(quote) -> dict:
+        bid = (
+            getattr(quote, "bid_price", None)
+            if getattr(quote, "bid_price", None) is not None
+            else getattr(quote, "bp", None)
+        )
+        ask = (
+            getattr(quote, "ask_price", None)
+            if getattr(quote, "ask_price", None) is not None
+            else getattr(quote, "ap", None)
+        )
+        bid = float(bid or 0)
+        ask = float(ask or 0)
+        mid = round((bid + ask) / 2, 4) if bid > 0 and ask > 0 else None
+        return {
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "bid_size": int(getattr(quote, "bid_size", 0) or getattr(quote, "bs", 0) or 0),
+            "ask_size": int(getattr(quote, "ask_size", 0) or getattr(quote, "as_", 0) or 0),
+        }
+
+    def get_option_latest_quotes(self, contract_symbols: list[str]) -> dict[str, dict]:
+        clean = sorted({str(s).upper() for s in (contract_symbols or []) if str(s).strip()})
+        if not clean:
+            return {}
+        from alpaca.data.requests import OptionLatestQuoteRequest
+        client = self._get_option_data_client()
+        req = OptionLatestQuoteRequest(symbol_or_symbols=clean)
+        resp = client.get_option_latest_quote(req)
+        out: dict[str, dict] = {}
+        for sym in clean:
+            quote = resp.get(sym) if isinstance(resp, dict) else None
+            if quote:
+                out[sym] = self._option_quote_to_dict(quote)
+        return out
+
+    def place_option_market_order(self, contract_symbol: str, qty: int, side: str = "buy") -> dict:
+        """Paper option market order. Kept separate from equity order path."""
+        self._require_submission_enabled()
+        if not config.PAPER or not bool(getattr(config, "OPTIONS_HEDGE_PAPER_ONLY", True)):
+            raise EnvironmentError("Option execution is paper-only in this app.")
+        if qty <= 0:
+            raise ValueError(f"Invalid option qty {qty} for {contract_symbol}")
+        side_enum = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
+        req = MarketOrderRequest(
+            symbol=contract_symbol,
+            qty=qty,
+            side=side_enum,
+            time_in_force=TimeInForce.DAY,
+        )
+        order = self.trading.submit_order(req)
+        log.info("LAB OPTION ORDER | %s %s %s contracts → %s", side_enum.value.upper(), contract_symbol, qty, order.id)
+        return {
+            "order_id": str(order.id),
+            "symbol": contract_symbol,
+            "qty": qty,
+            "side": side_enum.value,
+            "asset_class": "option",
         }
 
     # ── News ──────────────────────────────────────────────────────────────────
