@@ -419,13 +419,21 @@ function renderPositions(data) {
   }
 
   // Compute covered call coverage for QQQ
+  // side field comes from accounting rows: "LONG" or "SHORT"
   const qqqEq = eqPos.find(p => String(p.symbol||'').toUpperCase() === 'QQQ');
   const qqqShares = qqqEq ? Math.floor(+(qqqEq.qty||qqqEq.quantity||qqqEq.shares||0)) : 0;
-  const qqqLots = Math.floor(qqqShares / 100); // each contract covers 100 shares
+  const qqqLots = Math.floor(qqqShares / 100);
+  // A covered call = SHORT call. A LONG call is a directional bet, not a covered write.
   const coveredCallContracts = optPos.filter(p => {
     const parsed = parseOptSym(p.symbol);
-    return parsed && parsed.root === 'QQQ' && parsed.type === 'C' && +(p.side||p.qty||0) < 0 // short call = covered call
-        || (parsed && parsed.root === 'QQQ' && parsed.type === 'C'); // include all for now; server tracks side
+    const side = String(p.side||'').toUpperCase();
+    return parsed && parsed.root === 'QQQ' && parsed.type === 'C' && side === 'SHORT';
+  }).reduce((n, p) => n + Math.abs(+(p.qty||p.quantity||p.contracts||1)), 0);
+  // Long QQQ calls = directional bets (not covered writes)
+  const longCallContracts = optPos.filter(p => {
+    const parsed = parseOptSym(p.symbol);
+    const side = String(p.side||'LONG').toUpperCase();
+    return parsed && parsed.root === 'QQQ' && parsed.type === 'C' && side !== 'SHORT';
   }).reduce((n, p) => n + Math.abs(+(p.qty||p.quantity||p.contracts||1)), 0);
 
   const rows = [];
@@ -444,13 +452,19 @@ function renderPositions(data) {
     if (sym === 'QQQ' && qqqLots > 0) {
       const covered = coveredCallContracts;
       const uncovered = Math.max(0, qqqLots - covered);
-      qtyExtra = `<div style="font-size:10px;color:var(--muted);margin-top:2px">${qqqLots} lots${covered>0?` · <span style="color:var(--blue)">${covered} covered</span>`:''}</div>`;
-      if (uncovered > 0 && covered > 0) {
-        note = `${uncovered} lot${uncovered>1?'s':''} uncovered — engine will write calls`;
-      } else if (covered === 0 && qqqLots > 0) {
-        note = `${qqqLots} lots, no covered calls yet`;
+      const lotWord = qqqLots === 1 ? 'lot' : 'lots';
+      const extras = [];
+      if (covered > 0) extras.push(`<span style="color:var(--amber)">${covered} covered call${covered>1?'s':''}</span>`);
+      if (longCallContracts > 0) extras.push(`<span style="color:var(--blue)">${longCallContracts} long call${longCallContracts>1?'s':''}</span>`);
+      qtyExtra = `<div style="font-size:10px;color:var(--muted);margin-top:2px">${qqqLots} ${lotWord}${extras.length?' · '+extras.join(' · '):''}</div>`;
+      if (covered === 0 && longCallContracts > 0) {
+        note = `${qqqLots} ${lotWord}, ${longCallContracts} long call — no covered writes yet`;
+      } else if (covered > 0 && uncovered > 0) {
+        note = `${uncovered} lot${uncovered>1?'s':''} uncovered — engine may write calls`;
       } else if (covered === qqqLots) {
-        note = `All ${qqqLots} lots covered`;
+        note = `All ${qqqLots} ${lotWord} covered`;
+      } else {
+        note = `${qqqLots} ${lotWord}, no covered writes`;
       }
     }
     const qtyStr = qty > 0 ? Math.round(qty).toLocaleString() : '—';
@@ -473,7 +487,19 @@ function renderPositions(data) {
     const pnl = +(pos.unrealized_pnl||0);
     const pnlPct = +(pos.unrealized_pnl_pct||0);
     const parsed = parseOptSym(sym);
-    const typeTag = parsed ? (parsed.type==='C'?'<span class="tag call">Call</span>':'<span class="tag put">Put</span>') : '<span class="tag">Opt</span>';
+    const optSide = String(pos.side||'LONG').toUpperCase();
+    let typeTag = '<span class="tag">Opt</span>';
+    if (parsed) {
+      if (parsed.type === 'C') {
+        typeTag = optSide === 'SHORT'
+          ? '<span class="tag warn">Covered</span>'
+          : '<span class="tag call">Long Call</span>';
+      } else {
+        typeTag = optSide === 'SHORT'
+          ? '<span class="tag bad">Short Put</span>'
+          : '<span class="tag put">Put Hedge</span>';
+      }
+    }
     const note = parsed ? `${parsed.root} $${parsed.strike} · exp ${parsed.expiry}` : sym;
     rows.push(`<tr>
       <td><div class="sym" style="font-size:11px;cursor:default;letter-spacing:-.01em">${sym}</div></td>
@@ -596,7 +622,7 @@ async function handleSend() {
   addFeedItem(esc(text), 'you');
   showTyping();
   try {
-    const data = await apiJson('/api/lab/chat', {
+    const data = await apiJson('/api/lab/chat/message', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({message:text, context:_latestOverview})
@@ -643,7 +669,8 @@ $('msg-input').addEventListener('keydown', e => {
 // ─── TRADING TOGGLE ────────────────────────────────────────────────────────
 async function toggleTrading() {
   try {
-    const data = await apiJson('/api/lab/trader/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}' });
+    const endpoint = _paused ? '/api/lab/trader/resume' : '/api/lab/trader/pause';
+    const data = await apiJson(endpoint, {method:'POST',headers:{'Content-Type':'application/json'},body:'{}' });
     _paused = !!data.paused;
     $('tb-pause').textContent = _paused ? 'Resume' : 'Pause';
     $('tb-pause').className = _paused ? 'paused' : '';
