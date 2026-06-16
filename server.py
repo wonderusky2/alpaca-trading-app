@@ -1622,11 +1622,15 @@ def _build_call_buy(snapshot: dict, live_scores: dict | None = None) -> dict:
         out["summary"] = "Options are not enabled on this account."
         return out
 
-    # Only buy calls in BULL — in CHOPPY/BEAR the premium drag outweighs the benefit
-    if regime != "BULL":
+    # By default only buy calls in BULL; config can extend to CHOPPY
+    allowed_regimes = {"BULL"}
+    if bool(getattr(config, "OPTIONS_CALL_BUY_ALLOW_CHOPPY", False)):
+        allowed_regimes.add("CHOPPY")
+    if regime not in allowed_regimes:
         out["summary"] = (
             f"No directional call buys now: regime is {regime or 'UNKNOWN'}. "
-            "Calls are purchased only in confirmed BULL regime to amplify upside."
+            f"Calls are purchased in: {', '.join(sorted(allowed_regimes))}. "
+            "Set OPTIONS_CALL_BUY_ALLOW_CHOPPY=True in config to enable CHOPPY entries."
         )
         return out
 
