@@ -406,12 +406,19 @@ function renderPositions(data) {
   const eqPos = allPositions.filter(p => !isOptSym(p.symbol));
   const optPos = allPositions.filter(p => isOptSym(p.symbol));
 
-  $('pos-sub').textContent = `next rebalance ${(acctg.next_rebalance_date||'').slice(0,10)||'—'}`;
   const riskState = acctg.risk_state||{};
-  const rtag = $('pos-risk-tag');
   const rs = riskState.status||'ok';
-  rtag.textContent = rs.toUpperCase();
-  rtag.className = 'tag '+(rs==='breach'?'bad':rs==='review'?'warn':'good');
+  const rsMsg = riskState.message||'';
+  const rtag = $('pos-risk-tag');
+  const rLabel = rs==='breach'?'BREACH':rs==='warning'?'WARNING':rs==='review'?'REVIEW':rs==='recovery'?'RECOVERY':'OK';
+  rtag.textContent = rLabel;
+  rtag.title = rsMsg;
+  rtag.className = 'tag '+(rs==='breach'?'bad':rs==='warning'||rs==='review'||rs==='recovery'?'warn':'good');
+  // Show risk reason inline if not normal
+  const rDate = (acctg.next_rebalance_date||'').slice(0,10);
+  $('pos-sub').textContent = rsMsg && rs !== 'normal' && rs !== 'ok' && rs !== 'research'
+    ? rsMsg
+    : `next rebalance ${rDate||'—'}`;
 
   if (!allPositions.length) {
     $('pos-body').innerHTML = '<tr><td colspan="7" style="color:var(--muted);padding:14px 16px">No open positions. System is in cash.</td></tr>';
@@ -586,17 +593,36 @@ async function poll() {
       const acctg = data.accounting||{};
       const bench = data.benchmark||{};
       const clock = data.clock||{};
+      const riskState = acctg.risk_state||{};
       const equity = +(acct.equity||0);
       const lastEq = +(acct.adjusted_last_equity||acct.last_equity||equity);
       const pnl = equity - lastEq;
       const gross = +(acctg.gross_exposure_pct||0);
       const gap = +(bench.bot_vs_best||0);
+      const qqxPnl = +(bench.best_index_pnl||0);
+      const rsMsg = riskState.message||'';
+      const rs = riskState.status||'ok';
+      // P&L line
       addFeedItem(
-        `Account loaded. Equity <b>${fmt$(equity)}</b>, daily P&L <b class="${pnl>=0?'pos-green':'pos-red'}">${fmtPnl(pnl)}</b>, `+
-        `${gross.toFixed(1)}% exposure, vs QQQ <b class="${gap>=0?'pos-green':'pos-red'}">${fmtPnl(gap)}</b>. `+
-        `Market is <b>${clock.is_open?'open':'closed'}</b>.`,
+        `Equity <b>${fmt$(equity)}</b> · P&L today <b class="${pnl>=0?'pos-green':'pos-red'}">${fmtPnl(pnl)}</b> · `+
+        `${gross.toFixed(1)}% deployed · market <b>${clock.is_open?'open':'closed'}</b>.`,
         'agent'
       );
+      // VS QQQ explanation
+      if (bench.ok) {
+        const qqxPct = +((bench.indices||{}).QQQ?.change_pct||0);
+        addFeedItem(
+          `VS QQQ <b class="${gap>=0?'pos-green':'pos-red'}">${fmtPnl(gap)}</b> — `+
+          `QQQ was ${qqxPct>=0?'up':'down'} ${Math.abs(qqxPct).toFixed(2)}% today `+
+          `(${fmtPnl(qqxPnl)} on a 100% position). `+
+          `At ${gross.toFixed(0)}% exposure you captured ${gross.toFixed(0)}% of that move.`,
+          'sys'
+        );
+      }
+      // Risk state if not normal
+      if (rsMsg && rs !== 'normal' && rs !== 'ok' && rs !== 'research') {
+        addFeedItem(`Risk: ${esc(rsMsg)}`, 'sys');
+      }
       _initialized = true;
     }
 
