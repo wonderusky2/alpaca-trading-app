@@ -688,7 +688,7 @@ def _live_risk_state(
     elif position_count and (risk_pnl <= -hard_loss or loss_pct <= -1.0 or both_losing):
         status, action = "breach", "reduce_risk"
         message = "Risk breach: reduce exposure before adding or rebalancing."
-    elif position_count and risk_pnl < 0 and loss_pct <= -0.5:
+    elif position_count and risk_pnl < 0 and loss_pct <= -1.5:
         status, action = "warning", "rebalance_review"
         message = "Net P&L is negative; review before adding new positions."
     elif position_count and drift_breach:
