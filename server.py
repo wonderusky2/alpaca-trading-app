@@ -1474,9 +1474,8 @@ def _build_call_income(snapshot: dict, live_scores: dict | None = None) -> dict:
     qqq_value = abs(float(qqq_pos.get("market_val") or 0))
     covered_contracts = int(qqq_qty // 100)
     overwrite_cap = float(config.OPTIONS_CALL_MAX_OVERWRITE_PCT)
-    max_contracts = int(math.floor(covered_contracts * overwrite_cap))
-    if covered_contracts == 1 and overwrite_cap > 0:
-        max_contracts = 1
+    # Fully overwrite — sell one contract per 100 QQQ shares held
+    max_contracts = covered_contracts if overwrite_cap >= 1.0 else max(1, int(math.floor(covered_contracts * overwrite_cap)))
 
     out = {
         "ok": True,
@@ -1541,6 +1540,12 @@ def _build_call_income(snapshot: dict, live_scores: dict | None = None) -> dict:
         oi = int(c.get("open_interest") or 0)
         return (abs(dte - 14), abs(strike - target_strike), -oi)
 
+    # Exclude contracts already held long — selling them closes a long, not a new covered call
+    active_long_syms = _active_option_symbols(snapshot)
+    contracts = [c for c in contracts if str(c.get("symbol") or "").upper() not in active_long_syms]
+    if not contracts:
+        out["summary"] = "No eligible call contracts: all candidates already held as long positions."
+        return out
     ranked = sorted(contracts, key=_rank)[:20]
     quotes = client.get_option_latest_quotes([c["symbol"] for c in ranked if c.get("symbol")])
     candidates = []
@@ -1827,12 +1832,15 @@ def _active_option_symbols(snapshot: dict) -> set[str]:
 
 
 def _option_orders_without_duplicates(orders: list[dict], snapshot: dict) -> tuple[list[dict], list[str]]:
+    """Skip BUY orders for contracts already held. Never skip SELL orders (they may close/hedge)."""
     active = _active_option_symbols(snapshot)
     clean = []
     skipped = []
     for o in orders or []:
         sym = str(o.get("symbol") or "").upper()
-        if sym in active:
+        side = str(o.get("side") or "buy").lower()
+        # Only deduplicate BUY orders — covered call sells should always be allowed
+        if side == "buy" and sym in active:
             skipped.append(sym)
             continue
         clean.append(o)
