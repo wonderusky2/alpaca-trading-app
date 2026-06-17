@@ -635,9 +635,39 @@ async function poll() {
       addFeedItem(`Options engine: ${esc(optAuto.last_summary)}`, 'sys');
     }
 
+    if (_initialized) loadNews();
+
   } catch (e) {
     if (_initialized) addFeedItem(`Poll error: ${esc(e.message)}`, 'sys');
   }
+}
+
+// ─── NEWS ──────────────────────────────────────────────────────────────────
+const _seenNewsIds = new Set();
+let _lastNewsTs = 0;
+const NEWS_INTERVAL_MS = 5 * 60 * 1000;
+
+async function loadNews() {
+  if (Date.now() - _lastNewsTs < NEWS_INTERVAL_MS) return;
+  _lastNewsTs = Date.now();
+  try {
+    const data = await apiJson('/api/lab/news');
+    // Only show positive/negative — neutral is noise
+    const articles = (data.all_articles || [])
+      .filter(a => a.tone !== 'neutral' && !_seenNewsIds.has(a.id))
+      .slice(0, 8);
+    for (const a of articles) {
+      _seenNewsIds.add(a.id);
+      const color = a.tone === 'positive' ? 'var(--green)' : 'var(--red)';
+      const syms = (a.symbols||[]).slice(0,3).join(' · ');
+      addFeedItem(
+        `<span style="color:${color}">●</span> ` +
+        (syms ? `<b>${esc(syms)}</b> — ` : '') +
+        esc(a.headline),
+        'sys'
+      );
+    }
+  } catch(e) { /* silent — news is informational */ }
 }
 
 // ─── CHAT ──────────────────────────────────────────────────────────────────
