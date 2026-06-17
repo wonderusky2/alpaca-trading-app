@@ -544,6 +544,34 @@ function renderAlerts(alerts) {
 // ─── FEED ──────────────────────────────────────────────────────────────────
 const feedInner = () => $('feed-inner');
 const typingRow = () => $('typing-row');
+const FEED_KEY  = 'qqq_feed_v3';
+const FEED_MAX  = 150;
+
+function _persistFeed() {
+  try {
+    const items = [...feedInner().querySelectorAll('.fi')].slice(-FEED_MAX).map(el => ({
+      h: el.querySelector('.fi-msg')?.innerHTML || '',
+      r: el.classList.contains('you') ? 'you' : el.classList.contains('sys') ? 'sys' : 'agent',
+      t: el.querySelector('.fi-ts')?.textContent || '',
+    }));
+    localStorage.setItem(FEED_KEY, JSON.stringify(items));
+  } catch(e) {}
+}
+
+function restoreFeed() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(FEED_KEY) || '[]');
+    for (const item of stored) {
+      const who = item.r === 'you' ? 'You' : item.r === 'sys' ? 'System' : 'Agent';
+      const el  = document.createElement('div');
+      el.className = 'fi ' + (item.r === 'agent' ? '' : item.r);
+      el.innerHTML  = `<span class="fi-ts">${item.t}</span><span class="fi-who">${who}</span><div class="fi-msg">${item.h}</div>`;
+      feedInner().appendChild(el);
+    }
+    const fi = $('feed-items');
+    fi.scrollTop = fi.scrollHeight;
+  } catch(e) {}
+}
 
 function addFeedItem(html, role='agent', ts=null) {
   const t = ts || now12();
@@ -553,9 +581,9 @@ function addFeedItem(html, role='agent', ts=null) {
   el.className = 'fi '+cls;
   el.innerHTML = `<span class="fi-ts">${t}</span><span class="fi-who">${who}</span><div class="fi-msg">${html}</div>`;
   feedInner().appendChild(el);
-  // scroll feed to bottom
   const fi = $('feed-items');
   fi.scrollTop = fi.scrollHeight;
+  _persistFeed();
 }
 
 function showTyping() {
@@ -858,6 +886,7 @@ async function runBacktest() {
 }
 
 // ─── POLL LOOP ─────────────────────────────────────────────────────────────
+restoreFeed();
 poll();
 setInterval(poll, 20000);
 </script>
