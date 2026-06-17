@@ -228,7 +228,7 @@ input{font:inherit}
     <div class="tb-sep"></div>
     <div class="tb-stat big"><span class="lbl">Equity</span><span class="val" id="tb-equity">—</span></div>
     <div class="tb-stat hide-sm"><span class="lbl">P&amp;L</span><span class="val" id="tb-pnl">—</span></div>
-    <div class="tb-stat hide-sm"><span class="lbl">vs QQQ</span><span class="val" id="tb-qqq">—</span></div>
+    <div class="tb-stat hide-sm"><span class="lbl" id="tb-qqq-lbl">vs QQQ</span><span class="val" id="tb-qqq">—</span></div>
     <div class="tb-stat hide-sm"><span class="lbl">Exposure</span><span class="val" id="tb-exp">—</span></div>
     <div class="tb-stat hide-sm"><span class="lbl">Cash</span><span class="val" id="tb-cash">—</span></div>
     <button id="tb-pause" onclick="toggleTrading()">Pause</button>
@@ -388,6 +388,7 @@ function renderTopbar(data) {
   $('tb-pnl').className = 'val '+(pnl>=0?'pos-green':'pos-red');
   $('tb-qqq').textContent = bench.ok ? fmtPnl(gap) : '—';
   $('tb-qqq').className = 'val '+(gap>=0?'pos-green':'pos-red');
+  $('tb-qqq-lbl').textContent = 'vs '+(bench.best_symbol||'QQQ');
   $('tb-exp').textContent = gross.toFixed(1)+'%';
   $('tb-cash').textContent = fmt$(cash);
 }
@@ -608,14 +609,15 @@ async function poll() {
         `${gross.toFixed(1)}% deployed · market <b>${clock.is_open?'open':'closed'}</b>.`,
         'agent'
       );
-      // VS QQQ explanation
+      // VS benchmark explanation
       if (bench.ok) {
-        const qqxPct = +((bench.indices||{}).QQQ?.change_pct||0);
+        const bestSym = bench.best_symbol || 'QQQ';
+        const bestPct = +((bench.indices||{})[bestSym]?.change_pct||0);
         addFeedItem(
-          `VS QQQ <b class="${gap>=0?'pos-green':'pos-red'}">${fmtPnl(gap)}</b> — `+
-          `QQQ was ${qqxPct>=0?'up':'down'} ${Math.abs(qqxPct).toFixed(2)}% today `+
+          `VS ${bestSym} <b class="${gap>=0?'pos-green':'pos-red'}">${fmtPnl(gap)}</b> — `+
+          `${bestSym} was ${bestPct>=0?'up':'down'} ${Math.abs(bestPct).toFixed(2)}% today `+
           `(${fmtPnl(qqxPnl)} on a 100% position). `+
-          `At ${gross.toFixed(0)}% exposure you captured ${gross.toFixed(0)}% of that move.`,
+          `You had ${gross.toFixed(0)}% deployed.`,
           'sys'
         );
       }

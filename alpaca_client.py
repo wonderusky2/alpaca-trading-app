@@ -587,10 +587,10 @@ class AlpacaClient:
                         prev_close = None
                         if prev_bar:
                             prev_close = float(getattr(prev_bar, "close", 0) or 0)
-                        if not prev_close and daily_bar:
-                            prev_close = float(getattr(daily_bar, "open", 0) or 0)
+                        # Do NOT fall back to today's open — that gives intraday move,
+                        # not the daily move vs yesterday's close (breaks P&L benchmark).
                         if not prev_close:
-                            prev_close = price
+                            prev_close = price  # flat change if we have no prior close
 
                         vwap = 0.0
                         daily_open = 0.0
