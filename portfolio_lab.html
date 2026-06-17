@@ -591,30 +591,13 @@ function renderPerfBar(data) {
 
 async function loadPerfHistory() {
   try {
-    const data = await apiJson('/api/lab/portfolio/history?period=1A&timeframe=1D');
-    const h    = data.history || {};
-    const ts   = h.timestamp || [];
-    const eq   = h.equity    || [];
-    if (!ts.length) return;
-
-    const nowSec = Date.now() / 1000;
-    const today  = new Date();
-    const qStartMs = new Date(today.getFullYear(), Math.floor(today.getMonth()/3)*3, 1).getTime();
-    const yStartMs = new Date(today.getFullYear(), 0, 1).getTime();
-
-    function nearest(targetSec) {
-      let best = null, bestD = Infinity;
-      for (let i = 0; i < ts.length; i++) {
-        const d = Math.abs(ts[i] - targetSec);
-        if (d < bestD && eq[i] > 0) { bestD = d; best = eq[i]; }
-      }
-      return best;
-    }
-
+    const data = await apiJson('/api/lab/equity-baselines');
+    const b = data.baselines || {};
+    if (!Object.keys(b).length) return;  // no snapshots yet — accumulates over time
     _histEquity = {
-      week: nearest(nowSec - 7 * 86400),
-      qtd:  nearest(qStartMs / 1000),
-      ytd:  nearest(yStartMs / 1000),
+      week: b.week?.equity || null,
+      qtd:  b.qtd?.equity  || null,
+      ytd:  b.ytd?.equity  || null,
     };
     if (_latestOverview) renderPerfBar(_latestOverview);
   } catch(e) { /* non-critical */ }

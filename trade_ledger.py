@@ -47,6 +47,15 @@ CREATE TABLE IF NOT EXISTS trades (
     signal_snapshot  TEXT,
     model_snapshot   TEXT
 );
+CREATE TABLE IF NOT EXISTS equity_snapshots (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at  TEXT    NOT NULL,   -- ISO UTC timestamp
+    date         TEXT    NOT NULL,   -- YYYY-MM-DD (trading date)
+    equity       REAL    NOT NULL,
+    cash         REAL,
+    regime       TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS eq_snap_date ON equity_snapshots(date);
 """
 
 
@@ -139,6 +148,58 @@ def _insert(row: dict) -> None:
         logging.getLogger("trade_ledger").error("Ledger insert failed: %s", e)
 
 
+def record_equity_snapshot(equity: float, cash: float = 0.0, regime: str = "") -> None:
+    """Record today's equity. One row per calendar date (UPSERT by date)."""
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        now   = datetime.now(timezone.utc).isoformat()
+        con   = _connect()
+        con.execute(
+            """INSERT INTO equity_snapshots (recorded_at, date, equity, cash, regime)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(date) DO UPDATE SET
+                 recorded_at=excluded.recorded_at,
+                 equity=excluded.equity,
+                 cash=excluded.cash,
+                 regime=excluded.regime""",
+            (now, today, equity, cash, regime),
+        )
+        con.commit()
+        con.close()
+    except Exception as e:
+        import logging
+        logging.getLogger("trade_ledger").error("equity snapshot failed: %s", e)
+
+
+def equity_period_baselines() -> dict:
+    """Return equity at start-of-week, start-of-quarter, start-of-year from snapshots."""
+    try:
+        from datetime import date, timedelta
+        today = date.today()
+        # Start of current week (Monday)
+        bow   = today - timedelta(days=today.weekday())
+        # Start of current quarter
+        boq   = date(today.year, ((today.month - 1) // 3) * 3 + 1, 1)
+        # Start of current year
+        boy   = date(today.year, 1, 1)
+
+        con = _connect()
+        result = {}
+        for key, target in [("week", bow), ("qtd", boq), ("ytd", boy)]:
+            # Find the closest snapshot on or before target date
+            cur = con.execute(
+                "SELECT date, equity FROM equity_snapshots WHERE date <= ? ORDER BY date DESC LIMIT 1",
+                (target.isoformat(),),
+            )
+            row = cur.fetchone()
+            if row:
+                result[key] = {"date": row[0], "equity": row[1]}
+        con.close()
+        return result
+    except Exception:
+        return {}
+
+
 def recent_trades(limit: int = 200) -> list[dict]:
     """Return the most recent trades as a list of dicts."""
     try:
@@ -186,4 +247,34 @@ def win_loss_summary(limit: int = 500) -> dict:
         "expectancy":   round(
             (len(wins) / len(pnls)) * avg_win + (len(losses) / len(pnls)) * avg_loss, 2
         ) if pnls else 0.0,
+    }
+
+
+def edge_summary(limit: int = 500) -> dict:
+    """Return trade evidence used by entry/promotion gates."""
+    summary = win_loss_summary(limit=limit)
+    first_trade_at = None
+    try:
+        con = _connect()
+        cur = con.execute("SELECT MIN(recorded_at) FROM trades")
+        first_trade_at = cur.fetchone()[0]
+        con.close()
+    except Exception:
+        first_trade_at = None
+
+    paper_days = 0.0
+    if first_trade_at:
+        try:
+            first_dt = datetime.fromisoformat(str(first_trade_at).replace("Z", "+00:00"))
+            paper_days = max(0.0, (datetime.now(timezone.utc) - first_dt).total_seconds() / 86400)
+        except Exception:
+            paper_days = 0.0
+
+    trades = int(summary.get("trades") or 0)
+    expectancy = float(summary.get("expectancy") or 0.0)
+    return {
+        **summary,
+        "paper_days": round(paper_days, 1),
+        "first_trade_at": first_trade_at,
+        "expectancy_positive": bool(trades > 0 and expectancy > 0),
     }

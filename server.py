@@ -3130,6 +3130,15 @@ def api_lab_overview():
         data = _coordinator.overview()
         _overview_cache["ts"]   = now
         _overview_cache["data"] = data
+        # Record equity snapshot for period return calculations (once per overview refresh)
+        try:
+            _eq  = float((data.get("account") or {}).get("equity") or 0)
+            _csh = float((data.get("account") or {}).get("cash") or 0)
+            _rgm = str((data.get("live_scores") or {}).get("regime") or "")
+            if _eq > 0:
+                trade_ledger.record_equity_snapshot(_eq, _csh, _rgm)
+        except Exception as _snap_err:
+            log.debug("equity snapshot skipped: %s", _snap_err)
         return jsonify(data)
     except Exception as e:
         log.error("overview error: %s", e, exc_info=True)
@@ -3535,6 +3544,16 @@ def api_lab_ledger():
         return jsonify({"ok": True, "trades": trades, "summary": summary})
     except Exception as e:
         log.error("ledger error: %s", e, exc_info=True)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/lab/equity-baselines")
+@require_api_key
+def api_lab_equity_baselines():
+    """Return equity at start of week, quarter, and year from the snapshot ledger."""
+    try:
+        return jsonify({"ok": True, "baselines": trade_ledger.equity_period_baselines()})
+    except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -4262,47 +4281,38 @@ def api_lab_chat_message():
 
     # ── System prompt ─────────────────────────────────────────────────────────
     system_prompt = """\
-You are an algorithmic trading analyst for an Alpaca PAPER trading account (no real money at risk).
-Your job: tell the user in plain English what the market is doing, what the portfolio is doing, and what the signals say.
+You are the trading agent for a QQQ Autopilot account — Alpaca PAPER trading, no real money at risk.
 
-The strategy uses 6 technical indicators scored 0-100:
-  RSI(14) — momentum zone (sweet: 52-70 bull, <45 bear)
-  MACD histogram — direction and slope (positive+rising = bullish)
-  AVWAP — anchored VWAP from swing low/high (price above = institutional support)
-  EMA 9/21 — trend direction (EMA9>EMA21 = uptrend)
-  Trendline — slope + price position (up + price above = trend intact)
-  Price action — reversal candles, swing breakouts/breakdowns, gaps, and volume confirmation
+THIS SYSTEM TRADES ONLY QQQ. Satellite stock trading is disabled. Do not suggest buying or selling individual stocks.
 
-Entry: score ≥ 65. Position size scales with regime (BULL=100%, CHOPPY=50%). Stops are ATR-based.
-Regime: BULL when QQQ ≥+0.4%, BEAR when QQQ ≤-0.5%, CHOPPY otherwise.
+STRATEGY:
+- Core holding: QQQ shares, sized by regime
+  BULL  → 100% of equity in QQQ + buy 1-2 slightly OTM calls (2% OTM, 30-45 DTE) to amplify upside
+  CHOPPY → 95% of equity in QQQ + write covered calls on all lots (collect premium, cap upside)
+  BEAR  → 30% of equity in QQQ + buy puts (5% OTM, 30-60 DTE) as hedge
+- Regime uses VIX + EMA9/21 + ATR + intraday momentum + breadth signals
+- Rebalance triggers when allocation drifts >3% from target
 
-Be concise and direct — talk like a prop trader, not a financial advisor. Use plain numbers.
-Dollar amounts with $ and commas. Percentages with one decimal.
+OPTIONS:
+- Covered calls: SHORT QQQ calls, strike ~4% OTM, 7-21 DTE — collect premium in CHOPPY
+- Long calls: LONG QQQ calls, strike ~2% OTM, 21-45 DTE — amplify gains in BULL
+- Put hedges: LONG QQQ puts, strike ~5% OTM, 30-60 DTE — protect in BEAR
 
-When user asks to BUY or SELL a specific stock (e.g. "buy 10 NVDA", "sell my TSLA", "buy AAPL"):
-  Respond with ONLY this JSON (no markdown, no extra text):
-  {"trade_proposal": {"orders": [{"symbol": "NVDA", "side": "buy", "qty": 0}], "summary": "Brief reason"}}
-  - Set qty=0 to mean "auto-calculate from portfolio sizing" — the server will calculate qty from position_size_pct.
-  - Only set qty > 0 if the user explicitly specifies a share count.
-  - side must be "buy" or "sell"
+WHAT YOU CAN ANSWER:
+- Portfolio status: equity, P&L today/week/QTD/YTD, exposure, cash
+- Regime: current regime, why it triggered, what it means for allocation
+- Options: what calls/puts are held, when they expire, P&L, what the engine recommends next
+- News: summarise recent headlines affecting QQQ holdings (META, NVDA, GOOG, AAPL, MSFT, etc.)
+- Rebalance: whether allocation needs adjusting and by how much
+- Performance vs benchmark: how the account is doing vs SPY/QQQ hypothetical
 
-When user says to place/enter/execute orders or "go ahead" or "just do it" (e.g. "place orders", "enter positions", "go for it", "deploy capital"):
-  Respond with ONLY this JSON using the top qualifying signals from context (no markdown, no extra text):
-  {"action": "place_top_signals"}
+WHAT YOU CANNOT DO:
+- Buy or sell individual stocks (satellite trading is OFF)
+- Score individual tickers
+- Place orders for non-QQQ symbols
 
-When user asks to run/trigger/start a scan or live scores (e.g. "run live scores", "do it now", "scan now", "refresh signals"):
-  Respond with ONLY this JSON (no markdown, no extra text):
-  {"action": "trigger_live_scores"}
-
-When user asks to score, analyze, or get signal details for any specific stock (e.g. "score ZS", "analyze NVDA", "what's the signal on AAPL", "score this for me: MSFT", "get signal for TSLA"):
-  Respond with ONLY this JSON (no markdown, no extra text):
-  {"action": "score_symbol", "symbol": "ZS"}
-
-When user asks about unusual volume, high volume stocks, or volume spikes (e.g. "what has unusual volume", "any volume spikes", "high volume today"):
-  Respond with ONLY this JSON (no markdown, no extra text):
-  {"action": "unusual_volume"}
-
-For all other queries respond in plain text. Never fabricate data not in context. This is paper trading."""
+Be concise. Talk like a prop trader. Dollar amounts with $ and commas. Percentages with one decimal.
+Never fabricate data not in the context provided. This is paper trading."""
 
     # ── Context block ─────────────────────────────────────────────────────────
     # ── SPY / QQQ market context ──────────────────────────────────────────────
