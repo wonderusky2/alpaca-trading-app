@@ -763,12 +763,16 @@ async function loadNews() {
       .slice(0, 8);
     for (const a of articles) {
       _seenNewsIds.add(a.id);
-      const color = a.tone === 'positive' ? 'var(--green)' : 'var(--red)';
+      const isNeg = a.tone === 'negative';
+      const color = isNeg ? 'var(--red)' : 'var(--green)';
       const syms = (a.symbols||[]).slice(0,3).join(' · ');
+      const headline = isNeg
+        ? `<b style="color:var(--text)">${esc(a.headline)}</b>`
+        : esc(a.headline);
       addFeedItem(
         `<span style="color:${color}">●</span> ` +
         (syms ? `<b>${esc(syms)}</b> — ` : '') +
-        esc(a.headline),
+        headline,
         'sys'
       );
     }
