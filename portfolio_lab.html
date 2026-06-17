@@ -31,8 +31,10 @@ input{font:inherit}
 #topbar{
   display:flex;align-items:stretch;
   border-bottom:1px solid var(--border);
-  overflow:hidden;
+  overflow-x:auto;overflow-y:hidden;
+  scrollbar-width:none;
 }
+#topbar::-webkit-scrollbar{display:none}
 .tb-name{
   display:flex;align-items:center;
   padding:0 18px 0 16px;
@@ -558,9 +560,12 @@ function _persistFeed() {
   } catch(e) {}
 }
 
+let _feedRestored = false;
+
 function restoreFeed() {
   try {
     const stored = JSON.parse(localStorage.getItem(FEED_KEY) || '[]');
+    if (!stored.length) return;
     for (const item of stored) {
       const who = item.r === 'you' ? 'You' : item.r === 'sys' ? 'System' : 'Agent';
       const el  = document.createElement('div');
@@ -570,6 +575,7 @@ function restoreFeed() {
     }
     const fi = $('feed-items');
     fi.scrollTop = fi.scrollHeight;
+    _feedRestored = true;  // skip redundant init messages on reload
   } catch(e) {}
 }
 
@@ -659,43 +665,42 @@ async function poll() {
     _prevPosCount = posCount;
 
     if (!_initialized) {
-      const acct = data.account||{};
-      const acctg = data.accounting||{};
-      const bench = data.benchmark||{};
-      const clock = data.clock||{};
-      const riskState = acctg.risk_state||{};
-      const equity = +(acct.equity||0);
-      const lastEq = +(acct.adjusted_last_equity||acct.last_equity||equity);
-      const pnl = equity - lastEq;
-      const gross = +(acctg.gross_exposure_pct||0);
-      const gap = +(bench.bot_vs_best||0);
-      const qqxPnl = +(bench.best_index_pnl||0);
-      const rsMsg = riskState.message||'';
-      const rs = riskState.status||'ok';
-      // P&L line
-      addFeedItem(
-        `Equity <b>${fmt$(equity)}</b> · P&L today <b class="${pnl>=0?'pos-green':'pos-red'}">${fmtPnl(pnl)}</b> · `+
-        `${gross.toFixed(1)}% deployed · market <b>${clock.is_open?'open':'closed'}</b>.`,
-        'agent'
-      );
-      // VS benchmark explanation
-      if (bench.ok) {
-        const bestSym = bench.best_symbol || 'QQQ';
-        const bestPct = +((bench.indices||{})[bestSym]?.change_pct||0);
-        addFeedItem(
-          `VS ${bestSym} <b class="${gap>=0?'pos-green':'pos-red'}">${fmtPnl(gap)}</b> — `+
-          `${bestSym} was ${bestPct>=0?'up':'down'} ${Math.abs(bestPct).toFixed(2)}% today `+
-          `(${fmtPnl(qqxPnl)} on a 100% position). `+
-          `You had ${gross.toFixed(0)}% deployed.`,
-          'sys'
-        );
-      }
-      // Risk state if not normal
-      if (rsMsg && rs !== 'normal' && rs !== 'ok' && rs !== 'research') {
-        addFeedItem(`Risk: ${esc(rsMsg)}`, 'sys');
-      }
       _initialized = true;
       loadPerfHistory();
+      if (!_feedRestored) {
+        // Fresh load — add startup context messages
+        const acct = data.account||{};
+        const acctg = data.accounting||{};
+        const bench = data.benchmark||{};
+        const clock = data.clock||{};
+        const riskState = acctg.risk_state||{};
+        const equity = +(acct.equity||0);
+        const lastEq = +(acct.adjusted_last_equity||acct.last_equity||equity);
+        const pnl = equity - lastEq;
+        const gross = +(acctg.gross_exposure_pct||0);
+        const gap = +(bench.bot_vs_best||0);
+        const qqxPnl = +(bench.best_index_pnl||0);
+        const rsMsg = riskState.message||'';
+        const rs = riskState.status||'ok';
+        addFeedItem(
+          `Equity <b>${fmt$(equity)}</b> · P&L today <b class="${pnl>=0?'pos-green':'pos-red'}">${fmtPnl(pnl)}</b> · `+
+          `${gross.toFixed(1)}% deployed · market <b>${clock.is_open?'open':'closed'}</b>.`,
+          'agent'
+        );
+        if (bench.ok) {
+          const bestSym = bench.best_symbol || 'QQQ';
+          const bestPct = +((bench.indices||{})[bestSym]?.change_pct||0);
+          addFeedItem(
+            `VS ${bestSym} <b class="${gap>=0?'pos-green':'pos-red'}">${fmtPnl(gap)}</b> — `+
+            `${bestSym} was ${bestPct>=0?'up':'down'} ${Math.abs(bestPct).toFixed(2)}% today `+
+            `(${fmtPnl(qqxPnl)} on a 100% position). You had ${gross.toFixed(0)}% deployed.`,
+            'sys'
+          );
+        }
+        if (rsMsg && rs !== 'normal' && rs !== 'ok' && rs !== 'research') {
+          addFeedItem(`Risk: ${esc(rsMsg)}`, 'sys');
+        }
+      }
     }
 
     // Check options automation state
