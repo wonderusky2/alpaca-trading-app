@@ -25,7 +25,7 @@ button{cursor:pointer;font:inherit;background:none;border:none;color:inherit}
 input{font:inherit}
 
 /* ── APP SHELL ─────────────────────────────────────────────────────────── */
-#app{height:100vh;display:grid;grid-template-rows:48px 38px auto 1fr 48px;overflow:hidden}
+#app{height:100vh;display:grid;grid-template-rows:48px auto 1fr 48px;overflow:hidden}
 
 /* ── TOP BAR ───────────────────────────────────────────────────────────── */
 #topbar{
@@ -66,20 +66,6 @@ input{font:inherit}
 }
 #tb-pause:hover{border-color:var(--blue);color:var(--blue)}
 #tb-pause.paused{border-color:var(--amber);color:var(--amber)}
-
-/* ── PERFORMANCE BAR ───────────────────────────────────────────────────── */
-#perf-bar{
-  display:flex;align-items:stretch;overflow-x:auto;
-  border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0
-}
-.pb-stat{
-  display:flex;flex-direction:column;justify-content:center;
-  padding:0 14px;flex-shrink:0;min-width:0;gap:1px
-}
-.pb-lbl{font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.07em}
-.pb-val{font-size:11px;font-family:var(--mono);font-weight:700;white-space:nowrap}
-.pb-div{width:1px;background:var(--border);align-self:stretch;flex-shrink:0}
-.pb-sep{flex:1}
 
 /* ── POSITIONS ─────────────────────────────────────────────────────────── */
 #pos-bar{
@@ -245,24 +231,11 @@ input{font:inherit}
     <div class="tb-stat hide-sm"><span class="lbl" id="tb-qqq-lbl">vs QQQ</span><span class="val" id="tb-qqq">—</span></div>
     <div class="tb-stat hide-sm"><span class="lbl">Exposure</span><span class="val" id="tb-exp">—</span></div>
     <div class="tb-stat hide-sm"><span class="lbl">Cash</span><span class="val" id="tb-cash">—</span></div>
+    <div class="tb-stat hide-sm"><span class="lbl">Week</span><span class="val" id="tb-week">—</span></div>
+    <div class="tb-stat hide-sm"><span class="lbl">QTD</span><span class="val" id="tb-qtd">—</span></div>
+    <div class="tb-stat hide-sm"><span class="lbl">YTD</span><span class="val" id="tb-ytd">—</span></div>
     <button id="tb-pause" onclick="toggleTrading()">Pause</button>
   </header>
-
-  <!-- PERFORMANCE BAR -->
-  <div id="perf-bar">
-    <div class="pb-stat"><div class="pb-lbl">Today</div><div class="pb-val" id="pb-today">—</div></div>
-    <div class="pb-div"></div>
-    <div class="pb-stat"><div class="pb-lbl">Week</div><div class="pb-val" id="pb-week">—</div></div>
-    <div class="pb-div"></div>
-    <div class="pb-stat"><div class="pb-lbl">QTD</div><div class="pb-val" id="pb-qtd">—</div></div>
-    <div class="pb-div"></div>
-    <div class="pb-stat"><div class="pb-lbl">YTD</div><div class="pb-val" id="pb-ytd">—</div></div>
-    <div class="pb-sep"></div>
-    <div class="pb-div"></div>
-    <div class="pb-stat"><div class="pb-lbl">Stock P&amp;L</div><div class="pb-val" id="pb-stock">—</div></div>
-    <div class="pb-div"></div>
-    <div class="pb-stat"><div class="pb-lbl">Options P&amp;L</div><div class="pb-val" id="pb-opts">—</div></div>
-  </div>
 
   <!-- POSITIONS -->
   <div>
@@ -604,35 +577,16 @@ function fmtPerf(dollar, pct) {
 }
 
 function renderPerfBar(data) {
-  const equity   = +(data?.account?.equity || 0);
-  const lastEq   = +(data?.account?.adjusted_last_equity || data?.account?.last_equity || equity);
-  const todayD   = equity - lastEq;
-  const todayPct = lastEq > 0 ? todayD / lastEq * 100 : 0;
-  $('pb-today').innerHTML = fmtPerf(todayD, todayPct);
-
-  if (_histEquity) {
-    ['week','qtd','ytd'].forEach(k => {
-      const base = _histEquity[k];
-      if (base && base > 0) {
-        const d = equity - base, p = d / base * 100;
-        $('pb-' + (k === 'qtd' ? 'qtd' : k === 'ytd' ? 'ytd' : 'week')).innerHTML = fmtPerf(d, p);
-      }
-    });
-  }
-
-  // Stock vs options unrealized P&L
-  const positions = data?.accounting?.positions || [];
-  let stockPnl = 0, optPnl = 0;
-  for (const p of positions) {
-    const pnl = +(p.unrealized_pnl || 0);
-    (OPT_RE.test(p.symbol || '') ? (optPnl += pnl) : (stockPnl += pnl));
-  }
-  const fmtDollar = v => {
-    const cls = v >= 0 ? 'pos-green' : 'pos-red';
-    return `<span class="${cls}">${v>=0?'+':'-'}$${Math.abs(Math.round(v)).toLocaleString()}</span>`;
-  };
-  $('pb-stock').innerHTML = fmtDollar(stockPnl);
-  $('pb-opts').innerHTML  = fmtDollar(optPnl);
+  if (!_histEquity) return;
+  const equity = +(data?.account?.equity || 0);
+  if (!equity) return;
+  ['week','qtd','ytd'].forEach(k => {
+    const base = _histEquity[k];
+    if (base && base > 0) {
+      const d = equity - base, p = d / base * 100;
+      $('tb-' + k).innerHTML = fmtPerf(d, p);
+    }
+  });
 }
 
 async function loadPerfHistory() {
