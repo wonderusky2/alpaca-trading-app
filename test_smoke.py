@@ -79,7 +79,7 @@ for mod_name, attr in checks:
 # ── 3. trader.py key functions exist ──────────────────────────────────────────
 trader = modules.get("trader")
 if trader:
-    for fn in ["_conviction_size_mult", "_calc_qty", "_holding_hours", "_check_trailing_stops", "_rotate_stale_positions", "_reentry_block_status", "main", "fetch_quotes"]:
+    for fn in ["_conviction_size_mult", "_calc_qty", "_holding_hours", "_minimum_hold_blocks_exit", "_check_trailing_stops", "_rotate_stale_positions", "_reentry_block_status", "main", "fetch_quotes"]:
         if not hasattr(trader, fn):
             errors.append(f"trader.{fn} — MISSING")
             print(f"  ✗ trader.{fn} missing")
@@ -101,6 +101,15 @@ if trader and hasattr(trader, "_calc_qty"):
     qty = trader._calc_qty(price=500, equity=100000, model={"position_size_pct": 0.01}, size_mult=1.0)
     assert qty >= 5, f"min alpha order floor should prevent toy orders, got qty={qty}"
     print("  ✓ _calc_qty enforces meaningful order floor")
+
+if trader and hasattr(trader, "_minimum_hold_blocks_exit"):
+    fresh = {"first_seen_at": trader.datetime.now(trader.timezone.utc).isoformat()}
+    assert trader._minimum_hold_blocks_exit(fresh, "rsi_overbought")
+    assert trader._minimum_hold_blocks_exit(fresh, "profit_giveback")
+    assert not trader._minimum_hold_blocks_exit(fresh, "loss_stop")
+    assert not trader._minimum_hold_blocks_exit(fresh, "regime_flip")
+    assert not trader._minimum_hold_blocks_exit(fresh, "profit_target")
+    print("  ✓ minimum hold filters noise exits without delaying hard-risk exits")
 
 if trader and hasattr(trader, "_reentry_block_status"):
     real_recent_trades = trader.trade_ledger.recent_trades

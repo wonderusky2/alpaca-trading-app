@@ -406,6 +406,14 @@ def _holding_days(memory_row: dict) -> int:
     return int(_holding_hours(memory_row) / 24)
 
 
+def _minimum_hold_blocks_exit(memory_row: dict, reason: str) -> bool:
+    """Suppress indicator-noise exits during the configured price-discovery window."""
+    if reason in {"loss_stop", "regime_flip", "profit_target"}:
+        return False
+    minimum = int(getattr(config, "ALPHA_MIN_HOLD_MINUTES", 0) or 0)
+    return minimum > 0 and (_holding_hours(memory_row) * 60) < minimum
+
+
 # ── Exit stack (#23) ──────────────────────────────────────────────────────────
 # Five gates evaluated in priority order.  No other exit logic.
 #
@@ -481,6 +489,13 @@ def _check_trailing_stops(client: AlpacaClient, positions: dict, quotes: dict, m
             reason = "profit_giveback"
 
         if not reason:
+            continue
+        if _minimum_hold_blocks_exit(memory.get(sym) or {}, reason):
+            log.info(
+                "Minimum hold blocked %s exit for %s at %.1fm (need %dm).",
+                reason, sym, hold_hours * 60,
+                int(getattr(config, "ALPHA_MIN_HOLD_MINUTES", 0) or 0),
+            )
             continue
 
         qty = int(abs(float(pos.get("qty") or 0)))
@@ -567,6 +582,12 @@ def _rotate_stale_positions(
     for sym, pos in list((positions or {}).items()):
         sym = str(sym).upper()
         if sym in CORE_SYMBOLS:
+            continue
+        if _minimum_hold_blocks_exit(memory.get(sym) or {}, "signal_rotation"):
+            log.info(
+                "Minimum hold blocked rotation review for %s at %.1fm.",
+                sym, _holding_hours(memory.get(sym) or {}) * 60,
+            )
             continue
 
         current_score, _ = sg.score_symbol(sym, quotes, regime)
