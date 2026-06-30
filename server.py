@@ -76,6 +76,15 @@ def _recent_buy_age_minutes() -> float | None:
     return None
 
 
+def _entry_regime_size_mult(regime: str) -> float:
+    """Keep dashboard sizing aligned with the trader loop."""
+    return float(sg.regime_size_multiplier(str(regime or "").upper()))
+
+
+def _entry_qty(price: float, equity: float, model: dict, regime: str, size_mult: float = 1.0) -> int:
+    return trader._calc_qty(price, equity, model, size_mult=size_mult * _entry_regime_size_mult(regime))
+
+
 def _edge_evidence_gate() -> dict:
     evidence = trade_ledger.edge_summary(limit=500)
     trades = int(evidence.get("trades") or 0)
@@ -197,16 +206,15 @@ def _chat_order_gate(
     equity = float((acct_snap or {}).get("equity") or 0)
     cash = float((acct_snap or {}).get("cash") or 0)
     regime = str((scores_snap or {}).get("regime") or "").upper()
-    regime_mult = 0.5 if regime in ("CHOPPY", "CHOP") else 1.0
-    alloc = equity * float(model.get("position_size_pct", 0.05)) * regime_mult
-
     orders = []
     deployed = 0.0
     for sig in qualifying_signals:
         price = float((sig.get("quote") or {}).get("price") or 0)
         if price <= 0:
             continue
-        qty = max(1, int(alloc / price))
+        qty = _entry_qty(price, equity, model, regime)
+        if qty <= 0:
+            continue
         cost = qty * price
         if cash > 0 and deployed + cost > cash * 0.95:
             break
@@ -388,6 +396,7 @@ MARKET_HOLIDAYS_2026 = {
 # ── Symbol taxonomy ────────────────────────────────────────────────────────────
 _BULL_ETFS   = {"TQQQ", "SOXL", "FNGU", "TECL", "UDOW"}
 _BEAR_ETFS   = {"SQQQ", "SPXS", "SOXS", "TECS", "UVXY", "SDOW"}
+_OPTION_SYMBOL_RE = re.compile(r"^([A-Z]+)\d{6}[CP]\d{8}$")
 _TECH_GROWTH = {
     "NVDA", "AMD", "TSLA", "MSTR", "COIN", "MARA",
     "PLTR", "CRWD", "HOOD", "RKLB", "ARM", "SMCI",
@@ -987,6 +996,52 @@ def _signal_exit_reason(sym: str, live_scores: dict | None, held_score_map: dict
     return None
 
 
+def _rotation_candidate(sym: str, live_scores: dict | None, held_score_map: dict, min_conviction: int) -> dict | None:
+    """Return a better live candidate when a held name has clearly lost the lead."""
+    held = held_score_map.get(sym.upper()) or {}
+    held_score = int(float(held.get("score") or 0))
+    if held_score <= 0:
+        return None
+    for cand in (live_scores or {}).get("signals") or []:
+        cand_sym = str(cand.get("symbol") or "").upper()
+        cand_score = int(float(cand.get("score") or 0))
+        if cand_sym == sym.upper():
+            continue
+        if cand_score >= min_conviction and (cand_score - held_score) >= 20:
+            return cand
+    return None
+
+
+def _option_underlying(symbol: str) -> str | None:
+    m = _OPTION_SYMBOL_RE.match(str(symbol or "").upper())
+    return m.group(1) if m else None
+
+
+def _legacy_unwind_reason(symbol: str) -> str | None:
+    sym = str(symbol or "").upper()
+    legacy_symbols = {str(s).upper() for s in getattr(config, "LEGACY_BENCHMARK_SYMBOLS", ("QQQ",))}
+    legacy_option_roots = {str(s).upper() for s in getattr(config, "LEGACY_OPTION_UNDERLYINGS", ("QQQ",))}
+    if sym in legacy_symbols:
+        return "legacy benchmark core exposure"
+    underlying = _option_underlying(sym)
+    if underlying and underlying in legacy_option_roots:
+        return f"legacy {underlying} option overlay"
+    return None
+
+
+def _annotate_legacy_positions(accounting: dict) -> list[dict]:
+    legacy_rows: list[dict] = []
+    for row in (accounting.get("positions") or []):
+        reason = _legacy_unwind_reason(row.get("symbol"))
+        row["legacy_position"] = bool(reason)
+        row["legacy_reason"] = reason
+        if reason:
+            legacy_rows.append(row)
+    accounting["legacy_positions"] = legacy_rows
+    accounting["legacy_unwind_required"] = bool(legacy_rows)
+    return legacy_rows
+
+
 def _exit_recommendations(positions: dict, accounting: dict, live_scores: dict | None, model: dict,
                            held_score_map: dict | None = None) -> list[dict]:
     memory = strategy_model.update_position_memory(positions)
@@ -997,6 +1052,20 @@ def _exit_recommendations(positions: dict, accounting: dict, live_scores: dict |
 
     for row in rows:
         sym = str(row.get("symbol") or "").upper()
+        legacy_reason = _legacy_unwind_reason(sym)
+        if legacy_reason and bool(getattr(config, "LEGACY_UNWIND_ENABLED", False)):
+            recommendations.append({
+                "symbol": sym,
+                "side": "buy" if str(row.get("side") or "").upper() == "SHORT" else "sell",
+                "qty": row.get("qty"),
+                "reason": "legacy_benchmark_unwind",
+                "summary": f"Unwind {legacy_reason}",
+                "unrealized_pnl": row.get("unrealized_pnl"),
+                "unrealized_pnl_pct": round(float(row.get("unrealized_pnl_pct") or 0), 2),
+                "holding_days": _holding_days(memory.get(sym) or {}),
+            })
+            continue
+
         pnl_pct = float(row.get("unrealized_pnl_pct") or 0)
         peak_pnl_pct = float((memory.get(sym) or {}).get("peak_unrealized_pnl_pct") or pnl_pct)
         giveback_pct = peak_pnl_pct - pnl_pct
@@ -1005,6 +1074,8 @@ def _exit_recommendations(positions: dict, accounting: dict, live_scores: dict |
 
         if pnl_pct <= -float(model.get("trailing_stop_pct", 3.0)):
             reason = "loss_stop"
+        elif peak_pnl_pct >= float(model.get("profit_lock_trigger_pct", 2.0)) and pnl_pct <= 0:
+            reason = "profit_roundtrip"
         elif peak_pnl_pct >= float(model.get("profit_lock_trigger_pct", 2.0)) and giveback_pct >= float(model.get("profit_giveback_pct", 1.0)):
             reason = "profit_giveback"
         elif hold_days >= int(model.get("max_holding_days", 2)):
@@ -1014,13 +1085,24 @@ def _exit_recommendations(positions: dict, accounting: dict, live_scores: dict |
         elif _held:
             # Technical signal checks (only run when we have fresh scores)
             reason = _signal_exit_reason(sym, live_scores, _held)
+            if not reason:
+                replacement = _rotation_candidate(sym, live_scores, _held, int(model.get("min_conviction", sg.MIN_CONVICTION)))
+                held_score = int(float((_held.get(sym) or {}).get("score") or 0))
+                if replacement and held_score < int(model.get("min_conviction", sg.MIN_CONVICTION)):
+                    reason = "rotation_out"
 
         if reason:
+            summary = reason
+            if reason == "rotation_out":
+                replacement = _rotation_candidate(sym, live_scores, _held, int(model.get("min_conviction", sg.MIN_CONVICTION)))
+                if replacement:
+                    summary = f"Rotate out — stronger setup available in {replacement.get('symbol')}"
             recommendations.append({
                 "symbol": sym,
                 "side": "sell",
                 "qty": row.get("qty"),
                 "reason": reason,
+                "summary": summary,
                 "unrealized_pnl": row.get("unrealized_pnl"),
                 "unrealized_pnl_pct": round(pnl_pct, 2),
                 "peak_unrealized_pnl_pct": round(peak_pnl_pct, 2),
@@ -1266,6 +1348,8 @@ def _plain_exit_reason(rec: dict) -> str:
         return f"Price action turned bearish ({pnl_str})"
     if "signal_deterioration" in raw:
         return f"Signal score collapsed — conviction lost ({pnl_str})"
+    if "rotation_out" in raw:
+        return f"Capital can rotate into a stronger live setup ({pnl_str})"
     if "news" in raw:
         return f"Bad news hit this stock ({pnl_str}) — exit to be safe"
     return f"Exit signal triggered ({pnl_str})"
@@ -2020,8 +2104,6 @@ def _build_preview_orders(
     cash   = float((account or {}).get("cash") or 0)
     model = strategy_model.sanitize_model(model or strategy_model.load_model())
     min_conviction = int(model["min_conviction"])
-    position_size_pct = min(float(model["position_size_pct"]), float(config.MAX_POSITION_SIZE_PCT))
-
     if plan_type == "custom" and custom_orders:
         return [
             {
@@ -2052,6 +2134,8 @@ def _build_preview_orders(
         return orders
 
     if plan_type in {"benchmark_core", "core", "index_core"}:
+        if not bool(getattr(config, "CORE_TRADER_ENABLED", False)):
+            return []
         sym = str(((custom_orders or [{}])[0] if custom_orders else {}).get("symbol") or config.CORE_BENCHMARK_SYMBOL).upper()
         if sym not in _CORE_BENCHMARKS:
             sym = config.CORE_BENCHMARK_SYMBOL
@@ -2140,8 +2224,12 @@ def _build_preview_orders(
         if price <= 0:
             continue
 
-        alloc = equity * position_size_pct
-        qty   = max(1, int(alloc / price))
+        qty = _entry_qty(
+            price, equity, model, (scores or {}).get("regime"),
+            size_mult=float(sig.get("size_mult") or 1.0),
+        )
+        if qty <= 0:
+            continue
         cost  = qty * price
         if deployed_cash + cost > cash * 0.95:   # leave 5% cash buffer
             break
@@ -2176,6 +2264,7 @@ class PortfolioAgent:
         open_orders = client.get_open_orders()
         recent      = client.get_recent_orders(limit=recent_limit)
         accounting  = _build_accounting(positions, open_orders, recent, account, live_scores)
+        _annotate_legacy_positions(accounting)
         model = strategy_model.load_model()
         exit_recs = _exit_recommendations(positions, accounting, live_scores, model, held_score_map)
         accounting["exit_recommendations"] = exit_recs
@@ -2257,8 +2346,20 @@ class RiskAgent:
                 errors.append({"symbol": sym, "error": f"Unsupported side: {side}"})
 
         option_orders = [o for o in orders if _is_option_order(o)]
+        options_enabled = any([
+            bool(getattr(config, "OPTIONS_HEDGE_ENABLED", False)),
+            bool(getattr(config, "OPTIONS_CALL_BUY_ENABLED", False)),
+            bool(getattr(config, "OPTIONS_CALL_INCOME_ENABLED", False)),
+        ])
         if option_orders and not bool(clock.get("is_open")):
             errors.append({"error": "Options orders are blocked while market is closed."})
+        elif option_orders and not options_enabled:
+            non_closing_option_orders = [
+                o for o in option_orders
+                if str(o.get("side") or "buy").lower() != "sell" or bool(o.get("covered_call"))
+            ]
+            if non_closing_option_orders:
+                errors.append({"error": "Options are disabled in the alpha reset. Unwind old options; do not add new ones."})
         elif buys and not bool(clock.get("is_open")):
             errors.append({"error": "Market is closed. Buy orders are blocked."})
 
@@ -2320,6 +2421,36 @@ class RiskAgent:
                         f"need {min_gap} minutes between new buys."
                     )
                 })
+            for sym in sorted(new_stock_buy_symbols):
+                allowed = {
+                    str(s).upper()
+                    for s in getattr(config, "ALPHA_ALLOWED_SYMBOLS", ())
+                    if str(s).strip()
+                }
+                blocked_symbols = {
+                    str(s).upper()
+                    for s in getattr(config, "ALPHA_BLOCKED_SYMBOLS", ())
+                    if str(s).strip()
+                }
+                if sym in blocked_symbols or (allowed and sym not in allowed):
+                    errors.append({
+                        "symbol": sym,
+                        "error": f"{sym} is outside the approved alpha universe.",
+                    })
+                    continue
+                blocked, reason = trader._reentry_block_status(sym)
+                if blocked:
+                    errors.append({
+                        "symbol": sym,
+                        "error": reason or f"{sym} is in a post-exit cooldown.",
+                    })
+                    continue
+                entry_blocked, entry_reason = trader._entry_limit_block_status(sym)
+                if entry_blocked:
+                    errors.append({
+                        "symbol": sym,
+                        "error": entry_reason,
+                    })
 
             choppy_floor = int(config.CHOPPY_ENTRY_MIN_SCORE)
             for o in buys:
@@ -2648,12 +2779,28 @@ class DecisionCoordinator:
             }
         combined_scores = dict(live_scores or {})
         combined_scores["held_scores"] = held_scores
+        alerts: list[dict] = []
+        legacy_positions = accounting.get("legacy_positions") or []
+        if legacy_positions:
+            legacy_syms = ", ".join(str(p.get("symbol") or "?") for p in legacy_positions[:3])
+            extra = f" (+{len(legacy_positions) - 3} more)" if len(legacy_positions) > 3 else ""
+            market_open = bool((snap.get("clock") or {}).get("is_open"))
+            alerts.append({
+                "level": "warning",
+                "code": "legacy_benchmark_inventory",
+                "message": (
+                    f"Legacy benchmark inventory detected: {legacy_syms}{extra}. "
+                    + ("Trader will unwind it before adding new alpha risk." if market_open
+                       else "Trader will unwind it when the market opens before adding new alpha risk.")
+                ),
+            })
         return {
             "ok": True,
             "paper": config.PAPER,
             "account": account,
             "clock": snap.get("clock"),
             "accounting": accounting,
+            "alerts": alerts,
             "benchmark": benchmark,
             "market_down_gate": market_down_gate,
             "live_scores": combined_scores,
@@ -2707,16 +2854,23 @@ class DecisionCoordinator:
 def _decision_from_state(accounting: dict, live_scores: dict | None, news_risk: list[dict]) -> dict:
     risk_state = accounting.get("risk_state") or {}
     positions = accounting.get("positions") or []
+    legacy_positions = accounting.get("legacy_positions") or []
     top = (live_scores or {}).get("top") or []
 
     if risk_state.get("action") == "reduce_risk":
         action = "reduce_risk"
         summary = risk_state.get("message") or "Risk is elevated. Reduce exposure before adding."
         severity = "danger"
+    elif legacy_positions:
+        syms = ", ".join(str(p.get("symbol") or "?") for p in legacy_positions[:3])
+        extra = f" (+{len(legacy_positions) - 3} more)" if len(legacy_positions) > 3 else ""
+        action = "unwind_legacy"
+        summary = f"Legacy benchmark inventory still on-book: {syms}{extra}. Unwind it before adding alpha risk."
+        severity = "warning"
     elif accounting.get("exit_recommendations"):
         first = accounting["exit_recommendations"][0]
         action = "exit_positions"
-        summary = f"Exit recommended for {first.get('symbol')}: {first.get('reason')}."
+        summary = f"Exit recommended for {first.get('symbol')}: {first.get('summary') or first.get('reason')}."
         severity = "warning"
     elif news_risk:
         action = "review_news"
@@ -2756,6 +2910,7 @@ def _portfolio_narrative(
     prev_regime = _last_event_state.get("regime", "")
     exits      = accounting.get("exit_recommendations") or []
     positions  = accounting.get("positions") or []
+    legacy_positions = accounting.get("legacy_positions") or []
     risk_state = accounting.get("risk_state") or {}
     top        = ((live_scores or {}).get("top") or [])[:5]
 
@@ -2804,6 +2959,14 @@ def _portfolio_narrative(
         else:
             why.append(f"All {winners} open position{'s are' if winners>1 else ' is'} in the green. Portfolio is up ${pnl_abs:,.0f}.")
 
+    if legacy_positions:
+        legacy_labels = ", ".join(str(p.get("symbol") or "?") for p in legacy_positions[:3])
+        extra = f" (and {len(legacy_positions) - 3} more)" if len(legacy_positions) > 3 else ""
+        why.append(
+            f"You're still carrying legacy benchmark inventory from the old system: {legacy_labels}{extra}. "
+            "That muddies whether the alpha engine is actually beating the benchmark."
+        )
+
     if news_risk:
         syms = ", ".join(nr.get("symbol", "?") for nr in news_risk[:2])
         extra = f" (and {len(news_risk)-2} more)" if len(news_risk) > 2 else ""
@@ -2832,6 +2995,8 @@ def _portfolio_narrative(
 
     if risk_state.get("action") == "reduce_risk":
         next_actions.append("Pull back — reduce positions and don't add new ones until conditions improve.")
+    elif legacy_positions:
+        next_actions.append("Unwind the legacy QQQ and QQQ-option book before adding new alpha positions.")
     elif exits:
         n = len(exits)
         next_actions.append(f"Sell the {n} position{'s' if n>1 else ''} that are triggering exit rules.")
@@ -2867,6 +3032,8 @@ def _portfolio_narrative(
             f"{int(cash_pct)}% of your money is in cash, {int(gross_exposure)}% invested across "
             f"{pos_count} position{'s' if pos_count>1 else ''}. You're {pnl_word} ${pnl_abs:,.0f}."
         )
+        if legacy_positions:
+            summary += f" Legacy benchmark exposure still needs to be unwound ({len(legacy_positions)} position{'s' if len(legacy_positions)>1 else ''})."
     else:
         summary = f"You're fully in cash. Market is {regime_desc}."
 
@@ -3856,16 +4023,19 @@ def api_lab_chat_message():
 
     # Match the trading preview path so chat explanations use the same score
     # and risk snapshot as the actual order gate.
+    context_error = ""
     try:
         scores_snap = _coordinator.market_news.live_scores(force=False) or {}
         trade_snap = _coordinator.portfolio.snapshot(live_scores=scores_snap)
     except Exception as e:
+        context_error = str(e)
         log.error("chat context fetch failed: %s", e, exc_info=True)
         scores_snap = cache_snap.get("live_scores") or {}
         trade_snap = cache_snap
 
     acct_snap   = trade_snap.get("account")    or {}
     acctg_snap  = trade_snap.get("accounting") or {}
+    context_available = bool(acct_snap) or bool(acctg_snap) or bool(cache_snap)
 
     def _flt(d, key, default=0.0):
         v = d.get(key, default)
@@ -3892,13 +4062,26 @@ def api_lab_chat_message():
         val  = float(p.get("current_value") or 0)
         days = p.get("holding_days") or ""
         pos_lines.append(f"{sym} qty={qty} val=${val:,.0f} P&L=${pnl:+.0f}{f' {days}d' if days else ''}")
+    legacy_rows = acctg_snap.get("legacy_positions") or []
+    legacy_lines = [
+        f"{p.get('symbol')} ({p.get('legacy_reason')})"
+        for p in legacy_rows
+    ]
 
     exit_recs   = acctg_snap.get("exit_recommendations") or []
     exit_lines  = [
-        f"{r.get('symbol')} reason={r.get('reason')} pnl_pct={r.get('unrealized_pnl_pct')}%"
+        f"{r.get('symbol')} reason={r.get('summary') or r.get('reason')} pnl_pct={r.get('unrealized_pnl_pct')}%"
         for r in exit_recs
     ]
     risk_state  = acctg_snap.get("risk_state") or {}
+
+    if not context_available and context_error:
+        reply = (
+            "Command Console is online, but live account context is unavailable right now. "
+            f"Backend error: {context_error}. "
+            "It can still accept prompts, but without broker data it cannot answer status, positions, or setups reliably."
+        )
+        return jsonify({"ok": True, "reply": reply, "variant": "context_unavailable"})
 
     model_state = strategy_model.load_model()
     variant     = model_state.get("active_variant", "current")
@@ -4164,6 +4347,31 @@ def api_lab_chat_message():
             "summary": f"Close all {len(orders)} position(s) — paper trade only",
         }})
 
+    legacy_keywords = {
+        "unwind legacy", "unwind benchmark", "exit benchmark baggage", "liquidate qqq",
+        "close qqq", "close qqq options", "sell qqq core", "flatten legacy"
+    }
+    if any(k in text_low for k in legacy_keywords):
+        if not legacy_rows:
+            return jsonify({"ok": True, "reply": "No legacy benchmark inventory is currently on-book."})
+        orders = []
+        for row in legacy_rows:
+            qty = int(abs(float(row.get("qty") or 0)))
+            if qty <= 0:
+                continue
+            side = "buy" if str(row.get("side") or "").upper() == "SHORT" else "sell"
+            orders.append({
+                "symbol": row.get("symbol"),
+                "qty": str(qty),
+                "side": side,
+                "estimated_value": float(row.get("current_value") or 0),
+            })
+        return jsonify({"ok": True, "trade_proposal": {
+            "orders": orders,
+            "summary": f"Unwind {len(orders)} legacy benchmark position(s)",
+            "context": "These are leftover QQQ / QQQ-option holdings from the old benchmark system. Clear them before judging the alpha engine.",
+        }})
+
     # ── Fast-path: QQQ core rebalance intent ─────────────────────────────────
     rebalance_keywords = {
         "rebalance qqq", "rebalance qqq core", "rebalance core", "rebalance benchmark",
@@ -4171,6 +4379,15 @@ def api_lab_chat_message():
         "build qqq core", "qqq core allocation", "benchmark core allocation",
     }
     if any(k in text_low for k in rebalance_keywords):
+        if not bool(getattr(config, "CORE_TRADER_ENABLED", False)):
+            return jsonify({
+                "ok": True,
+                "reply": (
+                    "Benchmark-core autopilot is disabled in alpha mode. "
+                    "This account now deploys into the strongest qualifying setups instead of force-filling QQQ. "
+                    "Ask for the best setups or say 'execute signals' to stage paper orders."
+                ),
+            })
         preview = _coordinator.trading.preview("benchmark_core", None, trade_snap, scores_snap)
         orders = preview.get("orders") or []
         gate = preview.get("risk_gate") or {}
@@ -4217,8 +4434,6 @@ def api_lab_chat_message():
         held_syms = {p["symbol"].upper() for p in positions}
         _model = strategy_model.load_model()
         min_conv = int(_model.get("min_conviction", 75))
-        size_pct = float(_model.get("position_size_pct", 0.05))
-        regime_mult = 0.5 if regime in ("CHOPPY", "CHOP") else 1.0
         orders = []
         deployed = 0.0
         for sig in cached_signals:
@@ -4236,8 +4451,12 @@ def api_lab_chat_message():
                     pass
             if price <= 0:
                 continue
-            alloc = equity * size_pct * regime_mult
-            qty = max(1, int(alloc / price))
+            qty = _entry_qty(
+                price, equity, _model, regime,
+                size_mult=float(sig.get("size_mult") or 1.0),
+            )
+            if qty <= 0:
+                continue
             cost = qty * price
             if deployed + cost > cash * 0.95:
                 break
@@ -4270,46 +4489,46 @@ def api_lab_chat_message():
         if not order_gate.get("ok"):
             err = (order_gate.get("errors") or [{}])[0].get("error") or "Risk gate blocks new buys."
             return jsonify({"ok": True, "reply": f"New buys are blocked: {err}"})
-        regime_note = " at 50% size (CHOPPY)" if regime_mult < 1 else ""
         return jsonify({"ok": True, "trade_proposal": {
             "orders": orders,
             "summary": (
-                f"Enter top {len(orders)} signal(s){regime_note}: "
+                f"Enter top {len(orders)} signal(s): "
                 + ", ".join(f"{o['symbol']} x{o['qty']}" for o in orders)
             ),
         }})
 
     # ── System prompt ─────────────────────────────────────────────────────────
     system_prompt = """\
-You are the trading agent for a QQQ Autopilot account — Alpaca PAPER trading, no real money at risk.
+You are the trading agent for an alpha-first paper trading account — Alpaca PAPER trading, no real money at risk.
 
-THIS SYSTEM TRADES ONLY QQQ. Satellite stock trading is disabled. Do not suggest buying or selling individual stocks.
+THIS SYSTEM IS A STOCK ALPHA TRADER. Its job is to find high-conviction long ideas, size them meaningfully, hold cash when edge is weak, and protect downside hard.
 
 STRATEGY:
-- Core holding: QQQ shares, sized by regime
-  BULL  → 100% of equity in QQQ + buy 1-2 slightly OTM calls (2% OTM, 30-45 DTE) to amplify upside
-  CHOPPY → 95% of equity in QQQ + write covered calls on all lots (collect premium, cap upside)
-  BEAR  → 30% of equity in QQQ + buy puts (5% OTM, 30-60 DTE) as hedge
-- Regime uses VIX + EMA9/21 + ATR + intraday momentum + breadth signals
-- Rebalance triggers when allocation drifts >3% from target
+- Trade individual high-momentum stocks and ETFs, not benchmark-hugging QQQ allocations
+- Use regime, breadth, momentum, and price-action signals to decide whether the tape supports aggressive long risk
+- In BULL: press confirmed momentum names
+- In CHOPPY: only take stronger reversion or exceptional momentum setups
+- In BEAR: reduce long exposure fast; inverse ETFs and protection are allowed, but reckless long buying is not
+- Position sizing scales with conviction, but hard caps still control risk
+- Downside protection matters more than activity. No edge, no trade.
 
 OPTIONS:
-- Covered calls: SHORT QQQ calls, strike ~4% OTM, 7-21 DTE — collect premium in CHOPPY
-- Long calls: LONG QQQ calls, strike ~2% OTM, 21-45 DTE — amplify gains in BULL
-- Put hedges: LONG QQQ puts, strike ~5% OTM, 30-60 DTE — protect in BEAR
+- Options are a secondary protection/income lab, not the primary engine
+- Puts may be appropriate for market-level hedge conditions
+- Covered calls and directional calls are optional overlays and should not be oversold as proven alpha
 
 WHAT YOU CAN ANSWER:
 - Portfolio status: equity, P&L today/week/QTD/YTD, exposure, cash
-- Regime: current regime, why it triggered, what it means for allocation
-- Options: what calls/puts are held, when they expire, P&L, what the engine recommends next
-- News: summarise recent headlines affecting QQQ holdings (META, NVDA, GOOG, AAPL, MSFT, etc.)
-- Rebalance: whether allocation needs adjusting and by how much
-- Performance vs benchmark: how the account is doing vs SPY/QQQ hypothetical
+- Regime: current regime, why it triggered, and what it means for aggressive risk
+- Signals: which names are actionable, why they score well, and why others are blocked
+- Risk: what is preventing new buys, what would reduce exposure, and how downside is being managed
+- Orders: what the engine wants to buy or sell next and why
+- Performance: how the account is doing and whether the current behavior matches the strategy
 
-WHAT YOU CANNOT DO:
-- Buy or sell individual stocks (satellite trading is OFF)
-- Score individual tickers
-- Place orders for non-QQQ symbols
+WHAT YOU SHOULD NOT DO:
+- Pretend the system has edge when the data does not show it
+- Recommend trades without conviction, sizing, and a risk reason
+- Describe the app as QQQ-only when the actual engine is trading stock alpha
 
 Be concise. Talk like a prop trader. Dollar amounts with $ and commas. Percentages with one decimal.
 Never fabricate data not in the context provided. This is paper trading."""
@@ -4512,8 +4731,6 @@ Never fabricate data not in the context provided. This is paper trading."""
                     held_syms = {p["symbol"].upper() for p in positions}
                     _model = strategy_model.load_model()
                     min_conv = int(_model.get("min_conviction", 75))
-                    size_pct = float(_model.get("position_size_pct", 0.05))
-                    regime_mult = 0.5 if regime in ("CHOPPY", "CHOP") else 1.0
                     _orders = []
                     _deployed = 0.0
                     for _sig in cached_signals:
@@ -4525,8 +4742,12 @@ Never fabricate data not in the context provided. This is paper trading."""
                         _price = float((_sig.get("quote") or {}).get("price") or 0)
                         if _price <= 0:
                             continue
-                        _alloc = equity * size_pct * regime_mult
-                        _qty = max(1, int(_alloc / _price))
+                        _qty = _entry_qty(
+                            _price, equity, _model, regime,
+                            size_mult=float(_sig.get("size_mult") or 1.0),
+                        )
+                        if _qty <= 0:
+                            continue
                         _cost = _qty * _price
                         if _deployed + _cost > cash * 0.95:
                             break
@@ -4549,11 +4770,10 @@ Never fabricate data not in the context provided. This is paper trading."""
                         if not order_gate.get("ok"):
                             err = (order_gate.get("errors") or [{}])[0].get("error") or "Risk gate blocks new buys."
                             return jsonify({"ok": True, "reply": f"New buys are blocked: {err}"})
-                        _regime_note = " at 50% size (CHOPPY)" if regime_mult < 1 else ""
                         return jsonify({"ok": True, "trade_proposal": {
                             "orders": _orders,
                             "summary": (
-                                f"Enter top {len(_orders)} signal(s){_regime_note}: "
+                                f"Enter top {len(_orders)} signal(s): "
                                 + ", ".join(f"{o['symbol']} x{o['qty']}" for o in _orders)
                             ),
                         }})
@@ -4569,8 +4789,6 @@ Never fabricate data not in the context provided. This is paper trading."""
                 # Sanitize orders
                 clean_orders = []
                 _tp_model    = strategy_model.load_model()
-                _tp_size_pct = float(_tp_model.get("position_size_pct", 0.05))
-                _tp_regime_m = 0.5 if regime in ("CHOPPY", "CHOP") else 1.0
                 for o in orders:
                     sym  = str(o.get("symbol") or "").upper().strip()
                     side = str(o.get("side") or "buy").lower()
@@ -4583,8 +4801,7 @@ Never fabricate data not in the context provided. This is paper trading."""
                             except Exception:
                                 _price_tp = 0
                             if _price_tp > 0:
-                                _alloc_tp = equity * _tp_size_pct * _tp_regime_m
-                                qty = max(1, int(_alloc_tp / _price_tp))
+                                qty = _entry_qty(_price_tp, equity, _tp_model, regime)
                         if qty > 0:
                             _est = round(qty * float(o.get("price") or 0), 2)
                             clean_orders.append({"symbol": sym, "side": side, "qty": qty,
@@ -4605,16 +4822,17 @@ Never fabricate data not in the context provided. This is paper trading."""
         reply = _simple_chat_response(text_low, equity, daily_pnl, cash, regime, pos_lines, sig_lines,
                                       variant_lines=variant_lines, recent_order_lines=recent_order_lines,
                                       model_state=model_state, entry_gate=entry_gate,
-                                      benchmark=benchmark_snap)
+                                      benchmark=benchmark_snap, legacy_lines=legacy_lines)
         return jsonify({"ok": True, "reply": f"(LLM unavailable: {type(e).__name__}) {reply}",
                         "variant": "keyword_fallback"})
 
 
 def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_lines,
                           variant_lines=None, recent_order_lines=None, model_state=None,
-                          entry_gate=None, benchmark=None):
+                          entry_gate=None, benchmark=None, legacy_lines=None):
     entry_gate = entry_gate or {}
     benchmark = benchmark or {}
+    legacy_lines = legacy_lines or []
 
     if any(k in text for k in (
         "why are you not buying", "why aren't you buying", "why not buying",
@@ -4624,11 +4842,11 @@ def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_
         if entry_gate.get("blocked"):
             return entry_gate.get("summary") or "Auto entries are currently blocked by the trader gate."
         regime_note = (
-            f" CHOPPY regime requires score ≥ {config.CHOPPY_ENTRY_MIN_SCORE} and one new buy per hour."
+            f" CHOPPY regime still demands real edge: score ≥ {config.CHOPPY_ENTRY_MIN_SCORE}."
             if regime in ("CHOPPY", "CHOP") else ""
         )
         if sig_lines:
-            return ("Auto entries are eligible on the next trader tick. Top signals: "
+            return ("Auto entries are eligible on the next trader tick. Best setups right now: "
                     + "; ".join(sig_lines[:2]) + "." + regime_note)
         return "No qualifying signal is currently above the entry threshold." + regime_note
 
@@ -4646,21 +4864,23 @@ def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_
         )
 
     if any(k in text for k in ("position", "holding", "open")):
+        if legacy_lines:
+            return "Open positions include legacy benchmark inventory that should be unwound first: " + "; ".join(legacy_lines[:4]) + "."
         if pos_lines:
             return "Open positions: " + "; ".join(pos_lines) + "."
         return "No open positions. All cash."
 
     if any(k in text for k in ("signal", "scan", "score", "what to buy", "entry", "candidate")):
         if sig_lines:
-            return "Top signals: " + "; ".join(sig_lines) + "."
+            return "Best current setups: " + "; ".join(sig_lines) + "."
         return "No signals cached yet. Trigger a scan or wait for next run."
 
     if any(k in text for k in ("regime", "market", "bull", "bear", "choppy")):
         desc = {
-            "BULL":    "trending up — momentum strategies active.",
-            "BEAR":    "trending down — hedges and exits favored.",
-            "CHOP":    f"choppy — new entries require exceptional conviction, score ≥ {config.CHOPPY_ENTRY_MIN_SCORE}.",
-            "CHOPPY":  f"choppy — new entries require exceptional conviction, score ≥ {config.CHOPPY_ENTRY_MIN_SCORE}.",
+            "BULL":    "trending up — momentum longs can be sized aggressively.",
+            "BEAR":    "trending down — protect capital, cut weak longs, and prefer defense.",
+            "CHOP":    f"choppy — only stronger setups qualify, score ≥ {config.CHOPPY_ENTRY_MIN_SCORE}.",
+            "CHOPPY":  f"choppy — only stronger setups qualify, score ≥ {config.CHOPPY_ENTRY_MIN_SCORE}.",
             "UNKNOWN": "still loading — signals refreshing.",
         }.get(regime, "still loading.")
         return f"Current market is {desc}"
@@ -4681,7 +4901,7 @@ def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_
     if any(k in text for k in ("model", "strategy", "conviction", "generation", "param", "setting")):
         if model_state:
             m = model_state
-            return (f"Strategy gen {m.get('generation',0)}: variant={m.get('active_variant','?')}, "
+            return (f"Alpha engine gen {m.get('generation',0)}: variant={m.get('active_variant','?')}, "
                     f"min_conviction={m.get('min_conviction',75)}, max_positions={m.get('max_positions',3)}, "
                     f"position_size={int(float(m.get('position_size_pct',0.05))*100)}%, "
                     f"trailing_stop={m.get('trailing_stop_pct',3.0)}%, "
@@ -4690,7 +4910,7 @@ def _simple_chat_response(text, equity, daily_pnl, cash, regime, pos_lines, sig_
 
     return (f"Equity ${equity:,.0f} | P&L ${daily_pnl:+,.0f} | Regime {regime} | "
             f"{'No positions' if not pos_lines else str(len(pos_lines)) + ' positions open'}. "
-            "Ask me about positions, signals, P&L, regime, orders, variant history, or model settings.")
+            "Ask me about setups, risk blocks, positions, P&L, orders, variant history, or model settings.")
 
 
 @app.route("/api/lab/trader/control")

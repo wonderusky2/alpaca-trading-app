@@ -77,7 +77,7 @@ for mod_name, attr in checks:
 # ── 3. trader.py key functions exist ──────────────────────────────────────────
 trader = modules.get("trader")
 if trader:
-    for fn in ["_conviction_size_mult", "_calc_qty", "_holding_hours", "_check_trailing_stops", "main", "fetch_quotes"]:
+    for fn in ["_conviction_size_mult", "_calc_qty", "_holding_hours", "_check_trailing_stops", "_rotate_stale_positions", "_reentry_block_status", "main", "fetch_quotes"]:
         if not hasattr(trader, fn):
             errors.append(f"trader.{fn} — MISSING")
             print(f"  ✗ trader.{fn} missing")
@@ -85,14 +85,60 @@ if trader:
             print(f"  ✓ trader.{fn}")
 
 # ── 4. Conviction multiplier sanity ───────────────────────────────────────────
-# Conviction scaling disabled (#19) — all scores return flat 1.0
+# Alpha mode uses tiered conviction sizing: press A+ setups, trim borderline ones.
 if trader and hasattr(trader, "_conviction_size_mult"):
     fn = trader._conviction_size_mult
-    assert fn(95) == 1.0,   f"score 95 should be 1x (conviction scaling disabled), got {fn(95)}"
-    assert fn(85) == 1.0,   f"score 85 should be 1x (conviction scaling disabled), got {fn(85)}"
-    assert fn(75) == 1.0,   f"score 75 should be 1x (conviction scaling disabled), got {fn(75)}"
-    assert fn(60) == 1.0,   f"score 60 should be 1x (conviction scaling disabled), got {fn(60)}"
-    print("  ✓ _conviction_size_mult flat 1x (conviction scaling disabled)")
+    assert fn(95) == 1.35,  f"score 95 should size at 1.35x, got {fn(95)}"
+    assert fn(88) == 1.20,  f"score 88 should size at 1.20x, got {fn(88)}"
+    assert fn(80) == 1.0,   f"score 80 should size at 1.0x, got {fn(80)}"
+    assert fn(60) == 0.75,  f"score 60 should size at 0.75x, got {fn(60)}"
+    print("  ✓ _conviction_size_mult tiered alpha sizing")
+
+# ── 5. Sizing / migration sanity ─────────────────────────────────────────────
+if trader and hasattr(trader, "_calc_qty"):
+    qty = trader._calc_qty(price=500, equity=100000, model={"position_size_pct": 0.01}, size_mult=1.0)
+    assert qty >= 5, f"min alpha order floor should prevent toy orders, got qty={qty}"
+    print("  ✓ _calc_qty enforces meaningful order floor")
+
+if trader and hasattr(trader, "_reentry_block_status"):
+    real_recent_trades = trader.trade_ledger.recent_trades
+    try:
+        trader.trade_ledger.recent_trades = lambda limit=300: [{
+            "symbol": "SMCI",
+            "side": "sell",
+            "recorded_at": trader.datetime.now(trader.timezone.utc).isoformat(),
+            "exit_reason": "rotation_out",
+        }]
+        blocked, reason = trader._reentry_block_status("SMCI")
+        assert blocked, "same-day rotation exit should block immediate re-entry"
+        assert "next trading session" in reason.lower(), f"unexpected cooldown message: {reason}"
+        print("  ✓ same-day rotation exits block re-entry")
+    finally:
+        trader.trade_ledger.recent_trades = real_recent_trades
+
+if trader and hasattr(trader, "_entry_limit_block_status"):
+    real_recent_trades = trader.trade_ledger.recent_trades
+    try:
+        trader.trade_ledger.recent_trades = lambda limit=300: [{
+            "symbol": "HOOD",
+            "side": "buy",
+            "recorded_at": trader.datetime.now(trader.timezone.utc).isoformat(),
+        }]
+        blocked, reason = trader._entry_limit_block_status("HOOD")
+        assert blocked, "daily symbol entry limit should block repeated same-day entries"
+        assert "entry slot" in reason.lower(), f"unexpected entry limit message: {reason}"
+        print("  ✓ same-day symbol entry cap blocks churn")
+    finally:
+        trader.trade_ledger.recent_trades = real_recent_trades
+
+sm = modules.get("strategy_model")
+if sm:
+    migrated = sm.sanitize_model({"version": 2})
+    assert migrated["version"] >= 4, f"expected v4 migration, got {migrated['version']}"
+    assert migrated["max_positions"] <= 3, f"expected concentrated posture, got {migrated['max_positions']}"
+    assert migrated["max_holding_days"] <= 1, f"expected faster exit posture, got {migrated['max_holding_days']}"
+    assert migrated["position_size_pct"] >= 0.16, f"expected meaningful sizing, got {migrated['position_size_pct']}"
+    print("  ✓ strategy_model migrates into concentrated alpha defaults")
 
 # ── Result ────────────────────────────────────────────────────────────────────
 print()
