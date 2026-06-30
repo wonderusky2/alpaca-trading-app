@@ -78,6 +78,9 @@ _TRADE_MIGRATIONS = {
     "source": "TEXT",
     "intent": "TEXT",
     "experiment_id": "TEXT",
+    "hold_minutes": "REAL",
+    "entry_signal_score": "REAL",
+    "entry_regime": "TEXT",
 }
 
 
@@ -177,24 +180,34 @@ def reconcile_broker_orders(orders: list[dict]) -> dict:
             ).fetchone()
             intent_data = intent_row or (None, None, None, None, None, None, None)
             if side == "sell":
-                pnl, matched_experiment = _fifo_realized_match(con, symbol, qty, price)
+                (
+                    pnl,
+                    matched_experiment,
+                    hold_minutes,
+                    entry_signal_score,
+                    entry_regime,
+                ) = _fifo_realized_match(con, symbol, qty, price, filled_at)
             else:
                 pnl = None
                 matched_experiment = intent_data[6]
+                hold_minutes = None
+                entry_signal_score = None
+                entry_regime = None
             con.execute(
                 """INSERT INTO trades
                    (recorded_at, symbol, side, qty, price, notional, pnl,
                     exit_reason, regime, model_gen, signal_score, signal_snapshot,
                     model_snapshot, filled_at, broker_order_id, source, intent,
-                    experiment_id)
+                    experiment_id, hold_minutes, entry_signal_score, entry_regime)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           'alpaca_fill', ?, ?)""",
+                           'alpaca_fill', ?, ?, ?, ?, ?)""",
                 (
                     filled_at, symbol, side, qty, price, qty * price, pnl,
                     intent_data[0] if side == "sell" else None,
                     intent_data[1], intent_data[2], intent_data[3], intent_data[4],
                     intent_data[5] or json.dumps({}), filled_at, order_id,
-                    intent_data[0], matched_experiment,
+                    intent_data[0], matched_experiment, hold_minutes,
+                    entry_signal_score, entry_regime,
                 ),
             )
             inserted += 1
@@ -215,19 +228,25 @@ def _fifo_realized_match(
     symbol: str,
     sell_qty: int,
     sell_price: float,
-) -> tuple[float | None, str | None]:
-    """Return FIFO realized P&L and the experiment owning the matched entry lots."""
+    sell_filled_at: str | None = None,
+) -> tuple[float | None, str | None, float | None, float | None, str | None]:
+    """Return realized P&L plus inherited FIFO entry attribution."""
     rows = con.execute(
-        """SELECT side, qty, price, experiment_id FROM trades
+        """SELECT side, qty, price, experiment_id, filled_at,
+                  signal_score, regime
+           FROM trades
            WHERE symbol=? AND source='alpaca_fill'
            ORDER BY COALESCE(filled_at, recorded_at), id""",
         (symbol,),
     ).fetchall()
     lots: list[list] = []
-    for side, qty, price, experiment_id in rows:
+    for side, qty, price, experiment_id, filled_at, signal_score, regime in rows:
         remaining = float(qty)
         if side == "buy":
-            lots.append([remaining, float(price), experiment_id])
+            lots.append([
+                remaining, float(price), experiment_id, filled_at,
+                signal_score, regime,
+            ])
             continue
         while remaining > 0 and lots:
             used = min(remaining, lots[0][0])
@@ -239,11 +258,30 @@ def _fifo_realized_match(
     pnl = 0.0
     matched = 0.0
     matched_experiments: set[str | None] = set()
+    weighted_hold_minutes = 0.0
+    weighted_signal_score = 0.0
+    scored_qty = 0.0
+    matched_regimes: set[str] = set()
+    try:
+        sell_time = datetime.fromisoformat(str(sell_filled_at).replace("Z", "+00:00")) if sell_filled_at else None
+    except Exception:
+        sell_time = None
     while remaining > 0 and lots:
         used = min(remaining, lots[0][0])
         pnl += used * (sell_price - lots[0][1])
         matched += used
         matched_experiments.add(lots[0][2])
+        if sell_time and lots[0][3]:
+            try:
+                buy_time = datetime.fromisoformat(str(lots[0][3]).replace("Z", "+00:00"))
+                weighted_hold_minutes += used * max(0.0, (sell_time - buy_time).total_seconds() / 60)
+            except Exception:
+                pass
+        if lots[0][4] is not None:
+            weighted_signal_score += used * float(lots[0][4])
+            scored_qty += used
+        if lots[0][5]:
+            matched_regimes.add(str(lots[0][5]))
         lots[0][0] -= used
         remaining -= used
         if lots[0][0] <= 0:
@@ -252,7 +290,16 @@ def _fifo_realized_match(
     if matched == float(sell_qty) and len(matched_experiments) == 1:
         candidate = next(iter(matched_experiments))
         experiment_id = str(candidate) if candidate else None
-    return (round(pnl, 2) if matched > 0 else None), experiment_id
+    hold_minutes = round(weighted_hold_minutes / matched, 1) if matched > 0 and sell_time else None
+    entry_signal_score = round(weighted_signal_score / scored_qty, 1) if scored_qty > 0 else None
+    entry_regime = next(iter(matched_regimes)) if len(matched_regimes) == 1 else None
+    return (
+        round(pnl, 2) if matched > 0 else None,
+        experiment_id,
+        hold_minutes,
+        entry_signal_score,
+        entry_regime,
+    )
 
 
 def _fifo_realized_pnl(con: sqlite3.Connection, symbol: str, sell_qty: int, sell_price: float) -> float | None:

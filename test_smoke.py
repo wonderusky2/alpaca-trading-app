@@ -196,6 +196,9 @@ try:
         assert sell["pnl"] == 50.0, sell
         assert sell["exit_reason"] == "profit_target", sell
         assert sell["experiment_id"] == "test_alpha", sell
+        assert sell["hold_minutes"] == 60.0, sell
+        assert sell["entry_signal_score"] == 88.0, sell
+        assert sell["entry_regime"] == "BULL", sell
         assert legacy_sell["experiment_id"] is None, legacy_sell
         assert trade_ledger.edge_summary(experiment_id="test_alpha")["expectancy"] == 50.0
         assert all(row["source"] == "alpaca_fill" for row in rows), rows
