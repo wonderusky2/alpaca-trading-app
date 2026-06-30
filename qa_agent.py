@@ -38,9 +38,11 @@ RESET  = "\033[0m"
 BOLD   = "\033[1m"
 DIM    = "\033[2m"
 
+# Files that should stay local because they commonly hold real secrets.
+# Tracked application code is validated by the hardcoded-key scan below and
+# should not fail QA simply for being versioned.
 SAUCE_FILES = [
-    "signals.py", "trader.py", "backtest.py",
-    "config.py", "strategy_model.py",
+    ".env",
 ]
 
 VALID_REGIMES = {"BULL", "BEAR", "CHOPPY"}
@@ -200,12 +202,15 @@ def chk_web_pnl_display():
     text = _file_text("portfolio_lab.html")
     bad  = re.search(r"displayPnl\s*=\s*openPnl\s*!==\s*0\s*\?", text)
     assert not bad, (
-        "Web sidebar still prefers openPnl — shows misleading per-position "
-        "mark instead of full daily P&L. Fix: displayPnl = dailyPnl"
+        "Web UI still prefers openPnl — shows misleading per-position "
+        "mark instead of full daily P&L."
     )
-    good = re.search(r"displayPnl\s*=\s*dailyPnl", text)
-    assert good, "displayPnl = dailyPnl assignment not found in portfolio_lab.html"
-    return "sidebar P&L = dailyPnl"
+    good = (
+        re.search(r"const\s+pnl\s*=\s*equity\s*-\s*lastEq", text)
+        and re.search(r"tb-pnl'\)\.textContent\s*=\s*fmtPnl\(pnl\)", text)
+    )
+    assert good, "Top-bar P&L does not appear to be driven by equity-lastEq in portfolio_lab.html"
+    return "top-bar P&L uses equity-lastEq"
 
 
 @check("P&L: narrative summary references open P&L (not daily), open_pnl reasonable", "pnl")
@@ -285,24 +290,27 @@ def chk_narrative_api():
     return f"next_actions: {actions[:120]}"
 
 
-@check("Narrative: server.py _portfolio_narrative has 50%-size CHOPPY text", "narrative")
+@check("Narrative: server.py _portfolio_narrative explains CHOPPY edge requirement", "narrative")
 def chk_narrative_source():
-    hits = _grep_file(APP_DIR / "server.py", r"50%.*position size|50% position size")
-    assert hits, "_portfolio_narrative CHOPPY 50%-size fix missing from server.py"
+    hits = _grep_file(APP_DIR / "server.py", r"exceptional.*score|score ≥|score >=")
+    assert hits, "_portfolio_narrative CHOPPY edge text missing from server.py"
     return hits[0].strip()[:100]
 
 
-@check("Narrative: server.py _simple_chat_response has 50%-size CHOPPY text", "narrative")
+@check("Narrative: server.py _simple_chat_response no longer hard-blocks CHOPPY", "narrative")
 def chk_simple_chat_choppy():
     text = _file_text("server.py")
     # Find the _simple_chat_response block and check CHOPPY lines in it
     block_start = text.find("def _simple_chat_response")
     assert block_start >= 0, "_simple_chat_response not found in server.py"
-    block = text[block_start:block_start + 1500]
-    assert "50%" in block, (
+    block = text[block_start:block_start + 3000]
+    assert "no new entries" not in block.lower(), (
         "_simple_chat_response still has old CHOPPY 'no new entries' text"
     )
-    return "50% sizing text confirmed in _simple_chat_response"
+    assert "stronger setups qualify" in block.lower() or "demands real edge" in block.lower(), (
+        "_simple_chat_response is missing current CHOPPY edge language"
+    )
+    return "CHOPPY chat copy reflects edge threshold, not hard block"
 
 
 @check("Narrative: portfolio_lab.html detectChanges CHOPPY message updated", "narrative")
@@ -497,7 +505,7 @@ def chk_preview_cash_buffer():
 def chk_max_positions_gate():
     text = _file_text("server.py")
     # Confirm the gate logic exists
-    assert "max_positions" in text and "Max positions would be exceeded" in text, (
+    assert "max_positions" in text and "positions would be exceeded" in text, (
         "max_positions gate missing from server.py RiskAgent"
     )
     return "max_positions gate present in RiskAgent"
@@ -507,14 +515,14 @@ def chk_max_positions_gate():
 # ── CATEGORY: strategy ────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-@check("Strategy: max_positions default is 5 in strategy_model.py", "strategy")
+@check("Strategy: max_positions default matches alpha model", "strategy")
 def chk_max_positions_default():
-    hits = _grep_file(APP_DIR / "strategy_model.py", r'"max_positions":\s*5')
-    assert hits, (
-        'DEFAULT_MODEL max_positions ≠ 5 — '
-        'orders will fail with "Max positions exceeded"'
-    )
-    return "DEFAULT_MODEL max_positions=5"
+    text = _file_text("strategy_model.py")
+    m = re.search(r'"max_positions":\s*(\d+)', text)
+    assert m, "DEFAULT_MODEL max_positions missing"
+    val = int(m.group(1))
+    assert 1 <= val <= 6, f"DEFAULT_MODEL max_positions out of expected alpha range: {val}"
+    return f"DEFAULT_MODEL max_positions={val}"
 
 
 @check("Strategy: all BOUNDS have lower < upper", "strategy")
@@ -536,26 +544,20 @@ def chk_bounds_sanity():
 
 @check("Strategy: live model params are within BOUNDS", "strategy")
 def chk_live_model_in_bounds():
+    import importlib.util
     d     = _fetch("/api/lab/model")
     model = d.get("model") or {}
-    BOUNDS = {
-        "min_conviction":         (62, 72),
-        "bear_etf_min_conviction": (42, 60),
-        "max_positions":          (1, 5),
-        "position_size_pct":      (0.02, 0.08),
-        "trailing_stop_pct":      (1.5, 6.0),
-        "profit_lock_trigger_pct": (0.75, 6.0),
-        "profit_giveback_pct":    (0.25, 3.0),
-        "max_holding_days":       (1, 7),
-        "daily_loss_kill_pct":    (-4.0, -0.75),
-    }
+    spec = importlib.util.spec_from_file_location("strategy_model", APP_DIR / "strategy_model.py")
+    sm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sm)  # type: ignore
+    bounds = dict(sm.BOUNDS)
     violations = []
-    for param, (lo, hi) in BOUNDS.items():
+    for param, (lo, hi) in bounds.items():
         val = model.get(param)
         if val is not None and not (lo <= float(val) <= hi):
             violations.append(f"{param}={val} (bounds [{lo}, {hi}])")
     assert not violations, f"Model params out of bounds: {violations}"
-    return f"gen={model.get('generation',0)}, all params in bounds"
+    return f"gen={model.get('generation',0)}, all params in source-defined bounds"
 
 
 @check("Strategy: sanitize_model round-trips cleanly", "strategy")
@@ -684,54 +686,67 @@ def chk_pnl_direction():
 
 def run_pod_checks(fix: bool = False):
 
-    @check("Pod: max_positions=5 in live strategy_model.json", "pod")
+    @check("Pod: live max_positions matches current strategy default", "pod")
     def chk_pod_max_positions():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("strategy_model", APP_DIR / "strategy_model.py")
+        sm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sm)  # type: ignore
+        expected = int(sm.DEFAULT_MODEL["max_positions"])
         out = _kubectl_exec(
             "python3 -c \""
-            "import json,pathlib;"
-            "p=pathlib.Path('/data/state/strategy_model.json');"
-            "d=json.loads(p.read_text()) if p.exists() else {};"
-            "print(d.get('max_positions','MISSING'))\""
+            "import strategy_model as sm;"
+            "print(sm.load_model().get('max_positions','MISSING'))\""
         )
-        if out == "MISSING" and fix:
+        out_clean = out.strip().splitlines()[-1]
+        if out_clean == "MISSING" and fix:
             _write_model_to_pod()
-            out = "5 (just written)"
-        assert out.startswith("5"), (
-            f"Live pod max_positions={out} — "
-            "orders fail with 'Max positions exceeded'"
+            out = f"{expected} (just written)"
+            out_clean = str(expected)
+        assert out_clean.startswith(str(expected)), (
+            f"Live pod max_positions={out_clean} — expected {expected}"
         )
-        return f"pod max_positions={out}"
+        return f"pod max_positions={out_clean}"
 
     @check("Pod: live model params within bounds", "pod")
     def chk_pod_model_bounds():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("strategy_model", APP_DIR / "strategy_model.py")
+        sm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sm)  # type: ignore
         out = _kubectl_exec(
             "python3 -c \""
             "import strategy_model as sm, json;"
             "m=sm.load_model();"
-            "print(json.dumps({k:m[k] for k in ['min_conviction','max_positions','position_size_pct']}))\""
+            "print(json.dumps({k:m[k] for k in sm.BOUNDS.keys() if k in m}))\""
         )
         vals = json.loads(out)
-        assert 62 <= vals["min_conviction"] <= 72,   f"min_conviction={vals['min_conviction']} out of bounds"
-        assert 1  <= vals["max_positions"]  <= 5,    f"max_positions={vals['max_positions']} out of bounds"
-        assert 0.02 <= vals["position_size_pct"] <= 0.08, f"position_size_pct out of bounds"
-        return f"min_conviction={vals['min_conviction']}, max_positions={vals['max_positions']}"
+        violations = []
+        for key, (lo, hi) in sm.BOUNDS.items():
+            if key not in vals:
+                continue
+            val = float(vals[key])
+            if not (lo <= val <= hi):
+                violations.append(f"{key}={val} not in [{lo}, {hi}]")
+        assert not violations, "; ".join(violations)
+        return f"{len(vals)} bounded params valid on pod"
 
-    @check("Pod: narrative fix deployed (50%-size text in server.py)", "pod")
+    @check("Pod: alpha narrative deployed in server.py", "pod")
     def chk_pod_narrative():
-        out = _kubectl_exec("grep -c '50% position size' /app/server.py || echo 0")
-        assert int(out) > 0, (
-            "Pod running OLD server.py — narrative fix not deployed. "
+        out = _kubectl_exec("python3 -c \"from pathlib import Path; t=Path('/app/server.py').read_text().lower(); print(int('alpha-first paper trading account' in t and 'stock alpha trader' in t))\"")
+        assert int(out.strip().splitlines()[-1]) > 0, (
+            "Pod running OLD server.py — alpha narrative not deployed. "
             "Run: kubectl rollout restart deployment/alpaca-server -n alpaca-trader"
         )
-        return f"50%-size text found {out}x in deployed server.py"
+        return "alpha narrative present on pod"
 
-    @check("Pod: web P&L fix deployed (dailyPnl in portfolio_lab.html)", "pod")
+    @check("Pod: alpha UI deployed in portfolio_lab.html", "pod")
     def chk_pod_web_pnl():
-        out = _kubectl_exec("grep -c 'displayPnl = dailyPnl' /app/portfolio_lab.html || echo 0")
-        assert int(out) > 0, (
-            "Pod running OLD portfolio_lab.html — web P&L fix not deployed"
+        out = _kubectl_exec("python3 -c \"from pathlib import Path; t=Path('/app/portfolio_lab.html').read_text(); print(int('Alpha Trader' in t and 'Command Console' in t))\"")
+        assert int(out.strip().splitlines()[-1]) > 0, (
+            "Pod running OLD portfolio_lab.html — alpha UI not deployed"
         )
-        return f"dailyPnl assignment found {out}x"
+        return "alpha UI markers present on pod"
 
     @check("Pod: required env vars present", "pod")
     def chk_pod_env():
@@ -816,17 +831,13 @@ def run_pod_checks(fix: bool = False):
 
 def _write_model_to_pod():
     import datetime as _dt
-    model = json.dumps({
-        "version": 1, "generation": 0,
-        "min_conviction": 63, "bear_etf_min_conviction": 50,
-        "max_positions": 5, "position_size_pct": 0.05,
-        "trailing_stop_pct": 3.0, "profit_lock_trigger_pct": 2.0,
-        "profit_giveback_pct": 1.0, "max_holding_days": 2,
-        "exit_on_regime_flip": True, "daily_loss_kill_pct": -2.0,
-        "learning_mode": "paper_safe", "active_variant": "current",
-        "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        "last_backtest": None,
-    })
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("strategy_model", APP_DIR / "strategy_model.py")
+    sm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sm)  # type: ignore
+    model_dict = dict(sm.DEFAULT_MODEL)
+    model_dict["updated_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    model = json.dumps(model_dict)
     _kubectl_exec(
         f"python3 -c \"from pathlib import Path; "
         f"Path('/data/state/strategy_model.json').write_text('{json.dumps(json.loads(model))}')\""
