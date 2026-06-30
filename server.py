@@ -3706,9 +3706,12 @@ def api_lab_ledger():
     """Return recent trades from the durable SQLite ledger + win/loss summary."""
     try:
         limit = min(int(request.args.get("limit") or 200), 1000)
+        reconciliation = trade_ledger.reconcile_broker_orders(
+            get_client().get_recent_orders(limit=min(max(limit, 500), 500))
+        )
         trades = trade_ledger.recent_trades(limit=limit)
         summary = trade_ledger.win_loss_summary(limit=limit)
-        return jsonify({"ok": True, "trades": trades, "summary": summary})
+        return jsonify({"ok": True, "trades": trades, "summary": summary, "reconciliation": reconciliation})
     except Exception as e:
         log.error("ledger error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500

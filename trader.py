@@ -210,16 +210,6 @@ def _place_rebalance_order(
         client.place_market_order(symbol, qty, side)
         value = qty * price
         log.info("CORE %s: %s %d %s @ $%.2f (~$%.0f)", reason, side.upper(), qty, symbol, price, value)
-        trade_ledger.record_buy(
-            symbol, qty, price,
-            regime=regime,
-            signal_score=None,
-            signal_snapshot={"strategy": "qqq_core", "reason": reason},
-        ) if side.lower() == "buy" else trade_ledger.record_sell(
-            symbol, qty, price, 0.0,
-            exit_reason=reason,
-            regime=regime,
-        )
         return True
     except Exception as e:
         log.error("Core rebalance failed: %s %d %s: %s", side, qty, symbol, e)
@@ -456,7 +446,6 @@ def _check_trailing_stops(client: AlpacaClient, positions: dict, quotes: dict, m
                      reason, qty, sym, price, pnl_pct, peak_pnl_pct, hold_days, pnl)
             _record_sell(sym, pnl=pnl, exit_reason=reason)
             _clear_position_strategy(sym)
-            trade_ledger.record_sell(sym, qty, price, pnl, exit_reason=reason, regime=regime)
             exited.append(sym)
         except Exception as e:
             log.error("%s sell failed for %s: %s", reason, sym, e)
@@ -567,7 +556,6 @@ def _rotate_stale_positions(
             )
             _record_sell(sym, pnl=pnl, exit_reason=reason)
             _clear_position_strategy(sym)
-            trade_ledger.record_sell(sym, qty, price, pnl, exit_reason=reason, regime=regime)
             log.info(
                 "ROTATION EXIT %s: SELL %d %s @ $%.2f score=%d replacement=%s",
                 reason, qty, sym, price, current_score, getattr(replacement, "symbol", "-"),
@@ -647,8 +635,6 @@ def _liquidate_legacy_benchmark_positions(
 
         try:
             client.close_position(sym)
-            if side != "SHORT":
-                trade_ledger.record_sell(sym, qty, price, pnl, exit_reason="legacy_benchmark_unwind", regime=regime)
             _clear_position_strategy(sym)
             notify.send(
                 f"Legacy unwind: closed {sym} ({qty} units) because alpha mode should not carry {legacy_reason}."
@@ -720,8 +706,6 @@ def _liquidate_disallowed_positions(
         side = str(pos.get("side") or "").upper()
         try:
             client.close_position(sym)
-            if side != "SHORT":
-                trade_ledger.record_sell(sym, qty, price, pnl, exit_reason="disallowed_inventory", regime=regime)
             _record_sell(sym, pnl=pnl, exit_reason="disallowed_inventory")
             _clear_position_strategy(sym)
             notify.send(f"Alpha reset: closed {sym} because {reason}.")
@@ -1171,6 +1155,8 @@ def main() -> None:
     ctrl = _load_trader_control()
 
     client = AlpacaClient()
+    reconciliation = trade_ledger.reconcile_broker_orders(client.get_recent_orders(limit=500))
+    log.info("Broker fill reconciliation: %s", reconciliation)
 
     # ── Daily variant optimization (once per day) ──────────────────────────
     _run_daily_optimization()
@@ -1433,13 +1419,6 @@ def main() -> None:
             notify.trade_buy(sig.symbol, qty, price, sig.score, sig.regime)
             log.info("BUY %d %s @ $%.2f  score=%d  regime=%s  conv_mult=%.1fx  size=$%.0f",
                      qty, sig.symbol, price, sig.score, sig.regime, conv_mult, qty * price)
-            trade_ledger.record_buy(
-                sig.symbol, qty, price,
-                regime=sig.regime,
-                signal_score=sig.score,
-                signal_snapshot={"symbol": sig.symbol, "score": sig.score,
-                                 "regime": sig.regime, "size_mult": sig.size_mult},
-            )
             positions[sig.symbol] = {"qty": qty, "entry": price,
                                      "unrealized_pl": 0, "unrealized_plpc": 0}
             satellite_positions[sig.symbol] = positions[sig.symbol]

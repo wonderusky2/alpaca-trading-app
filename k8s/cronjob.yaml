@@ -32,6 +32,9 @@ spec:
                     name: alpaca-trader-config
                 - secretRef:
                     name: alpaca-trader-secrets
+              volumeMounts:
+                - name: state
+                  mountPath: /data/state
               resources:
                 requests:
                   cpu: "100m"
@@ -39,3 +42,7 @@ spec:
                 limits:
                   cpu: "500m"
                   memory: "256Mi"
+          volumes:
+            - name: state
+              persistentVolumeClaim:
+                claimName: alpaca-trader-state

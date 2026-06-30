@@ -58,13 +58,113 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
 CREATE UNIQUE INDEX IF NOT EXISTS eq_snap_date ON equity_snapshots(date);
 """
 
+_TRADE_MIGRATIONS = {
+    "broker_order_id": "TEXT",
+    "filled_at": "TEXT",
+    "source": "TEXT",
+}
+
 
 def _connect() -> sqlite3.Connection:
     LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(LEDGER_PATH))
-    con.execute(_DDL)
+    con.executescript(_DDL)
+    existing = {row[1] for row in con.execute("PRAGMA table_info(trades)")}
+    for column, column_type in _TRADE_MIGRATIONS.items():
+        if column not in existing:
+            con.execute(f"ALTER TABLE trades ADD COLUMN {column} {column_type}")
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS trades_broker_order_id "
+        "ON trades(broker_order_id) WHERE broker_order_id IS NOT NULL"
+    )
     con.commit()
     return con
+
+
+def reconcile_broker_orders(orders: list[dict]) -> dict:
+    """Insert confirmed Alpaca fills exactly once, using broker values as truth."""
+    filled = [
+        order for order in (orders or [])
+        if str(order.get("status") or "").lower() == "filled"
+        and order.get("id")
+        and float(order.get("filled_qty") or 0) > 0
+        and float(order.get("filled_avg_price") or 0) > 0
+    ]
+    filled.sort(key=lambda order: str(order.get("filled_at") or order.get("submitted_at") or ""))
+    inserted = 0
+    skipped = 0
+    try:
+        con = _connect()
+        for order in filled:
+            order_id = str(order["id"])
+            if con.execute(
+                "SELECT 1 FROM trades WHERE broker_order_id=?", (order_id,)
+            ).fetchone():
+                skipped += 1
+                continue
+            side = str(order.get("side") or "").lower()
+            if side not in {"buy", "sell"}:
+                continue
+            symbol = str(order.get("symbol") or "").upper()
+            qty = int(float(order.get("filled_qty") or 0))
+            price = float(order.get("filled_avg_price") or 0)
+            filled_at = str(order.get("filled_at") or order.get("submitted_at") or datetime.now(timezone.utc).isoformat())
+            pnl = _fifo_realized_pnl(con, symbol, qty, price) if side == "sell" else None
+            con.execute(
+                """INSERT INTO trades
+                   (recorded_at, symbol, side, qty, price, notional, pnl,
+                    filled_at, broker_order_id, source, model_snapshot)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'alpaca_fill', ?)""",
+                (
+                    filled_at, symbol, side, qty, price, qty * price, pnl,
+                    filled_at, order_id, json.dumps({}),
+                ),
+            )
+            inserted += 1
+        con.commit()
+        total = con.execute(
+            "SELECT COUNT(*) FROM trades WHERE source='alpaca_fill'"
+        ).fetchone()[0]
+        con.close()
+        return {"ok": True, "inserted": inserted, "skipped": skipped, "total": total}
+    except Exception as exc:
+        import logging
+        logging.getLogger("trade_ledger").error("Broker reconciliation failed: %s", exc)
+        return {"ok": False, "inserted": inserted, "skipped": skipped, "error": str(exc)}
+
+
+def _fifo_realized_pnl(con: sqlite3.Connection, symbol: str, sell_qty: int, sell_price: float) -> float | None:
+    """Calculate realized P&L from prior confirmed fills using FIFO inventory."""
+    rows = con.execute(
+        """SELECT side, qty, price FROM trades
+           WHERE symbol=? AND source='alpaca_fill'
+           ORDER BY COALESCE(filled_at, recorded_at), id""",
+        (symbol,),
+    ).fetchall()
+    lots: list[list[float]] = []
+    for side, qty, price in rows:
+        remaining = float(qty)
+        if side == "buy":
+            lots.append([remaining, float(price)])
+            continue
+        while remaining > 0 and lots:
+            used = min(remaining, lots[0][0])
+            lots[0][0] -= used
+            remaining -= used
+            if lots[0][0] <= 0:
+                lots.pop(0)
+    remaining = float(sell_qty)
+    pnl = 0.0
+    matched = 0.0
+    while remaining > 0 and lots:
+        used = min(remaining, lots[0][0])
+        pnl += used * (sell_price - lots[0][1])
+        matched += used
+        lots[0][0] -= used
+        remaining -= used
+        if lots[0][0] <= 0:
+            lots.pop(0)
+    return round(pnl, 2) if matched > 0 else None
 
 
 def record_buy(

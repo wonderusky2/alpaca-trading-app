@@ -5,6 +5,8 @@ Any failure = non-zero exit = build fails.
 """
 import sys
 import os
+import tempfile
+from pathlib import Path
 
 # ── Stub out secrets so imports don't fail ────────────────────────────────────
 for var in ["ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_BASE_URL",
@@ -139,6 +141,32 @@ if sm:
     assert migrated["max_holding_days"] <= 1, f"expected faster exit posture, got {migrated['max_holding_days']}"
     assert migrated["position_size_pct"] >= 0.16, f"expected meaningful sizing, got {migrated['position_size_pct']}"
     print("  ✓ strategy_model migrates into concentrated alpha defaults")
+
+# ── 6. Broker fill ledger is idempotent and uses FIFO realized P&L ──────────
+try:
+    import trade_ledger
+    real_ledger_path = trade_ledger.LEDGER_PATH
+    with tempfile.TemporaryDirectory() as tmpdir:
+        trade_ledger.LEDGER_PATH = Path(tmpdir) / "trades.db"
+        orders = [
+            {"id": "buy-1", "symbol": "AAPL", "side": "buy", "status": "filled",
+             "filled_qty": 10, "filled_avg_price": 100, "filled_at": "2026-01-01T15:00:00+00:00"},
+            {"id": "sell-1", "symbol": "AAPL", "side": "sell", "status": "filled",
+             "filled_qty": 10, "filled_avg_price": 105, "filled_at": "2026-01-01T16:00:00+00:00"},
+        ]
+        first = trade_ledger.reconcile_broker_orders(orders)
+        second = trade_ledger.reconcile_broker_orders(orders)
+        rows = trade_ledger.recent_trades(limit=10)
+        sell = next(row for row in rows if row["side"] == "sell")
+        assert first["inserted"] == 2 and second["inserted"] == 0, (first, second)
+        assert len(rows) == 2, rows
+        assert sell["pnl"] == 50.0, sell
+        assert all(row["source"] == "alpaca_fill" for row in rows), rows
+    trade_ledger.LEDGER_PATH = real_ledger_path
+    print("  ✓ broker fill reconciliation is idempotent with FIFO P&L")
+except Exception as e:
+    errors.append(f"broker fill reconciliation: {e}")
+    print(f"  ✗ broker fill reconciliation: {e}")
 
 # ── Result ────────────────────────────────────────────────────────────────────
 print()
