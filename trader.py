@@ -76,6 +76,52 @@ def _active_model() -> dict:
     return strategy_model.load_model()
 
 
+def _submit_market_order(
+    client: AlpacaClient,
+    symbol: str,
+    qty: int,
+    side: str,
+    *,
+    intent: str,
+    regime: str = "",
+    model: dict | None = None,
+    signal_score: int | None = None,
+    signal_snapshot: dict | None = None,
+) -> dict:
+    """Submit an order and durably bind its decision context to the broker ID."""
+    result = client.place_market_order(symbol, qty, side)
+    trade_ledger.record_order_intent(
+        result.get("order_id", ""), symbol, side, qty,
+        intent=intent,
+        regime=regime,
+        model_snapshot=model or _active_model(),
+        signal_score=signal_score,
+        signal_snapshot=signal_snapshot,
+        experiment_id=str(getattr(config, "ALPHA_EXPERIMENT_ID", "")),
+    )
+    return result
+
+
+def _submit_close_position(
+    client: AlpacaClient,
+    symbol: str,
+    qty: int,
+    *,
+    intent: str,
+    regime: str = "",
+    model: dict | None = None,
+) -> dict:
+    result = client.close_position(symbol)
+    trade_ledger.record_order_intent(
+        result.get("order_id", ""), symbol, "sell", qty,
+        intent=intent,
+        regime=regime,
+        model_snapshot=model or _active_model(),
+        experiment_id=str(getattr(config, "ALPHA_EXPERIMENT_ID", "")),
+    )
+    return result
+
+
 def _load_trader_control() -> dict:
     path = strategy_model.STATE_DIR / "trader_control.json"
     try:
@@ -207,7 +253,9 @@ def _place_rebalance_order(
     if qty <= 0:
         return False
     try:
-        client.place_market_order(symbol, qty, side)
+        _submit_market_order(
+            client, symbol, qty, side, intent=reason, regime=regime,
+        )
         value = qty * price
         log.info("CORE %s: %s %d %s @ $%.2f (~$%.0f)", reason, side.upper(), qty, symbol, price, value)
         return True
@@ -439,7 +487,9 @@ def _check_trailing_stops(client: AlpacaClient, positions: dict, quotes: dict, m
         if qty <= 0:
             continue
         try:
-            client.place_market_order(sym, qty, "sell")
+            _submit_market_order(
+                client, sym, qty, "sell", intent=reason, regime=regime, model=model,
+            )
             notify.trade_sell(sym, qty, price, pnl, reason,
                               entry_price=entry_price, pnl_pct=pnl_pct, hold_hours=hold_hours)
             log.info("Exit %s: SELL %d %s @ $%.2f (pnl=%.2f%% peak=%.2f%% hold=%dd P&L $%.2f)",
@@ -549,7 +599,9 @@ def _rotate_stale_positions(
             reason_for_notify = f"rotation_out_to_{replacement.symbol.lower()}"
 
         try:
-            client.place_market_order(sym, qty, "sell")
+            _submit_market_order(
+                client, sym, qty, "sell", intent=reason, regime=regime, model=model,
+            )
             notify.trade_sell(
                 sym, qty, price, pnl, reason_for_notify,
                 entry_price=entry_price, pnl_pct=pnl_pct, hold_hours=hold_hours,
@@ -588,7 +640,9 @@ def run_eod_flat(client: AlpacaClient, positions: dict, quotes: dict) -> None:
         if qty <= 0:
             continue
         try:
-            client.place_market_order(sym, qty, "sell")
+            _submit_market_order(
+                client, sym, qty, "sell", intent="eod_flat", regime="EOD",
+            )
             notify.trade_sell(sym, qty, price, pnl, "eod_flat",
                               entry_price=entry_price, pnl_pct=pnl_pct, hold_hours=hold_hours)
             _clear_position_strategy(sym)
@@ -634,7 +688,9 @@ def _liquidate_legacy_benchmark_positions(
         side = str(pos.get("side") or "").upper()
 
         try:
-            client.close_position(sym)
+            _submit_close_position(
+                client, sym, qty, intent="legacy_benchmark_unwind", regime=regime,
+            )
             _clear_position_strategy(sym)
             notify.send(
                 f"Legacy unwind: closed {sym} ({qty} units) because alpha mode should not carry {legacy_reason}."
@@ -705,7 +761,9 @@ def _liquidate_disallowed_positions(
         pnl = float(pos.get("unrealized_pl") or 0)
         side = str(pos.get("side") or "").upper()
         try:
-            client.close_position(sym)
+            _submit_close_position(
+                client, sym, qty, intent="disallowed_inventory", regime=regime,
+            )
             _record_sell(sym, pnl=pnl, exit_reason="disallowed_inventory")
             _clear_position_strategy(sym)
             notify.send(f"Alpha reset: closed {sym} because {reason}.")
@@ -943,15 +1001,16 @@ def _recent_buy_blocked() -> bool:
 
 def _edge_gate_blocks_entries() -> bool:
     """Block fresh buys once the ledger has enough evidence and expectancy is not positive."""
-    evidence = trade_ledger.edge_summary(limit=500)
+    experiment_id = str(getattr(config, "ALPHA_EXPERIMENT_ID", "")) or None
+    evidence = trade_ledger.edge_summary(limit=500, experiment_id=experiment_id)
     trades = int(evidence.get("trades") or 0)
     expectancy = float(evidence.get("expectancy") or 0.0)
     min_trades = int(config.EDGE_GATE_MIN_CLOSED_TRADES)
     min_expectancy = float(config.EDGE_GATE_MIN_EXPECTANCY)
     if trades >= min_trades and expectancy <= min_expectancy:
         log.warning(
-            "Edge gate blocked entries: %d closed trades, expectancy $%.2f <= $%.2f.",
-            trades, expectancy, min_expectancy,
+            "Edge gate blocked experiment %s: %d closed trades, expectancy $%.2f <= $%.2f.",
+            experiment_id, trades, expectancy, min_expectancy,
         )
         return True
     return False
@@ -1337,7 +1396,12 @@ def main() -> None:
                 continue
 
             try:
-                client.place_market_order(sym, addon_qty, "buy")
+                _submit_market_order(
+                    client, sym, addon_qty, "buy",
+                    intent="pyramid_add", regime=regime, model=model,
+                    signal_score=current_score,
+                    signal_snapshot={"strategy": "momentum", "pyramid_add": addon_count + 1},
+                )
                 notify.trade_pyramid(
                     sym, addon_qty, price_now, current_score, regime,
                     pnl_pct=pnl_pct, entry_price=entry_price,
@@ -1415,7 +1479,18 @@ def main() -> None:
             continue
 
         try:
-            client.place_market_order(sig.symbol, qty, "buy")
+            _submit_market_order(
+                client, sig.symbol, qty, "buy",
+                intent="entry", regime=sig.regime, model=model,
+                signal_score=sig.score,
+                signal_snapshot={
+                    "symbol": sig.symbol,
+                    "score": sig.score,
+                    "regime": sig.regime,
+                    "size_mult": sig.size_mult,
+                    "strategy": getattr(sig, "strategy", "momentum"),
+                },
+            )
             notify.trade_buy(sig.symbol, qty, price, sig.score, sig.regime)
             log.info("BUY %d %s @ $%.2f  score=%d  regime=%s  conv_mult=%.1fx  size=$%.0f",
                      qty, sig.symbol, price, sig.score, sig.regime, conv_mult, qty * price)

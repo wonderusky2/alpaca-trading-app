@@ -113,7 +113,13 @@ def sanitize_model(model: dict) -> dict:
 
 def load_model() -> dict:
     try:
-        return sanitize_model(json.loads(MODEL_STATE_PATH.read_text(encoding="utf-8")))
+        raw = json.loads(MODEL_STATE_PATH.read_text(encoding="utf-8"))
+        clean = sanitize_model(raw)
+        if clean != raw:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            clean["updated_at"] = datetime.now(timezone.utc).isoformat()
+            MODEL_STATE_PATH.write_text(json.dumps(clean, indent=2, sort_keys=True), encoding="utf-8")
+        return clean
     except Exception:
         return sanitize_model(DEFAULT_MODEL)
 

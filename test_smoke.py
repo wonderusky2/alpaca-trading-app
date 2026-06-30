@@ -148,19 +148,47 @@ try:
     real_ledger_path = trade_ledger.LEDGER_PATH
     with tempfile.TemporaryDirectory() as tmpdir:
         trade_ledger.LEDGER_PATH = Path(tmpdir) / "trades.db"
+        trade_ledger.record_order_intent(
+            "buy-1", "AAPL", "buy", 10,
+            intent="entry", regime="BULL", signal_score=88,
+            signal_snapshot={"strategy": "momentum"},
+            model_snapshot={"generation": 4},
+            experiment_id="test_alpha",
+        )
+        trade_ledger.record_order_intent(
+            "sell-1", "AAPL", "sell", 10,
+            intent="profit_target", regime="BULL",
+            model_snapshot={"generation": 4},
+            experiment_id="test_alpha",
+        )
+        trade_ledger.record_order_intent(
+            "legacy-sell", "MSFT", "sell", 5,
+            intent="profit_target", regime="BULL",
+            model_snapshot={"generation": 4},
+            experiment_id="test_alpha",
+        )
         orders = [
             {"id": "buy-1", "symbol": "AAPL", "side": "buy", "status": "filled",
              "filled_qty": 10, "filled_avg_price": 100, "filled_at": "2026-01-01T15:00:00+00:00"},
             {"id": "sell-1", "symbol": "AAPL", "side": "sell", "status": "filled",
              "filled_qty": 10, "filled_avg_price": 105, "filled_at": "2026-01-01T16:00:00+00:00"},
+            {"id": "legacy-buy", "symbol": "MSFT", "side": "buy", "status": "filled",
+             "filled_qty": 5, "filled_avg_price": 200, "filled_at": "2026-01-01T17:00:00+00:00"},
+            {"id": "legacy-sell", "symbol": "MSFT", "side": "sell", "status": "filled",
+             "filled_qty": 5, "filled_avg_price": 210, "filled_at": "2026-01-01T18:00:00+00:00"},
         ]
         first = trade_ledger.reconcile_broker_orders(orders)
         second = trade_ledger.reconcile_broker_orders(orders)
         rows = trade_ledger.recent_trades(limit=10)
-        sell = next(row for row in rows if row["side"] == "sell")
-        assert first["inserted"] == 2 and second["inserted"] == 0, (first, second)
-        assert len(rows) == 2, rows
+        sell = next(row for row in rows if row["broker_order_id"] == "sell-1")
+        legacy_sell = next(row for row in rows if row["broker_order_id"] == "legacy-sell")
+        assert first["inserted"] == 4 and second["inserted"] == 0, (first, second)
+        assert len(rows) == 4, rows
         assert sell["pnl"] == 50.0, sell
+        assert sell["exit_reason"] == "profit_target", sell
+        assert sell["experiment_id"] == "test_alpha", sell
+        assert legacy_sell["experiment_id"] is None, legacy_sell
+        assert trade_ledger.edge_summary(experiment_id="test_alpha")["expectancy"] == 50.0
         assert all(row["source"] == "alpaca_fill" for row in rows), rows
     trade_ledger.LEDGER_PATH = real_ledger_path
     print("  ✓ broker fill reconciliation is idempotent with FIFO P&L")

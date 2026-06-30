@@ -86,7 +86,8 @@ def _entry_qty(price: float, equity: float, model: dict, regime: str, size_mult:
 
 
 def _edge_evidence_gate() -> dict:
-    evidence = trade_ledger.edge_summary(limit=500)
+    experiment_id = str(getattr(config, "ALPHA_EXPERIMENT_ID", "")) or None
+    evidence = trade_ledger.edge_summary(limit=500, experiment_id=experiment_id)
     trades = int(evidence.get("trades") or 0)
     expectancy = float(evidence.get("expectancy") or 0.0)
     min_trades = int(config.EDGE_GATE_MIN_CLOSED_TRADES)
@@ -2573,6 +2574,15 @@ class TradingAgent:
                     result = client.place_option_market_order(sym, qty, side)
                 else:
                     result = client.place_market_order(sym, qty, side)
+                trade_ledger.record_order_intent(
+                    result.get("order_id", ""), sym, side, qty,
+                    intent=str(o.get("reason") or o.get("intent") or "dashboard_order"),
+                    regime=str((snapshot.get("market") or {}).get("regime") or ""),
+                    signal_score=(o.get("signal") or {}).get("score"),
+                    signal_snapshot=o.get("signal") or None,
+                    model_snapshot=strategy_model.load_model(),
+                    experiment_id=str(getattr(config, "ALPHA_EXPERIMENT_ID", "")),
+                )
                 submitted.append({**o, **result})
             except Exception as e:
                 errors.append({"symbol": sym, "qty": qty, "side": side, "error": str(e)})
@@ -3711,7 +3721,15 @@ def api_lab_ledger():
         )
         trades = trade_ledger.recent_trades(limit=limit)
         summary = trade_ledger.win_loss_summary(limit=limit)
-        return jsonify({"ok": True, "trades": trades, "summary": summary, "reconciliation": reconciliation})
+        experiment_id = str(getattr(config, "ALPHA_EXPERIMENT_ID", "")) or None
+        experiment = trade_ledger.edge_summary(limit=limit, experiment_id=experiment_id)
+        return jsonify({
+            "ok": True,
+            "trades": trades,
+            "summary": summary,
+            "experiment": experiment,
+            "reconciliation": reconciliation,
+        })
     except Exception as e:
         log.error("ledger error: %s", e, exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500

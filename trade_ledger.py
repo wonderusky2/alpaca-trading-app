@@ -55,6 +55,20 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
     cash         REAL,
     regime       TEXT
 );
+CREATE TABLE IF NOT EXISTS order_intents (
+    broker_order_id  TEXT PRIMARY KEY,
+    submitted_at     TEXT NOT NULL,
+    symbol           TEXT NOT NULL,
+    side             TEXT NOT NULL,
+    qty              INTEGER NOT NULL,
+    intent           TEXT,
+    regime           TEXT,
+    model_gen        INTEGER,
+    signal_score     INTEGER,
+    signal_snapshot  TEXT,
+    model_snapshot   TEXT,
+    experiment_id    TEXT
+);
 CREATE UNIQUE INDEX IF NOT EXISTS eq_snap_date ON equity_snapshots(date);
 """
 
@@ -62,12 +76,16 @@ _TRADE_MIGRATIONS = {
     "broker_order_id": "TEXT",
     "filled_at": "TEXT",
     "source": "TEXT",
+    "intent": "TEXT",
+    "experiment_id": "TEXT",
 }
 
 
 def _connect() -> sqlite3.Connection:
     LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(LEDGER_PATH))
+    con.execute("PRAGMA busy_timeout=5000")
+    con.execute("PRAGMA journal_mode=WAL")
     con.executescript(_DDL)
     existing = {row[1] for row in con.execute("PRAGMA table_info(trades)")}
     for column, column_type in _TRADE_MIGRATIONS.items():
@@ -79,6 +97,48 @@ def _connect() -> sqlite3.Connection:
     )
     con.commit()
     return con
+
+
+def record_order_intent(
+    broker_order_id: str,
+    symbol: str,
+    side: str,
+    qty: int,
+    intent: str = "",
+    regime: str = "",
+    signal_score: int | None = None,
+    signal_snapshot: dict | None = None,
+    model_snapshot: dict | None = None,
+    experiment_id: str = "",
+) -> None:
+    """Persist the decision context for an order before its fill is reconciled."""
+    if not broker_order_id:
+        return
+    if model_snapshot is None:
+        try:
+            model_snapshot = strategy_model.load_model()
+        except Exception:
+            model_snapshot = {}
+    try:
+        con = _connect()
+        con.execute(
+            """INSERT OR REPLACE INTO order_intents
+               (broker_order_id, submitted_at, symbol, side, qty, intent, regime,
+                model_gen, signal_score, signal_snapshot, model_snapshot, experiment_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(broker_order_id), datetime.now(timezone.utc).isoformat(),
+                str(symbol).upper(), str(side).lower(), int(qty), str(intent or ""),
+                str(regime or ""), model_snapshot.get("generation"), signal_score,
+                json.dumps(signal_snapshot) if signal_snapshot else None,
+                json.dumps(model_snapshot), str(experiment_id or ""),
+            ),
+        )
+        con.commit()
+        con.close()
+    except Exception as exc:
+        import logging
+        logging.getLogger("trade_ledger").error("Order intent insert failed: %s", exc)
 
 
 def reconcile_broker_orders(orders: list[dict]) -> dict:
@@ -109,15 +169,32 @@ def reconcile_broker_orders(orders: list[dict]) -> dict:
             qty = int(float(order.get("filled_qty") or 0))
             price = float(order.get("filled_avg_price") or 0)
             filled_at = str(order.get("filled_at") or order.get("submitted_at") or datetime.now(timezone.utc).isoformat())
-            pnl = _fifo_realized_pnl(con, symbol, qty, price) if side == "sell" else None
+            intent_row = con.execute(
+                """SELECT intent, regime, model_gen, signal_score, signal_snapshot,
+                          model_snapshot, experiment_id
+                   FROM order_intents WHERE broker_order_id=?""",
+                (order_id,),
+            ).fetchone()
+            intent_data = intent_row or (None, None, None, None, None, None, None)
+            if side == "sell":
+                pnl, matched_experiment = _fifo_realized_match(con, symbol, qty, price)
+            else:
+                pnl = None
+                matched_experiment = intent_data[6]
             con.execute(
                 """INSERT INTO trades
                    (recorded_at, symbol, side, qty, price, notional, pnl,
-                    filled_at, broker_order_id, source, model_snapshot)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'alpaca_fill', ?)""",
+                    exit_reason, regime, model_gen, signal_score, signal_snapshot,
+                    model_snapshot, filled_at, broker_order_id, source, intent,
+                    experiment_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           'alpaca_fill', ?, ?)""",
                 (
                     filled_at, symbol, side, qty, price, qty * price, pnl,
-                    filled_at, order_id, json.dumps({}),
+                    intent_data[0] if side == "sell" else None,
+                    intent_data[1], intent_data[2], intent_data[3], intent_data[4],
+                    intent_data[5] or json.dumps({}), filled_at, order_id,
+                    intent_data[0], matched_experiment,
                 ),
             )
             inserted += 1
@@ -133,19 +210,24 @@ def reconcile_broker_orders(orders: list[dict]) -> dict:
         return {"ok": False, "inserted": inserted, "skipped": skipped, "error": str(exc)}
 
 
-def _fifo_realized_pnl(con: sqlite3.Connection, symbol: str, sell_qty: int, sell_price: float) -> float | None:
-    """Calculate realized P&L from prior confirmed fills using FIFO inventory."""
+def _fifo_realized_match(
+    con: sqlite3.Connection,
+    symbol: str,
+    sell_qty: int,
+    sell_price: float,
+) -> tuple[float | None, str | None]:
+    """Return FIFO realized P&L and the experiment owning the matched entry lots."""
     rows = con.execute(
-        """SELECT side, qty, price FROM trades
+        """SELECT side, qty, price, experiment_id FROM trades
            WHERE symbol=? AND source='alpaca_fill'
            ORDER BY COALESCE(filled_at, recorded_at), id""",
         (symbol,),
     ).fetchall()
-    lots: list[list[float]] = []
-    for side, qty, price in rows:
+    lots: list[list] = []
+    for side, qty, price, experiment_id in rows:
         remaining = float(qty)
         if side == "buy":
-            lots.append([remaining, float(price)])
+            lots.append([remaining, float(price), experiment_id])
             continue
         while remaining > 0 and lots:
             used = min(remaining, lots[0][0])
@@ -156,15 +238,26 @@ def _fifo_realized_pnl(con: sqlite3.Connection, symbol: str, sell_qty: int, sell
     remaining = float(sell_qty)
     pnl = 0.0
     matched = 0.0
+    matched_experiments: set[str | None] = set()
     while remaining > 0 and lots:
         used = min(remaining, lots[0][0])
         pnl += used * (sell_price - lots[0][1])
         matched += used
+        matched_experiments.add(lots[0][2])
         lots[0][0] -= used
         remaining -= used
         if lots[0][0] <= 0:
             lots.pop(0)
-    return round(pnl, 2) if matched > 0 else None
+    experiment_id = None
+    if matched == float(sell_qty) and len(matched_experiments) == 1:
+        candidate = next(iter(matched_experiments))
+        experiment_id = str(candidate) if candidate else None
+    return (round(pnl, 2) if matched > 0 else None), experiment_id
+
+
+def _fifo_realized_pnl(con: sqlite3.Connection, symbol: str, sell_qty: int, sell_price: float) -> float | None:
+    """Backward-compatible realized P&L helper."""
+    return _fifo_realized_match(con, symbol, sell_qty, sell_price)[0]
 
 
 def record_buy(
@@ -315,13 +408,19 @@ def recent_trades(limit: int = 200) -> list[dict]:
         return []
 
 
-def win_loss_summary(limit: int = 500) -> dict:
+def win_loss_summary(limit: int = 500, experiment_id: str | None = None) -> dict:
     """Basic win/loss stats from the ledger for closed (sell) rows."""
     try:
         con = _connect()
+        where = "side='sell' AND pnl IS NOT NULL"
+        params: list = []
+        if experiment_id:
+            where += " AND experiment_id=?"
+            params.append(experiment_id)
+        params.append(limit)
         cur = con.execute(
-            "SELECT pnl FROM trades WHERE side='sell' AND pnl IS NOT NULL ORDER BY id DESC LIMIT ?",
-            (limit,),
+            f"SELECT pnl FROM trades WHERE {where} ORDER BY id DESC LIMIT ?",
+            params,
         )
         pnls = [r[0] for r in cur.fetchall()]
         con.close()
@@ -350,13 +449,19 @@ def win_loss_summary(limit: int = 500) -> dict:
     }
 
 
-def edge_summary(limit: int = 500) -> dict:
+def edge_summary(limit: int = 500, experiment_id: str | None = None) -> dict:
     """Return trade evidence used by entry/promotion gates."""
-    summary = win_loss_summary(limit=limit)
+    summary = win_loss_summary(limit=limit, experiment_id=experiment_id)
     first_trade_at = None
     try:
         con = _connect()
-        cur = con.execute("SELECT MIN(recorded_at) FROM trades")
+        if experiment_id:
+            cur = con.execute(
+                "SELECT MIN(recorded_at) FROM trades WHERE experiment_id=?",
+                (experiment_id,),
+            )
+        else:
+            cur = con.execute("SELECT MIN(recorded_at) FROM trades")
         first_trade_at = cur.fetchone()[0]
         con.close()
     except Exception:
@@ -377,4 +482,5 @@ def edge_summary(limit: int = 500) -> dict:
         "paper_days": round(paper_days, 1),
         "first_trade_at": first_trade_at,
         "expectancy_positive": bool(trades > 0 and expectancy > 0),
+        "experiment_id": experiment_id,
     }
