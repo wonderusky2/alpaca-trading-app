@@ -202,6 +202,18 @@ try:
         assert legacy_sell["experiment_id"] is None, legacy_sell
         assert trade_ledger.edge_summary(experiment_id="test_alpha")["expectancy"] == 50.0
         assert all(row["source"] == "alpaca_fill" for row in rows), rows
+        import experiment_monitor
+        original_experiment = experiment_monitor.config.ALPHA_EXPERIMENT_ID
+        experiment_monitor.config.ALPHA_EXPERIMENT_ID = "test_alpha"
+        report = experiment_monitor.build_report(
+            {"equity": 100050, "cash": 50000, "buying_power": 100000},
+            {},
+        )
+        experiment_monitor.config.ALPHA_EXPERIMENT_ID = original_experiment
+        assert report["status"] == "COLLECTING", report
+        assert report["summary"]["total_pnl"] == 50.0, report
+        assert report["by_symbol"]["AAPL"]["expectancy"] == 50.0, report
+        assert report["hold_buckets"]["15m_to_6h"]["trades"] == 1, report
     trade_ledger.LEDGER_PATH = real_ledger_path
     print("  ✓ broker fill reconciliation is idempotent with FIFO P&L")
 except Exception as e:

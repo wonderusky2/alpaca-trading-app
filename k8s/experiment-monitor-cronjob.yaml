@@ -1,0 +1,48 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: alpaca-experiment-monitor
+  namespace: alpaca-trader
+  labels:
+    app: alpaca-experiment-monitor
+spec:
+  schedule: "15 16 * * 1-5"
+  timeZone: "America/New_York"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 180
+      template:
+        metadata:
+          labels:
+            app: alpaca-experiment-monitor
+        spec:
+          restartPolicy: Never
+          serviceAccountName: alpaca-trader-sa
+          containers:
+            - name: monitor
+              image: gcr.io/pure-tribute-440710-r8/alpaca-trader:latest
+              imagePullPolicy: Always
+              command: ["python", "experiment_monitor.py"]
+              envFrom:
+                - configMapRef:
+                    name: alpaca-trader-config
+                - secretRef:
+                    name: alpaca-trader-secrets
+              volumeMounts:
+                - name: state
+                  mountPath: /data/state
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "96Mi"
+                limits:
+                  cpu: "250m"
+                  memory: "192Mi"
+          volumes:
+            - name: state
+              persistentVolumeClaim:
+                claimName: alpaca-trader-state

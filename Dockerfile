@@ -29,6 +29,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY alpaca_client.py \
      backtest.py \
      config.py \
+     experiment_monitor.py \
      logger.py \
      notify.py \
      portfolio.py \
