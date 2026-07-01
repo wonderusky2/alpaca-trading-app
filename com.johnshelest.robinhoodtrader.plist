@@ -9,7 +9,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/johnshelest/Code/robinhood-trader/run.sh</string>
+    <string>/Users/johnshelest/Code/alpaca-trading-app/run.sh</string>
   </array>
 
   <!-- Run every 5 minutes -->
@@ -22,9 +22,9 @@
 
   <!-- Logging -->
   <key>StandardOutPath</key>
-  <string>/Users/johnshelest/Code/robinhood-trader/launchd.log</string>
+  <string>/Users/johnshelest/Code/alpaca-trading-app/launchd.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/johnshelest/Code/robinhood-trader/launchd.log</string>
+  <string>/Users/johnshelest/Code/alpaca-trading-app/launchd.log</string>
 
   <!-- Run even on battery -->
   <key>ProcessType</key>

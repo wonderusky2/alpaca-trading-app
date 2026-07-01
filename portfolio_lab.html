@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>QQQ Trader</title>
+<title>Alpha Trader</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -25,7 +25,7 @@ button{cursor:pointer;font:inherit;background:none;border:none;color:inherit}
 input{font:inherit}
 
 /* ── APP SHELL ─────────────────────────────────────────────────────────── */
-#app{height:100vh;display:grid;grid-template-rows:48px auto 1fr 48px;overflow:hidden}
+#app{height:100vh;display:grid;grid-template-rows:48px minmax(150px,32vh) minmax(320px,1fr);overflow:hidden}
 
 /* ── TOP BAR ───────────────────────────────────────────────────────────── */
 #topbar{
@@ -89,7 +89,7 @@ input{font:inherit}
 .tag.call{color:#5dade2;border-color:rgba(93,173,226,.3);background:rgba(93,173,226,.08)}
 .tag.put{color:var(--red);border-color:rgba(192,57,43,.3);background:rgba(192,57,43,.08)}
 
-#pos-section{overflow-x:auto;overflow-y:hidden}
+#pos-section{overflow:auto;min-height:0}
 #pos-table{width:100%;border-collapse:collapse;min-width:560px}
 #pos-table th{
   padding:0 16px 0;height:28px;
@@ -112,17 +112,21 @@ input{font:inherit}
 /* ── FEED ──────────────────────────────────────────────────────────────── */
 #feed{display:flex;flex-direction:column;min-height:0;overflow:hidden;border-top:1px solid var(--border)}
 #feed-hdr{
-  display:flex;align-items:center;padding:0 16px;height:32px;flex-shrink:0;
-  font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;
+  display:flex;align-items:flex-start;justify-content:space-between;padding:14px 16px 10px;min-height:56px;flex-shrink:0;
   border-bottom:1px solid var(--border)
 }
-#feed-hdr-right{margin-left:auto;display:flex;gap:8px}
+#feed-hdr-left{display:flex;flex-direction:column;gap:4px;min-width:0}
+#feed-hdr-title{color:var(--text);font-size:16px;font-weight:800;letter-spacing:-.02em}
+#feed-hdr-sub{font-size:11px;color:var(--muted);line-height:1.4}
+#console-state{font-size:11px;color:var(--dim);line-height:1.4;text-align:right;max-width:320px}
+#console-bar{display:flex;flex-direction:column;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}
+#feed-hdr-right{display:flex;gap:8px;flex-wrap:wrap}
 .feed-action{
   height:22px;padding:0 10px;border-radius:4px;border:1px solid var(--border2);
   font-size:10px;font-weight:700;color:var(--muted);letter-spacing:.04em;text-transform:uppercase
 }
 .feed-action:hover{border-color:var(--blue);color:var(--blue)}
-#feed-items{flex:1;overflow-y:auto;display:flex;flex-direction:column-reverse}
+#feed-items{flex:1;overflow-y:auto;display:block;min-height:0}
 #feed-inner{display:flex;flex-direction:column}
 .fi{
   display:grid;grid-template-columns:80px 52px 1fr;
@@ -150,15 +154,15 @@ input{font:inherit}
 /* ── INPUT ─────────────────────────────────────────────────────────────── */
 #input-row{
   display:flex;align-items:center;gap:10px;
-  padding:0 16px;height:48px;flex-shrink:0;
-  border-top:1px solid var(--border);background:var(--bg)
+  padding:0;height:42px;flex-shrink:0;
+  border:1px solid var(--border2);border-radius:6px;background:var(--bg)
 }
 #msg-input{
-  flex:1;background:none;border:none;outline:none;color:var(--text);font-size:13px
+  flex:1;background:none;border:none;outline:none;color:var(--text);font-size:13px;padding:0 14px
 }
 #msg-input::placeholder{color:var(--dim)}
 #send-btn{
-  width:30px;height:30px;border-radius:5px;background:var(--blue);color:#fff;
+  width:42px;height:42px;border-radius:0 5px 5px 0;background:var(--blue);color:#fff;
   font-size:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0
 }
 #send-btn:disabled{opacity:.3;cursor:default}
@@ -215,6 +219,10 @@ input{font:inherit}
 @media(max-width:820px){
   .hide-sm{display:none!important}
   #pos-bar,.tag{font-size:9px}
+  #app{grid-template-rows:48px minmax(160px,38vh) minmax(320px,1fr)}
+  #feed-hdr{padding:12px;gap:12px;flex-direction:column}
+  #console-state{max-width:none;text-align:left}
+  #console-bar{padding:12px}
 }
 </style>
 </head>
@@ -223,26 +231,23 @@ input{font:inherit}
 
   <!-- TOP BAR -->
   <header id="topbar">
-    <span class="tb-name">QQQ Autopilot</span>
+    <span class="tb-name">Alpha Trader</span>
     <div class="t-chip tb-chip" id="tb-market"><span class="dot dot-dim" id="tb-mkt-dot"></span><span id="tb-mkt-txt">—</span></div>
     <div class="t-chip tb-chip" id="tb-regime"><span class="dot dot-dim" id="tb-rgm-dot"></span><span id="tb-rgm-txt">—</span></div>
     <div class="t-chip tb-chip hide-sm" id="tb-auto"><span class="dot dot-dim" id="tb-auto-dot"></span><span id="tb-auto-txt">—</span></div>
     <div class="tb-sep"></div>
     <div class="tb-stat big"><span class="lbl">Equity</span><span class="val" id="tb-equity">—</span></div>
     <div class="tb-stat hide-sm"><span class="lbl">P&amp;L</span><span class="val" id="tb-pnl">—</span></div>
-    <div class="tb-stat hide-sm"><span class="lbl" id="tb-qqq-lbl">vs QQQ</span><span class="val" id="tb-qqq">—</span></div>
+    <div class="tb-stat hide-sm"><span class="lbl" id="tb-qqq-lbl">Alpha vs QQQ</span><span class="val" id="tb-qqq">—</span></div>
     <div class="tb-stat hide-sm"><span class="lbl">Exposure</span><span class="val" id="tb-exp">—</span></div>
     <div class="tb-stat hide-sm"><span class="lbl">Cash</span><span class="val" id="tb-cash">—</span></div>
-    <div class="tb-stat hide-sm"><span class="lbl">Week</span><span class="val" id="tb-week">—</span></div>
-    <div class="tb-stat hide-sm"><span class="lbl">QTD</span><span class="val" id="tb-qtd">—</span></div>
-    <div class="tb-stat hide-sm"><span class="lbl">YTD</span><span class="val" id="tb-ytd">—</span></div>
     <button id="tb-pause" onclick="toggleTrading()">Pause</button>
   </header>
 
   <!-- POSITIONS -->
   <div>
     <div id="pos-bar">
-      Positions
+      Book
       <div id="pos-bar-right">
         <span class="tag" id="pos-risk-tag">—</span>
         <span id="pos-sub" style="color:var(--dim);font-size:10px"></span>
@@ -266,7 +271,18 @@ input{font:inherit}
   <!-- ACTIVITY FEED -->
   <section id="feed">
     <div id="feed-hdr">
-      Activity
+      <div id="feed-hdr-left">
+        <div id="feed-hdr-title">Command Console</div>
+        <div id="feed-hdr-sub">One place to see what the engine is doing, what is blocking it, and what action it wants next.</div>
+      </div>
+      <div id="console-state">Loading engine state…</div>
+    </div>
+    <div id="console-bar">
+      <div id="feed-hdr-right"></div>
+      <div id="input-row">
+        <input id="msg-input" type="text" placeholder="Ask why, what changed, what it wants to do next, or approve a trade..." autocomplete="off">
+        <button id="send-btn" onclick="handleSend()">▶</button>
+      </div>
     </div>
     <div id="feed-items">
       <div id="feed-inner"></div>
@@ -277,13 +293,6 @@ input{font:inherit}
       </div>
     </div>
   </section>
-
-  <!-- INPUT -->
-  <div id="input-row">
-    <input id="msg-input" type="text" placeholder="Ask the agent anything…" autocomplete="off">
-    <button id="send-btn" onclick="handleSend()">▶</button>
-  </div>
-
 </div>
 
 <!-- Stock detail modal -->
@@ -338,6 +347,7 @@ let _marketOpen = false;
 let _latestOverview = {};
 let _dismissedAlerts = new Set();
 let _initialized = false;
+let _backendUnavailable = false;
 
 // ─── FORMATTERS ────────────────────────────────────────────────────────────
 const fmt$ = (n, d=0) => n==null||isNaN(n) ? '—' : '$'+Math.abs(+n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
@@ -365,7 +375,7 @@ function renderTopbar(data) {
   const equity = +acct.equity||0;
   const lastEq = +(acct.adjusted_last_equity||acct.last_equity||equity);
   const pnl = equity - lastEq;
-  const gap = +(bench.bot_vs_best||0);
+  const gap = bench.bot_vs_best==null ? null : +bench.bot_vs_best;
   const gross = +(acctg.gross_exposure_pct||0);
   const cash = +(acct.cash||0);
   _marketOpen = !!clock.is_open;
@@ -391,9 +401,9 @@ function renderTopbar(data) {
   $('tb-equity').textContent = fmt$(equity);
   $('tb-pnl').textContent = fmtPnl(pnl);
   $('tb-pnl').className = 'val '+(pnl>=0?'pos-green':'pos-red');
-  $('tb-qqq').textContent = bench.ok ? fmtPnl(gap) : '—';
-  $('tb-qqq').className = 'val '+(gap>=0?'pos-green':'pos-red');
-  $('tb-qqq-lbl').textContent = 'vs '+(bench.best_symbol||'QQQ');
+  $('tb-qqq').textContent = bench.ok && gap!=null ? fmtPnl(gap) : '—';
+  $('tb-qqq').className = 'val '+((gap||0)>=0?'pos-green':'pos-red');
+  $('tb-qqq-lbl').textContent = 'Vs passive';
   $('tb-exp').textContent = gross.toFixed(1)+'%';
   $('tb-cash').textContent = fmt$(cash);
 }
@@ -431,69 +441,35 @@ function renderPositions(data) {
     return;
   }
 
-  // Compute covered call coverage for QQQ
-  // side field comes from accounting rows: "LONG" or "SHORT"
-  const qqqEq = eqPos.find(p => String(p.symbol||'').toUpperCase() === 'QQQ');
-  const qqqShares = qqqEq ? Math.floor(+(qqqEq.qty||qqqEq.quantity||qqqEq.shares||0)) : 0;
-  const qqqLots = Math.floor(qqqShares / 100);
-  // A covered call = SHORT call. A LONG call is a directional bet, not a covered write.
-  const coveredCallContracts = optPos.filter(p => {
-    const parsed = parseOptSym(p.symbol);
-    const side = String(p.side||'').toUpperCase();
-    return parsed && parsed.root === 'QQQ' && parsed.type === 'C' && side === 'SHORT';
-  }).reduce((n, p) => n + Math.abs(+(p.qty||p.quantity||p.contracts||1)), 0);
-  // Long QQQ calls = directional bets (not covered writes)
-  const longCallContracts = optPos.filter(p => {
-    const parsed = parseOptSym(p.symbol);
-    const side = String(p.side||'LONG').toUpperCase();
-    return parsed && parsed.root === 'QQQ' && parsed.type === 'C' && side !== 'SHORT';
-  }).reduce((n, p) => n + Math.abs(+(p.qty||p.quantity||p.contracts||1)), 0);
-
   const rows = [];
 
   for (const pos of eqPos) {
     const sym = String(pos.symbol||'?').toUpperCase();
+    const legacy = !!pos.legacy_position;
+    const legacyReason = String(pos.legacy_reason||'');
     const qty = +(pos.qty||pos.quantity||pos.shares||pos.num_shares||0);
     const val = +(pos.current_value||pos.market_value||0);
     const wt = +(pos.current_weight_pct||pos.weight_pct||0);
     const pnl = +(pos.unrealized_pnl||0);
     const pnlPct = +(pos.unrealized_pnl_pct||0);
     const ex = exits[sym];
-    // For QQQ, add coverage note
-    let note = ex ? shortTxt(ex.reason||ex.summary||'Exit candidate',56) : 'Holding';
-    let qtyExtra = '';
-    if (sym === 'QQQ' && qqqLots > 0) {
-      const covered = coveredCallContracts;
-      const uncovered = Math.max(0, qqqLots - covered);
-      const lotWord = qqqLots === 1 ? 'lot' : 'lots';
-      const extras = [];
-      if (covered > 0) extras.push(`<span style="color:var(--amber)">${covered} covered call${covered>1?'s':''}</span>`);
-      if (longCallContracts > 0) extras.push(`<span style="color:var(--blue)">${longCallContracts} long call${longCallContracts>1?'s':''}</span>`);
-      qtyExtra = `<div style="font-size:10px;color:var(--muted);margin-top:2px">${qqqLots} ${lotWord}${extras.length?' · '+extras.join(' · '):''}</div>`;
-      if (covered === 0 && longCallContracts > 0) {
-        note = `${qqqLots} ${lotWord}, ${longCallContracts} long call — no covered writes yet`;
-      } else if (covered > 0 && uncovered > 0) {
-        note = `${uncovered} lot${uncovered>1?'s':''} uncovered — engine may write calls`;
-      } else if (covered === qqqLots) {
-        note = `All ${qqqLots} ${lotWord} covered`;
-      } else {
-        note = `${qqqLots} ${lotWord}, no covered writes`;
-      }
-    }
+    let note = legacyReason || (ex ? shortTxt(ex.summary||ex.reason||'Exit candidate',56) : 'Holding');
     const qtyStr = qty > 0 ? Math.round(qty).toLocaleString() : '—';
     rows.push(`<tr>
-      <td><div class="sym" onclick="showStockDetail('${sym}')">${sym}</div>${qtyExtra}</td>
+      <td><div class="sym" onclick="showStockDetail('${sym}')">${sym}</div></td>
       <td class="mono" style="color:var(--muted)">${qtyStr}</td>
       <td class="mono">${fmt$(val)}</td>
       <td class="mono">${wt.toFixed(1)}%</td>
       <td class="mono ${pnl>=0?'pos-green':'pos-red'}">${fmtPnl(pnl)} <span style="font-size:10px;opacity:.7">${fmtPct(pnlPct,2)}</span></td>
-      <td><span class="tag good">Stock</span></td>
+      <td>${legacy ? '<span class="tag warn">Legacy</span>' : '<span class="tag good">Stock</span>'}</td>
       <td style="font-size:11px;color:var(--muted)">${esc(note)}</td>
     </tr>`);
   }
 
   for (const pos of optPos) {
     const sym = String(pos.symbol||'?').toUpperCase();
+    const legacy = !!pos.legacy_position;
+    const legacyReason = String(pos.legacy_reason||'');
     const qty = Math.abs(+(pos.qty||pos.quantity||pos.contracts||1));
     const val = +(pos.current_value||pos.market_value||0);
     const wt = +(pos.current_weight_pct||pos.weight_pct||0);
@@ -513,14 +489,14 @@ function renderPositions(data) {
           : '<span class="tag put">Put Hedge</span>';
       }
     }
-    const note = parsed ? `${parsed.root} $${parsed.strike} · exp ${parsed.expiry}` : sym;
+    const note = legacyReason || (parsed ? `${parsed.root} $${parsed.strike} · exp ${parsed.expiry}` : sym);
     rows.push(`<tr>
       <td><div class="sym" style="font-size:11px;cursor:default;letter-spacing:-.01em">${sym}</div></td>
       <td class="mono" style="color:var(--muted)">${qty} ct</td>
       <td class="mono">${fmt$(val)}</td>
       <td class="mono">${wt>0?wt.toFixed(1)+'%':'—'}</td>
       <td class="mono ${pnl>=0?'pos-green':'pos-red'}">${fmtPnl(pnl)} <span style="font-size:10px;opacity:.7">${fmtPct(pnlPct,2)}</span></td>
-      <td>${typeTag}</td>
+      <td>${legacy ? '<span class="tag warn">Legacy</span>' : typeTag}</td>
       <td style="font-size:11px;color:var(--muted)">${esc(note)}</td>
     </tr>`);
   }
@@ -546,8 +522,91 @@ function renderAlerts(alerts) {
 // ─── FEED ──────────────────────────────────────────────────────────────────
 const feedInner = () => $('feed-inner');
 const typingRow = () => $('typing-row');
-const FEED_KEY  = 'qqq_feed_v3';
-const FEED_MAX  = 150;
+const FEED_KEY  = 'alpha_feed_v3';
+const FEED_MAX  = 80;
+
+function feedTextFromHtml(html) {
+  const div = document.createElement('div');
+  div.innerHTML = html || '';
+  return (div.textContent || div.innerText || '').replace(/\s+/g, ' ').trim();
+}
+
+function isLowSignalFeedText(text) {
+  const t = String(text || '').toLowerCase();
+  return (
+    t.startsWith('position count:') ||
+    t.startsWith('options engine: covered-call income is eligible')
+  );
+}
+
+function shouldSuppressFeedItem(text, role='agent') {
+  const clean = feedTextFromHtml(text);
+  if (!clean) return true;
+  if (isLowSignalFeedText(clean)) return true;
+  const items = [...feedInner().querySelectorAll('.fi')];
+  const last = items[items.length - 1];
+  if (!last) return false;
+  const lastRole = last.classList.contains('you') ? 'you' : last.classList.contains('sys') ? 'sys' : 'agent';
+  const lastText = feedTextFromHtml(last.querySelector('.fi-msg')?.innerHTML || '');
+  return role === lastRole && clean === lastText;
+}
+
+function renderConsole(data) {
+  const acctg = data.accounting || {};
+  const decision = data.decision || {};
+  const risk = acctg.risk_state || {};
+  const legacyRows = acctg.legacy_positions || [];
+  const top = ((data.live_scores || {}).top || [])[0] || null;
+  const stateEl = $('console-state');
+  const actionsEl = $('feed-hdr-right');
+
+  let stateText = 'Engine ready.';
+  if (legacyRows.length) {
+    stateText = `Legacy inventory on-book: ${legacyRows.map(p => p.symbol).join(', ')}. Clear it before judging alpha performance.`;
+  } else if ((risk.status || '').toLowerCase() === 'breach') {
+    stateText = risk.message || 'Risk breach is active. Reduce exposure before adding.';
+  } else if (decision.summary) {
+    stateText = decision.summary;
+  } else if (top) {
+    stateText = `${top.symbol} is the strongest current setup at score ${Math.round(+(top.score || 0))}.`;
+  }
+  stateEl.textContent = stateText;
+
+  const actions = [
+    { label: 'Status', prompt: 'status' },
+    legacyRows.length
+      ? { label: 'Unwind Legacy', prompt: 'unwind legacy benchmark positions' }
+      : ((risk.status || '').toLowerCase() === 'breach'
+        ? { label: 'Reduce Risk', prompt: 'what should be reduced right now and why' }
+        : null),
+    top ? { label: 'Best Setup', prompt: 'show me the best actionable setups right now' } : null,
+    { label: 'Downside', prompt: 'how would you protect downside right now' },
+    { label: 'Backtest', action: 'backtest' },
+  ].filter(Boolean);
+
+  actionsEl.innerHTML = actions.map(action => {
+    if (action.action === 'backtest') {
+      return `<button class="feed-action" onclick="openBacktestPanel()">${esc(action.label)}</button>`;
+    }
+    return `<button class="feed-action" onclick="runPrompt('${esc(action.prompt)}')">${esc(action.label)}</button>`;
+  }).join('');
+}
+
+function renderConsoleUnavailable(message) {
+  _backendUnavailable = true;
+  $('console-state').textContent = message;
+  $('feed-hdr-right').innerHTML = `<button class="feed-action" onclick="poll()">Retry</button>`;
+  $('msg-input').disabled = true;
+  $('send-btn').disabled = true;
+  $('msg-input').placeholder = 'Broker context unavailable — restore backend credentials to use the console.';
+}
+
+function renderConsoleReady() {
+  _backendUnavailable = false;
+  $('msg-input').disabled = false;
+  $('send-btn').disabled = false;
+  $('msg-input').placeholder = 'Ask why, what changed, what it wants to do next, or approve a trade...';
+}
 
 function _persistFeed() {
   try {
@@ -567,6 +626,8 @@ function restoreFeed() {
     const stored = JSON.parse(localStorage.getItem(FEED_KEY) || '[]');
     if (!stored.length) return;
     for (const item of stored) {
+      const text = feedTextFromHtml(item.h || '');
+      if (isLowSignalFeedText(text)) continue;
       const who = item.r === 'you' ? 'You' : item.r === 'sys' ? 'System' : 'Agent';
       const el  = document.createElement('div');
       el.className = 'fi ' + (item.r === 'agent' ? '' : item.r);
@@ -580,6 +641,7 @@ function restoreFeed() {
 }
 
 function addFeedItem(html, role='agent', ts=null) {
+  if (shouldSuppressFeedItem(html, role)) return;
   const t = ts || now12();
   const cls = role==='you'?'you':(role==='sys'?'sys':'');
   const who = role==='you'?'You':(role==='sys'?'System':'Agent');
@@ -601,7 +663,6 @@ function showTyping() {
 function hideTyping() { typingRow().classList.remove('vis'); }
 
 // ─── PERF BAR ──────────────────────────────────────────────────────────────
-const OPT_RE = /^[A-Z]{1,6}\d{6}[CP]\d{8}$/;
 let _histEquity = null;
 
 function fmtPerf(dollar, pct) {
@@ -615,6 +676,7 @@ function renderPerfBar(data) {
   const equity = +(data?.account?.equity || 0);
   if (!equity) return;
   ['week','qtd','ytd'].forEach(k => {
+    if (!$('tb-' + k)) return;
     const base = _histEquity[k];
     if (base && base > 0) {
       const d = equity - base, p = d / base * 100;
@@ -645,8 +707,10 @@ async function poll() {
   try {
     const data = await apiJson('/api/lab/overview');
     _latestOverview = data;
+    renderConsoleReady();
     renderTopbar(data);
     renderPositions(data);
+    renderConsole(data);
     renderAlerts((data.alerts||[]));
     renderPerfBar(data);
 
@@ -657,12 +721,7 @@ async function poll() {
     }
     _prevRegime = regime || _prevRegime;
 
-    // Announce position count changes
-    const posCount = (data.accounting?.positions||[]).length;
-    if (_initialized && _prevPosCount !== null && posCount !== _prevPosCount) {
-      addFeedItem(`Position count: ${_prevPosCount} → ${posCount}.`, 'sys');
-    }
-    _prevPosCount = posCount;
+    _prevPosCount = (data.accounting?.positions||[]).length;
 
     if (!_initialized) {
       _initialized = true;
@@ -678,7 +737,7 @@ async function poll() {
         const lastEq = +(acct.adjusted_last_equity||acct.last_equity||equity);
         const pnl = equity - lastEq;
         const gross = +(acctg.gross_exposure_pct||0);
-        const gap = +(bench.bot_vs_best||0);
+        const gap = bench.bot_vs_best==null ? null : +bench.bot_vs_best;
         const qqxPnl = +(bench.best_index_pnl||0);
         const rsMsg = riskState.message||'';
         const rs = riskState.status||'ok';
@@ -687,73 +746,39 @@ async function poll() {
           `${gross.toFixed(1)}% deployed · market <b>${clock.is_open?'open':'closed'}</b>.`,
           'agent'
         );
-        if (bench.ok) {
-          const bestSym = bench.best_symbol || 'QQQ';
-          const bestPct = +((bench.indices||{})[bestSym]?.change_pct||0);
+        const legacyRows = data.accounting?.legacy_positions || [];
+        if (legacyRows.length) {
           addFeedItem(
-            `VS ${bestSym} <b class="${gap>=0?'pos-green':'pos-red'}">${fmtPnl(gap)}</b> — `+
-            `${bestSym} was ${bestPct>=0?'up':'down'} ${Math.abs(bestPct).toFixed(2)}% today `+
-            `(${fmtPnl(qqxPnl)} on a 100% position). You had ${gross.toFixed(0)}% deployed.`,
+            `Legacy benchmark inventory detected: <b>${legacyRows.map(p => esc(p.symbol)).join(', ')}</b>. The trader will unwind it before adding new alpha risk.`,
             'sys'
           );
-        }
-        if (rsMsg && rs !== 'normal' && rs !== 'ok' && rs !== 'research') {
+        } else if (rsMsg && rs !== 'normal' && rs !== 'ok' && rs !== 'research') {
           addFeedItem(`Risk: ${esc(rsMsg)}`, 'sys');
+        } else if (bench.ok && gap!=null && Math.abs(gap) > 0) {
+          addFeedItem(
+            `Relative edge: <b class="${gap>=0?'pos-green':'pos-red'}">${fmtPnl(gap)}</b> against today's passive baseline.`,
+            'sys'
+          );
         }
       }
     }
 
-    // Check options automation state
-    const optAuto = (data.options||{}).automation_state||{};
-    if (optAuto.last_summary && optAuto.last_summary !== window._lastOptSummary) {
-      window._lastOptSummary = optAuto.last_summary;
-      addFeedItem(`Options engine: ${esc(optAuto.last_summary)}`, 'sys');
-    }
-
-    if (_initialized) loadNews();
+    // Do not auto-inject options commentary into the console feed on every poll.
+    // The console should show actionable decisions, not recurring strategy boilerplate.
 
   } catch (e) {
-    if (_initialized) addFeedItem(`Poll error: ${esc(e.message)}`, 'sys');
-  }
-}
-
-// ─── NEWS ──────────────────────────────────────────────────────────────────
-const _seenNewsIds = new Set();
-let _lastNewsTs = 0;
-const NEWS_INTERVAL_MS = 5 * 60 * 1000;
-
-async function loadNews() {
-  if (Date.now() - _lastNewsTs < NEWS_INTERVAL_MS) return;
-  _lastNewsTs = Date.now();
-  try {
-    const data = await apiJson('/api/lab/news');
-    // Only show positive/negative — neutral is noise
-    const articles = (data.all_articles || [])
-      .filter(a => a.tone !== 'neutral' && !_seenNewsIds.has(a.id))
-      .slice(0, 8);
-    for (const a of articles) {
-      _seenNewsIds.add(a.id);
-      const isNeg = a.tone === 'negative';
-      const color = isNeg ? 'var(--red)' : 'var(--green)';
-      const syms = (a.symbols||[]).slice(0,3).join(' · ');
-      const headline = isNeg
-        ? `<b style="color:var(--text)">${esc(a.headline)}</b>`
-        : esc(a.headline);
-      addFeedItem(
-        `<span style="color:${color}">●</span> ` +
-        (syms ? `<b>${esc(syms)}</b> — ` : '') +
-        headline,
-        'sys'
-      );
+    renderConsoleUnavailable(`Live broker context unavailable: ${e.message}`);
+    if (!_initialized) {
+      _initialized = true;
     }
-  } catch(e) { /* silent — news is informational */ }
+  }
 }
 
 // ─── CHAT ──────────────────────────────────────────────────────────────────
 async function handleSend() {
   const inp = $('msg-input');
   const text = inp.value.trim();
-  if (!text) return;
+  if (!text || _backendUnavailable) return;
   inp.value = '';
   $('send-btn').disabled = true;
   addFeedItem(esc(text), 'you');
@@ -765,21 +790,36 @@ async function handleSend() {
       body: JSON.stringify({text:text, context:_latestOverview})
     });
     hideTyping();
-    const reply = data.reply||data.response||data.message||'No response.';
-    const orders = data.orders||null;
+    const proposal = data.trade_proposal || null;
+    const reply = data.reply||data.response||data.message||proposal?.context||proposal?.summary||'No response.';
+    const orders = data.orders||proposal?.orders||null;
+    if (data.variant === 'context_unavailable') {
+      renderConsoleUnavailable(reply);
+    } else {
+      renderConsoleReady();
+    }
     let html = esc(reply).replace(/\*\*(.*?)\*\*/g,'<b>$1</b>');
+    if (proposal?.summary && proposal.summary !== reply) {
+      html = `<div style="margin-bottom:4px"><b>${esc(proposal.summary)}</b></div>${html}`;
+    }
     if (orders && orders.length) {
+      const orderSummary = orders
+        .slice(0, 3)
+        .map(o => `${String(o.side||'').toUpperCase()} ${o.qty} ${o.symbol}`)
+        .join(' · ');
       html += `<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
-        <button style="height:26px;padding:0 10px;border-radius:4px;border:1px solid rgba(38,166,91,.4);background:rgba(38,166,91,.1);color:var(--green);font-size:11px;font-weight:700;cursor:pointer" onclick="acceptOrders(${JSON.stringify(orders).replace(/"/g,'&quot;')},this.parentElement)">Accept</button>
+        <div style="width:100%;font-size:11px;color:var(--muted)">${esc(orderSummary)}${orders.length>3?' ...':''}</div>
+        <button style="height:26px;padding:0 10px;border-radius:4px;border:1px solid rgba(38,166,91,.4);background:rgba(38,166,91,.1);color:var(--green);font-size:11px;font-weight:700;cursor:pointer" onclick="acceptOrders(${JSON.stringify(orders).replace(/"/g,'&quot;')},this.parentElement)">Accept ${orders.length} order${orders.length>1?'s':''}</button>
         <button style="height:26px;padding:0 10px;border-radius:4px;border:1px solid var(--border2);color:var(--muted);font-size:11px;font-weight:700;cursor:pointer" onclick="this.parentElement.remove()">Dismiss</button>
       </div>`;
     }
     addFeedItem(html, 'agent');
   } catch (e) {
     hideTyping();
+    renderConsoleUnavailable(`Console request failed: ${e.message}`);
     addFeedItem(`Error: ${esc(e.message)}`, 'sys');
   }
-  $('send-btn').disabled = false;
+  if (!_backendUnavailable) $('send-btn').disabled = false;
   $('msg-input').focus();
 }
 
@@ -802,6 +842,12 @@ async function acceptOrders(orders, actionsEl) {
 $('msg-input').addEventListener('keydown', e => {
   if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
 });
+
+function runPrompt(text) {
+  if (_backendUnavailable) return;
+  $('msg-input').value = text;
+  handleSend();
+}
 
 // ─── TRADING TOGGLE ────────────────────────────────────────────────────────
 async function toggleTrading() {

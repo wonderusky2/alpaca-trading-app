@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import config
 
+log = logging.getLogger("signals")
+
 # ── Universe ──────────────────────────────────────────────────────────────────
 BULL_ETF: list[str] = []
 BEAR_ETF: list[str] = []
@@ -262,7 +264,7 @@ def enrich_quotes_with_indicators(
     # ── 1. Alpaca bars — only useful on SIP feed; IEX returns ~1 symbol/batch ─
     # Skip Alpaca bar fetching on IEX (free tier) and go straight to yfinance.
     # Alpaca snapshots (price, change_pct, vwap, daily_open) still come from Alpaca.
-    _data_feed = os.environ.get("ALPACA_DATA_FEED", "iex").lower()
+    _data_feed = str(getattr(config, "ALPACA_DATA_FEED", "iex") or "iex").lower()
     if alpaca_client is not None and _data_feed != "iex":
         import zoneinfo as _tz
         _et = _tz.ZoneInfo("America/New_York")
@@ -1361,8 +1363,11 @@ def scan_premarket_gaps(
         snaps = alpaca_client.get_snapshots(ALL_SYMBOLS)
         gaps = []
         for sym, snap in snaps.items():
-            prev_close = float((snap.get("daily_bar") or {}).get("c", 0) or 0)
-            pre_price  = float((snap.get("minute_bar") or {}).get("c", 0) or 0)
+            # get_snapshots returns flat {price, prev_close, ...} dicts —
+            # the old daily_bar/minute_bar parsing matched nothing and the
+            # scan always returned empty.
+            prev_close = float(snap.get("prev_close") or 0)
+            pre_price  = float(snap.get("price") or 0)
             if prev_close <= 0 or pre_price <= 0:
                 continue
             gap_pct = (pre_price - prev_close) / prev_close * 100
@@ -1410,42 +1415,14 @@ def scan_dynamic_universe(
         if now < expiry:
             return cached_list
 
-    base = list(BULL_UNIVERSE)
-    try:
-        if alpaca_client is None:
-            from alpaca_client import AlpacaClient
-            alpaca_client = AlpacaClient()
-
-        snaps = alpaca_client.get_snapshots(ALL_SYMBOLS)
-        candidates = []
-        existing = set(ALL_SYMBOLS)
-        etf_suffixes = ("Q", "X", "U", "S")  # rough ETF filter
-
-        for sym, snap in snaps.items():
-            if sym in existing:
-                continue
-            daily = snap.get("daily_bar") or {}
-            prev  = snap.get("prev_daily_bar") or {}
-            price = float(daily.get("c") or 0)
-            vol   = float(daily.get("v") or 0)
-            prev_vol = float(prev.get("v") or 0)
-            if price < 5 or vol <= 0 or prev_vol <= 0:
-                continue
-            vol_ratio = vol / prev_vol
-            if vol_ratio < 1.5:
-                continue
-            if len(sym) >= 5 and sym.endswith(etf_suffixes):
-                continue
-            candidates.append((sym, vol_ratio))
-
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        additions = [s for s, _ in candidates[:max_add]]
-        if additions:
-            log.info("Dynamic universe added %d symbols: %s", len(additions), additions)
-        result = base + additions
-    except Exception as e:
-        log.warning("Dynamic universe scan failed: %s", e)
-        result = base
-
+    # NOTE: the previous implementation could never add a symbol — it only
+    # fetched snapshots for ALL_SYMBOLS and then excluded everything already
+    # in ALL_SYMBOLS, and it parsed a snapshot shape get_snapshots() does not
+    # return. Even if it had worked, additions outside ALPHA_ALLOWED_SYMBOLS
+    # would be bought and then force-liquidated by the alpha-universe guard on
+    # the next tick (pure churn). Until there is a real market-movers data
+    # source AND the allowed-universe policy permits dynamic names, the
+    # universe is the static allowed list.
+    result = list(BULL_UNIVERSE)
     _dyn_universe_cache = (result, now + _DYN_UNIVERSE_TTL)
     return result

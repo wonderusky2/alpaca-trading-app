@@ -5,7 +5,7 @@ Left-click on icon  → toggle dollar amount (like swing-bot)
 Right-click on icon → open full menu
 """
 from __future__ import annotations
-import json, os, shlex, shutil, subprocess, tempfile, threading
+import base64, json, os, shlex, shutil, subprocess, tempfile, threading
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -20,18 +20,24 @@ _bundle_resources = Path(__file__).parent.resolve()
 TRADER_DIR = (
     _bundle_resources
     if (_bundle_resources / "server.py").exists()
-    else Path.home() / "Code" / "robinhood-trader"
+    else (
+        Path.home() / "Code" / "alpaca-trading-app"
+        if (Path.home() / "Code" / "alpaca-trading-app" / "server.py").exists()
+        else Path.home() / "Code" / "robinhood-trader"
+    )
 )
 LOG_PATH       = TRADER_DIR / "trader.log"
 PLIST_SRC      = TRADER_DIR / "com.johnshelest.robinhoodtrader.plist"
 PLIST_DEST     = Path.home() / "Library" / "LaunchAgents" / "com.johnshelest.robinhoodtrader.plist"
 PLIST_LABEL    = "com.johnshelest.robinhoodtrader"
-CONJUR_DIR     = Path.home() / "Code" / "conjur-secret-manager"
+CONJUR_DIR     = Path(os.environ.get("CONJUR_DIR", str(Path.home() / "Code" / "conjur-secret-manager")))
 IVSENTINEL_ENV = Path.home() / "Code" / ".ivsentinel.env"
 ET             = ZoneInfo("America/New_York")
 START_CAPITAL  = 100_000.0
 UI_STATE_FILE  = TRADER_DIR / ".ui_state.json"
 FLASK_PORT     = 5001
+K8S_SECRET_NAME = os.environ.get("K8S_SECRET_NAME", "alpaca-trader-secrets")
+K8S_NAMESPACE   = os.environ.get("K8S_NAMESPACE", "alpaca-trader")
 
 
 # ── PyObjC click handler — left-click toggles, right-click opens menu ─────────
@@ -85,6 +91,26 @@ def _save_ui_state(state: dict) -> None:
         pass
 
 def _load_conjur_env() -> None:
+    export_cmd = os.environ.get("CONJUR_EXPORT_CMD", "").strip()
+    if export_cmd:
+        try:
+            proc = subprocess.run(
+                ["bash", "-lc", export_cmd],
+                capture_output=True, text=True, timeout=15, check=True,
+            )
+            for line in proc.stdout.splitlines():
+                if not line.startswith("export ") or "=" not in line:
+                    continue
+                key, raw = line[len("export "):].split("=", 1)
+                try:
+                    val = shlex.split(raw)[0]
+                except Exception:
+                    val = raw.strip().strip("'\"")
+                if key and val:
+                    os.environ[key] = val
+        except Exception:
+            pass
+
     # Try shutil.which first, then common Homebrew/nvm paths
     npm = (shutil.which("npm")
            or next((p for p in [
@@ -93,30 +119,49 @@ def _load_conjur_env() -> None:
                str(Path.home() / ".nvm/versions/node/$(ls ~/.nvm/versions/node | tail -1)/bin/npm"),
            ] if Path(p).exists()), None))
     if not npm or not Path(npm).exists() or not CONJUR_DIR.exists():
-        return
-    try:
-        proc = subprocess.run(
-            [npm, "run", "--silent", "export"],
-            cwd=str(CONJUR_DIR), capture_output=True, text=True, timeout=15, check=True,
-        )
-        for line in proc.stdout.splitlines():
-            if not line.startswith("export ") or "=" not in line:
-                continue
-            key, raw = line[len("export "):].split("=", 1)
-            try:
-                val = shlex.split(raw)[0]
-            except Exception:
-                val = raw.strip().strip("'\"")
-            if key and val:
-                os.environ[key] = val
-    except Exception:
         pass
+    else:
+        try:
+            proc = subprocess.run(
+                [npm, "run", "--silent", "export"],
+                cwd=str(CONJUR_DIR), capture_output=True, text=True, timeout=15, check=True,
+            )
+            for line in proc.stdout.splitlines():
+                if not line.startswith("export ") or "=" not in line:
+                    continue
+                key, raw = line[len("export "):].split("=", 1)
+                try:
+                    val = shlex.split(raw)[0]
+                except Exception:
+                    val = raw.strip().strip("'\"")
+                if key and val:
+                    os.environ[key] = val
+        except Exception:
+            pass
     try:
         for line in IVSENTINEL_ENV.read_text().splitlines():
             line = line.strip()
             if line.startswith("export ") and "=" in line:
                 key, raw = line[len("export "):].split("=", 1)
                 os.environ.setdefault(key.strip(), raw.strip().strip('"\''))
+    except Exception:
+        pass
+    if os.environ.get("ALPACA_PAPER_KEY") and os.environ.get("ALPACA_PAPER_SECRET"):
+        return
+    kubectl = shutil.which("kubectl")
+    if not kubectl:
+        return
+    try:
+        proc = subprocess.run(
+            [kubectl, "get", "secret", K8S_SECRET_NAME, "-n", K8S_NAMESPACE, "-o", "json"],
+            capture_output=True, text=True, timeout=15, check=True,
+        )
+        data = (json.loads(proc.stdout).get("data") or {})
+        for key in ("ALPACA_PAPER_KEY", "ALPACA_PAPER_SECRET", "GEMINI_API_KEY", "NOTIFY_WEBHOOK_URL"):
+            encoded = data.get(key)
+            if not encoded:
+                continue
+            os.environ.setdefault(key, base64.b64decode(encoded).decode("utf-8"))
     except Exception:
         pass
 
@@ -151,7 +196,7 @@ def _start_flask_server() -> None:
     Instead we invoke the real interpreter directly and add venv site-packages to
     PYTHONPATH so all installed packages are found.
     """
-    source_dir    = Path.home() / "Code" / "robinhood-trader"
+    source_dir    = TRADER_DIR
     venv_dir      = source_dir / "venv_server"
     server_script = source_dir / "server.py"
     server_log    = source_dir / "server.log"

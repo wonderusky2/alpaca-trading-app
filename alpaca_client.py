@@ -94,7 +94,7 @@ class AlpacaClient:
         if not config.fund_manager_order_submission_enabled():
             raise EnvironmentError(
                 "Order submission is locked. "
-                "Set FUND_MANAGER_ORDER_SUBMISSION_ENABLED=false to override."
+                "Set FUND_MANAGER_ORDER_SUBMISSION_ENABLED=true to enable."
             )
 
     # ── Account ───────────────────────────────────────────────────────────────
@@ -575,12 +575,21 @@ class AlpacaClient:
                     try:
                         # latest_trade has current price; daily_bar has vwap
                         latest_trade = getattr(snap, "latest_trade", None)
+                        latest_quote = getattr(snap, "latest_quote", None)
                         daily_bar    = getattr(snap, "daily_bar", None)
                         prev_bar     = getattr(snap, "prev_daily_bar", None)
 
                         price = None
+                        trade_ts = None
                         if latest_trade:
                             price = float(getattr(latest_trade, "price", 0) or 0)
+                            _ts = getattr(latest_trade, "timestamp", None)
+                            trade_ts = _ts.isoformat() if hasattr(_ts, "isoformat") else None
+
+                        bid = ask = 0.0
+                        if latest_quote:
+                            bid = float(getattr(latest_quote, "bid_price", 0) or 0)
+                            ask = float(getattr(latest_quote, "ask_price", 0) or 0)
                         if not price and daily_bar:
                             price = float(getattr(daily_bar, "close", 0) or 0)
 
@@ -606,6 +615,12 @@ class AlpacaClient:
                                 "change_pct": round(change_pct, 4),
                                 "vwap":       round(vwap, 4),
                                 "daily_open": round(daily_open, 4),
+                                # timestamp/bid/ask feed the stale-quote and
+                                # spread kill gates in trader.py — without
+                                # these fields both gates were dead code.
+                                "timestamp":  trade_ts,
+                                "bid":        round(bid, 4),
+                                "ask":        round(ask, 4),
                             }
                     except Exception as se:
                         log.debug("Snapshot parse failed for %s: %s", sym, se)

@@ -61,6 +61,21 @@ def _fetch_timed(path: str) -> tuple[dict, float]:
     return data, time.time() - t0
 
 
+def _post(path: str, body: dict) -> dict:
+    url = f"{SERVER_URL}{path}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "X-API-Key": os.environ.get("ALPACA_AGENT_API_KEY", ""),
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
+        return json.loads(r.read())
+
+
 def _grep_file(path: Path, pattern: str) -> list[str]:
     if not path.exists():
         return []
@@ -72,6 +87,11 @@ def _grep_file(path: Path, pattern: str) -> list[str]:
 def _file_text(name: str) -> str:
     p = APP_DIR / name
     return p.read_text(encoding="utf-8") if p.exists() else ""
+
+
+def short_reply(text: str, n: int = 96) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    return text[:n] + ("…" if len(text) > n else "")
 
 
 def _kubectl_exec(cmd: str) -> str:
@@ -170,6 +190,36 @@ def chk_all_endpoints():
     return f"{len(endpoints)} endpoints OK"
 
 
+@check("Server: command console 'status' prompt returns structured reply without runtime errors", "health")
+def chk_console_status():
+    d = _post("/api/lab/chat/message", {"text": "status"})
+    assert d.get("ok"), f"ok=false: {d}"
+    reply = str(d.get("reply") or d.get("message") or "")
+    proposal = d.get("trade_proposal") or {}
+    assert reply or proposal, f"Empty console response: {d}"
+    bad_markers = (
+        "cannot access local variable",
+        "traceback",
+        "unboundlocalerror",
+        "validation errors for",
+    )
+    lower = reply.lower()
+    assert not any(marker in lower for marker in bad_markers), f"console runtime error leaked: {reply}"
+    return short_reply(reply or str(proposal.get("summary") or "ok"))
+
+
+@check("Server: ledger endpoint reconciles broker fills and returns durable trades", "health")
+def chk_ledger_endpoint():
+    d = _fetch("/api/lab/ledger")
+    assert d.get("ok"), f"ok=false: {d}"
+    rec = d.get("reconciliation") or {}
+    assert rec.get("ok"), f"reconciliation failed: {rec}"
+    trades = d.get("trades") or []
+    bad_sources = [t.get("source") for t in trades if t.get("source") not in {None, "alpaca_fill"}]
+    assert not bad_sources, f"unexpected ledger sources: {bad_sources[:5]}"
+    return f"ledger trades={len(trades)}, reconciled total={rec.get('total')}"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ── CATEGORY: pnl ─────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
@@ -241,6 +291,27 @@ def chk_pnl_vs_narrative():
     last   = float(acct.get("last_equity") or equity)
     daily  = equity - last
     return f"open_pnl=${open_pnl:+,.0f}, daily_pnl=${daily:+,.0f}, narrative: '{summary[:50]}'"
+
+
+@check("P&L: benchmark delta is not echoing bot P&L when benchmark is unavailable", "pnl")
+def chk_benchmark_truth():
+    d = _fetch("/api/lab/overview")
+    acct = d.get("account") or {}
+    bench = d.get("benchmark") or {}
+    equity = float(acct.get("equity") or 0)
+    last_eq = float(acct.get("adjusted_last_equity") or acct.get("last_equity") or equity)
+    daily = round(equity - last_eq, 2)
+    bot_vs = bench.get("bot_vs_best")
+    if not bench.get("ok"):
+        assert bot_vs in (None, 0, 0.0), (
+            f"benchmark unavailable but bot_vs_best={bot_vs} "
+            f"(daily_pnl={daily:+,.2f}) — app is likely echoing account P&L as benchmark edge"
+        )
+        return "benchmark unavailable -> no synthetic edge shown"
+    best_sym = str(bench.get("best_symbol") or "")
+    assert best_sym in {"SPY", "QQQ"}, f"unexpected benchmark symbol: {best_sym or 'missing'}"
+    assert bench.get("best_index_pnl") is not None, "benchmark ok=true but best_index_pnl is missing"
+    return f"benchmark ok vs {best_sym}, bot_vs_best={float(bot_vs or 0):+,.0f}"
 
 
 @check("P&L: position values don't exceed equity (sanity)", "pnl")
@@ -851,10 +922,10 @@ def _write_model_to_pod():
 ALL_LOCAL_CHECKS = [
     # health
     chk_status, chk_status_speed, chk_overview_speed, chk_overview,
-    chk_all_endpoints,
+    chk_all_endpoints, chk_console_status, chk_ledger_endpoint,
     # pnl
     chk_dawn_fix, chk_pnl_not_phantom, chk_web_pnl_display,
-    chk_pnl_vs_narrative, chk_position_sum,
+    chk_pnl_vs_narrative, chk_benchmark_truth, chk_position_sum,
     # narrative
     chk_narrative_api, chk_narrative_source, chk_simple_chat_choppy,
     chk_web_choppy_js,

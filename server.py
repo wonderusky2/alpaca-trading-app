@@ -746,8 +746,8 @@ def _benchmark_truth(account: dict, daily_pnl: float | None = None) -> dict:
         "base_equity": round(last_equity, 2),
         "indices": {},
         "best_symbol": None,
-        "best_index_pnl": 0.0,
-        "bot_vs_best": round(float(daily_pnl or 0), 2),
+        "best_index_pnl": None,
+        "bot_vs_best": None,
         "verdict": "benchmark unavailable",
     }
     if last_equity <= 0:
@@ -761,14 +761,39 @@ def _benchmark_truth(account: dict, daily_pnl: float | None = None) -> dict:
 
     best_sym = None
     best_pnl = None
+
+    def _snapshot_change_pct(snap: dict) -> tuple[float | None, float | None]:
+        if not isinstance(snap, dict):
+            return None, None
+        price = snap.get("price")
+        prev_close = snap.get("prev_close")
+        change_pct = snap.get("change_pct")
+        try:
+            price = float(price) if price is not None else None
+        except (TypeError, ValueError):
+            price = None
+        try:
+            prev_close = float(prev_close) if prev_close is not None else None
+        except (TypeError, ValueError):
+            prev_close = None
+        try:
+            change_pct = float(change_pct) if change_pct is not None else None
+        except (TypeError, ValueError):
+            change_pct = None
+        if change_pct is None and price and prev_close:
+            change_pct = ((price - prev_close) / prev_close) * 100.0
+        return change_pct, price
+
     for sym in ("SPY", "QQQ"):
         snap = snaps.get(sym) or {}
-        pct = float(snap.get("change_pct") or 0)
+        pct, price = _snapshot_change_pct(snap)
+        if pct is None:
+            continue
         bench_pnl = last_equity * pct / 100.0
         out["indices"][sym] = {
             "change_pct": round(pct, 2),
             "pnl_if_100pct": round(bench_pnl, 2),
-            "price": snap.get("price"),
+            "price": price,
         }
         if best_pnl is None or bench_pnl > best_pnl:
             best_sym = sym

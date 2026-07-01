@@ -13,15 +13,20 @@ POSITION_MEMORY_PATH  = STATE_DIR / "position_memory.json"
 VARIANT_HISTORY_PATH  = STATE_DIR / "variant_history.json"
 
 DEFAULT_MODEL = {
-    "version": 4,
+    "version": 5,
     "generation": 0,
     "min_conviction": 78,
     "bear_etf_min_conviction": 50,
     "max_positions": 3,
     "position_size_pct": 0.16,
     "trailing_stop_pct": 2.0,
-    "profit_lock_trigger_pct": 0.6,
-    "profit_giveback_pct": 0.4,
+    # v5: risk/reward rebalanced. The old 0.6/0.4 lock exited winners around
+    # +0.2–0.6% while the stop risked -2.0% — structurally negative expectancy
+    # (ledger showed avg_win $22 vs avg_loss $44). Winners must be allowed to
+    # earn at least as much as a loser costs.
+    "profit_target_pct": 3.0,
+    "profit_lock_trigger_pct": 1.5,
+    "profit_giveback_pct": 0.75,
     "partial_exit_trigger_pct": 2.5,
     "partial_exit_fraction": 0.33,
     "velocity_stop_pct": 1.5,          # exit if drops >1.5% in one tick
@@ -46,6 +51,7 @@ BOUNDS = {
     "max_positions": (1, 6),
     "position_size_pct": (0.01, 0.20),
     "trailing_stop_pct": (1.5, 6.0),
+    "profit_target_pct": (1.0, 8.0),
     "profit_lock_trigger_pct": (0.2, 6.0),
     "profit_giveback_pct": (0.1, 3.0),
     "partial_exit_trigger_pct": (0.3, 10.0),
@@ -65,24 +71,33 @@ def _clamp(value, low, high):
 
 def _apply_alpha_first_migration(clean: dict) -> dict:
     version = int(clean.get("version") or 0)
-    if version >= 4:
-        clean["version"] = version
-        return clean
 
-    clean["min_conviction"] = max(int(clean.get("min_conviction", 78)), 78)
-    clean["max_positions"] = min(int(clean.get("max_positions", 3)), 3)
-    clean["position_size_pct"] = max(float(clean.get("position_size_pct", 0.16)), 0.16)
-    clean["trailing_stop_pct"] = min(float(clean.get("trailing_stop_pct", 2.0)), 2.0)
-    clean["profit_lock_trigger_pct"] = min(float(clean.get("profit_lock_trigger_pct", 0.6)), 0.6)
-    clean["profit_giveback_pct"] = min(float(clean.get("profit_giveback_pct", 0.4)), 0.4)
-    clean["partial_exit_trigger_pct"] = max(float(clean.get("partial_exit_trigger_pct", 2.5)), 2.5)
-    clean["partial_exit_fraction"] = min(float(clean.get("partial_exit_fraction", 0.33)), 0.33)
-    clean["pyramid_trigger_pct"] = max(float(clean.get("pyramid_trigger_pct", 1.2)), 1.2)
-    clean["max_single_position_pct"] = min(float(clean.get("max_single_position_pct", 0.20)), 0.20)
-    clean["max_holding_days"] = min(int(clean.get("max_holding_days", 1)), 1)
-    clean["daily_loss_kill_pct"] = min(float(clean.get("daily_loss_kill_pct", -1.5)), -1.5)
-    clean["active_variant"] = "alpha_momentum"
-    clean["version"] = 4
+    if version < 4:
+        clean["min_conviction"] = max(int(clean.get("min_conviction", 78)), 78)
+        clean["max_positions"] = min(int(clean.get("max_positions", 3)), 3)
+        clean["position_size_pct"] = max(float(clean.get("position_size_pct", 0.16)), 0.16)
+        clean["trailing_stop_pct"] = min(float(clean.get("trailing_stop_pct", 2.0)), 2.0)
+        clean["profit_lock_trigger_pct"] = min(float(clean.get("profit_lock_trigger_pct", 0.6)), 0.6)
+        clean["profit_giveback_pct"] = min(float(clean.get("profit_giveback_pct", 0.4)), 0.4)
+        clean["partial_exit_trigger_pct"] = max(float(clean.get("partial_exit_trigger_pct", 2.5)), 2.5)
+        clean["partial_exit_fraction"] = min(float(clean.get("partial_exit_fraction", 0.33)), 0.33)
+        clean["pyramid_trigger_pct"] = max(float(clean.get("pyramid_trigger_pct", 1.2)), 1.2)
+        clean["max_single_position_pct"] = min(float(clean.get("max_single_position_pct", 0.20)), 0.20)
+        clean["max_holding_days"] = min(int(clean.get("max_holding_days", 1)), 1)
+        clean["daily_loss_kill_pct"] = min(float(clean.get("daily_loss_kill_pct", -1.5)), -1.5)
+        clean["active_variant"] = "alpha_momentum"
+        version = 4
+
+    if version < 5:
+        # v5: fix inverted risk/reward. Old params locked winners at ~+0.2-0.6%
+        # while risking -2.0% per trade. Raise the lock trigger and giveback so
+        # a winner can pay for at least one loser.
+        clean["profit_lock_trigger_pct"] = max(float(clean.get("profit_lock_trigger_pct", 1.5)), 1.5)
+        clean["profit_giveback_pct"] = max(float(clean.get("profit_giveback_pct", 0.75)), 0.75)
+        clean.setdefault("profit_target_pct", 3.0)
+        version = 5
+
+    clean["version"] = version
     return clean
 
 
@@ -94,6 +109,7 @@ def sanitize_model(model: dict) -> dict:
     clean["max_positions"] = int(_clamp(int(clean["max_positions"]), *BOUNDS["max_positions"]))
     clean["position_size_pct"] = round(float(_clamp(float(clean["position_size_pct"]), *BOUNDS["position_size_pct"])), 4)
     clean["trailing_stop_pct"] = round(float(_clamp(float(clean["trailing_stop_pct"]), *BOUNDS["trailing_stop_pct"])), 2)
+    clean["profit_target_pct"] = round(float(_clamp(float(clean.get("profit_target_pct", 3.0)), *BOUNDS["profit_target_pct"])), 2)
     clean["profit_lock_trigger_pct"] = round(float(_clamp(float(clean["profit_lock_trigger_pct"]), *BOUNDS["profit_lock_trigger_pct"])), 2)
     clean["profit_giveback_pct"] = round(float(_clamp(float(clean["profit_giveback_pct"]), *BOUNDS["profit_giveback_pct"])), 2)
     clean["partial_exit_trigger_pct"] = round(float(_clamp(float(clean.get("partial_exit_trigger_pct", 1.0)), *BOUNDS["partial_exit_trigger_pct"])), 2)

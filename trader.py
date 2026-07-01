@@ -200,12 +200,34 @@ def _check_kill_switch(account: dict, model: dict) -> bool:
     if last_equity <= 0:
         return False
     daily_pct = (equity - last_equity) / last_equity * 100
-    limit = min(float(model.get("daily_loss_kill_pct", DAILY_LOSS_KILL)), config.DAILY_LOSS_KILL_PCT)
+    # Tighter (less negative) limit wins: config is a hard cap the adaptive
+    # model can never loosen. min() picked the MORE negative value — bug.
+    limit = max(float(model.get("daily_loss_kill_pct", DAILY_LOSS_KILL)), config.DAILY_LOSS_KILL_PCT)
     if daily_pct <= limit:
         log.warning("Kill switch: daily P&L %.2f%% ≤ %.2f%% limit", daily_pct, limit)
-        notify.send(f"🛑 RHT KILL SWITCH: daily P&L {daily_pct:.2f}% — halting trades today.")
+        _notify_kill_switch_once(daily_pct)
         return True
     return False
+
+
+_KILL_NOTIFY_PATH = strategy_model.STATE_DIR / "kill_switch_notified.json"
+
+
+def _notify_kill_switch_once(daily_pct: float) -> None:
+    """Send the kill-switch alert once per trading day, not every 5-min tick."""
+    today = _now_et().date().isoformat()
+    try:
+        if _KILL_NOTIFY_PATH.exists():
+            if json.loads(_KILL_NOTIFY_PATH.read_text(encoding="utf-8")).get("date") == today:
+                return
+    except Exception:
+        pass
+    notify.send(f"🛑 RHT KILL SWITCH: daily P&L {daily_pct:.2f}% — halting new trades today.")
+    try:
+        strategy_model.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        _KILL_NOTIFY_PATH.write_text(json.dumps({"date": today}), encoding="utf-8")
+    except Exception:
+        pass
 
 
 # ── Position sizing ───────────────────────────────────────────────────────────
@@ -1282,17 +1304,19 @@ def main() -> None:
     if equity <= 0:
         log.error("Invalid equity: %s", equity); return
 
-    # ── Kill switch ────────────────────────────────────────────────────────
-    if _check_kill_switch(account, model):
-        return
-
     # ── Regime gate ────────────────────────────────────────────────────────
     regime = sg.detect_regime(quotes)
 
     # ── Trailing stop check ────────────────────────────────────────────────
+    # Runs BEFORE the kill switch: risk exits must keep working on the worst
+    # days. The kill switch only halts NEW risk, never position management.
     stopped_out = _check_trailing_stops(client, positions, quotes, model, regime=regime)
     if stopped_out:
         positions = client.get_positions()  # refresh after exits
+
+    # ── Kill switch (blocks new entries/rebalancing, not exits) ────────────
+    if _check_kill_switch(account, model):
+        return
 
     # ── QQQ core sleeve ────────────────────────────────────────────────────
     if _rebalance_core_sleeve(client, account, positions, quotes, regime):
