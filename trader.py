@@ -231,12 +231,33 @@ def _notify_kill_switch_once(daily_pct: float) -> None:
 
 
 # ── Position sizing ───────────────────────────────────────────────────────────
-def _calc_qty(price: float, equity: float, model: dict, size_mult: float = 1.0) -> int:
+def _calc_qty(
+    price: float,
+    equity: float,
+    model: dict,
+    size_mult: float = 1.0,
+    stop_pct: float | None = None,
+) -> int:
+    """Position size in shares.
+
+    When stop_pct (distance to the stop, in %) is provided and RISK_PER_TRADE_PCT
+    is configured, size so every trade risks the same fraction of equity:
+        notional = equity * risk% / stop%
+    capped at the notional position-size limit. Without a stop, falls back to
+    fixed-notional sizing (old behavior).
+    """
     if price <= 0 or equity <= 0:
         return 0
     raw_pct = float(model.get("position_size_pct", POSITION_SIZE_PCT))
     capped_pct = min(raw_pct, config.MAX_POSITION_SIZE_PCT) * size_mult
     target_value = equity * capped_pct
+    risk_pct = float(getattr(config, "RISK_PER_TRADE_PCT", 0.0) or 0.0)
+    if stop_pct and stop_pct > 0 and risk_pct > 0:
+        # Equal dollar risk per trade; bounded by the hard notional cap so a
+        # very tight stop can't balloon the position.
+        risk_value = equity * (risk_pct / 100.0) * size_mult
+        hard_cap_value = equity * float(config.MAX_POSITION_SIZE_PCT) * size_mult
+        target_value = min(risk_value / (stop_pct / 100.0), hard_cap_value)
     min_order_value = max(
         float(getattr(config, "ALPHA_MIN_ORDER_VALUE", 0.0)),
         equity * float(getattr(config, "ALPHA_MIN_ORDER_PCT", 0.0)),
@@ -471,14 +492,18 @@ def _check_trailing_stops(client: AlpacaClient, positions: dict, quotes: dict, m
         peak_pnl_pct = float((memory.get(sym) or {}).get("peak_unrealized_pnl_pct") or pnl_pct)
         giveback_pct = peak_pnl_pct - pnl_pct
 
-        hard_stop_pct    = float(model.get("trailing_stop_pct", TRAILING_STOP_PCT))
+        # ATR-based stop fixed at entry (per-position); model default otherwise.
+        # Bounded so a data glitch can't produce an absurd stop.
+        pos_meta = strategies.get(sym) or {}
+        pos_stop = float(pos_meta.get("stop_pct") or 0)
+        hard_stop_pct    = min(max(pos_stop, 1.0), 5.0) if pos_stop > 0 else float(model.get("trailing_stop_pct", TRAILING_STOP_PCT))
         max_hold_days    = int(model.get("max_holding_days", 2))
         profit_target    = float(model.get("profit_target_pct", 3.0))
         giveback_trigger = float(model.get("profit_giveback_pct", 1.0))
         lock_trigger     = float(model.get("profit_lock_trigger_pct", profit_target))
 
         # Reversion trades: tighter params — take gains fast, cut losses faster (#55)
-        if strategies.get(sym) == "reversion":
+        if pos_meta.get("strategy") == "reversion":
             hard_stop_pct = min(hard_stop_pct, REVERSION_TRAILING_STOP)
             profit_target = min(profit_target, REVERSION_PROFIT_TARGET)
             max_hold_days = min(max_hold_days, 1)
@@ -824,18 +849,29 @@ _STRATEGY_MEMORY_PATH   = strategy_model.STATE_DIR / "position_strategy.json"
 
 
 def _load_position_strategies() -> dict:
-    """Returns {sym: "momentum"|"reversion"} for currently tracked positions."""
+    """Returns {sym: {"strategy": "momentum"|"reversion", "stop_pct": float|None}}.
+
+    Older files stored a bare strategy string per symbol; those are normalized
+    to dicts on read so callers have one shape to deal with.
+    """
     try:
         if _STRATEGY_MEMORY_PATH.exists():
-            return json.loads(_STRATEGY_MEMORY_PATH.read_text(encoding="utf-8"))
+            raw = json.loads(_STRATEGY_MEMORY_PATH.read_text(encoding="utf-8"))
+            out: dict = {}
+            for sym, val in (raw or {}).items():
+                out[str(sym).upper()] = val if isinstance(val, dict) else {"strategy": str(val)}
+            return out
     except Exception:
         pass
     return {}
 
 
-def _record_position_strategy(sym: str, strategy: str) -> None:
+def _record_position_strategy(sym: str, strategy: str, stop_pct: float | None = None) -> None:
     data = _load_position_strategies()
-    data[sym.upper()] = strategy
+    entry: dict = {"strategy": strategy}
+    if stop_pct and stop_pct > 0:
+        entry["stop_pct"] = round(float(stop_pct), 2)
+    data[sym.upper()] = entry
     try:
         strategy_model.STATE_DIR.mkdir(parents=True, exist_ok=True)
         _STRATEGY_MEMORY_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -956,17 +992,26 @@ def _entry_limit_block_status(sym: str) -> tuple[bool, str]:
     return False, ""
 
 
+# Administrative exits — not a verdict on the strategy, so they must not feed
+# the consecutive-loss halt (#7). A losing forced unwind of out-of-universe
+# inventory says nothing about signal quality.
+_NON_STRATEGY_EXITS = {"disallowed_inventory", "legacy_benchmark_unwind", "eod_flat"}
+
+
 def _record_sell(sym: str, pnl: float = 0.0, exit_reason: str = "") -> None:
     """Record sell cooldown + update consecutive-loss counter (#20)."""
+    reason = str(exit_reason or "").lower()
     cooldowns = _load_sell_cooldowns()
     cooldowns[sym.upper()] = {
         "sold_at": datetime.now(timezone.utc).isoformat(),
-        "exit_reason": str(exit_reason or "").lower(),
+        "exit_reason": reason,
     }
     try:
         _SELL_COOLDOWN_PATH.write_text(json.dumps(cooldowns, indent=2), encoding="utf-8")
     except Exception as e:
         log.warning("Could not save sell cooldown: %s", e)
+    if reason in _NON_STRATEGY_EXITS:
+        return
     # Track win/loss streak for consecutive-loss kill gate
     streak = _record_trade_outcome(won=(pnl > 0))
     if pnl <= 0:
@@ -1281,7 +1326,16 @@ def main() -> None:
         run_eod_flat(client, positions, quotes)
         return
 
-    if not is_market_open():
+    # Holiday-aware market check (#4): broker clock is truth (knows holidays and
+    # half-days); local weekday/time window is only the fallback if the API fails.
+    market_open: bool | None = None
+    try:
+        market_open = bool(client.get_clock().get("is_open"))
+    except Exception as e:
+        log.warning("Broker clock fetch failed (%s) — using local calendar fallback.", e)
+    if market_open is None:
+        market_open = is_market_open() or is_eod()  # local window incl. 15:40-16:00
+    if not market_open:
         log.info("Market closed — nothing to do."); return
 
     # ── Get live Alpaca state ──────────────────────────────────────────────
@@ -1316,6 +1370,13 @@ def main() -> None:
 
     # ── Kill switch (blocks new entries/rebalancing, not exits) ────────────
     if _check_kill_switch(account, model):
+        return
+
+    # ── EOD window (#5): 15:40-16:00 ET manages exits only ─────────────────
+    # Previously the trader went fully dark after 15:40, leaving stops
+    # unmanaged for the final 20 minutes of the session.
+    if is_eod():
+        log.info("EOD window (≥15:40 ET): exits managed above; no new risk.")
         return
 
     # ── QQQ core sleeve ────────────────────────────────────────────────────
@@ -1475,6 +1536,10 @@ def main() -> None:
 
     bought_list: list[tuple[str, int, float, int]] = []  # (sym, qty, price, score)
 
+    # Buying-power guard (#6): size off equity but never submit more than the
+    # account can fund — Alpaca rejects those orders and the tick is wasted.
+    available_funds = float(account.get("buying_power") or account.get("cash") or 0)
+
     for sig in trade_signals:
         if len(bought_list) >= int(config.MAX_NEW_ENTRIES_PER_TICK):
             log.info("Entry throttle: max %d new entry per tick reached.", config.MAX_NEW_ENTRIES_PER_TICK)
@@ -1516,10 +1581,28 @@ def main() -> None:
         conv_mult = _conviction_size_mult(sig.score) if use_conviction_scale else 1.0
         total_size_mult = sig.size_mult * conv_mult
 
+        # ATR stop distance (%) from the signal — drives risk-based sizing and
+        # is persisted so the exit stack enforces the same stop it was sized on.
+        entry_stop_pct = 0.0
+        atr_stop = float(getattr(sig, "atr_stop", 0) or 0)
+        if atr_stop > 0 and price > 0 and atr_stop < price:
+            entry_stop_pct = (price - atr_stop) / price * 100
+
         # Hard cap: never exceed max_single_position_pct of equity in one name
         max_pos_pct = min(float(model.get("max_single_position_pct", MAX_SINGLE_POS_PCT)), MAX_SINGLE_POS_PCT)
         max_qty_by_cap = int(equity * max_pos_pct / price) if price > 0 else 0
-        qty = min(_calc_qty(price, equity, model, size_mult=total_size_mult), max_qty_by_cap)
+        qty = min(
+            _calc_qty(price, equity, model, size_mult=total_size_mult,
+                      stop_pct=entry_stop_pct or None),
+            max_qty_by_cap,
+        )
+
+        # Buying-power cap (#6)
+        max_qty_by_funds = int(available_funds * 0.98 / price) if price > 0 else 0
+        if qty > max_qty_by_funds:
+            log.info("Funding cap: %s qty %d → %d (available ~$%.0f).",
+                     sig.symbol, qty, max_qty_by_funds, available_funds)
+            qty = max_qty_by_funds
         if qty <= 0:
             continue
 
@@ -1542,7 +1625,11 @@ def main() -> None:
             positions[sig.symbol] = {"qty": qty, "entry": price,
                                      "unrealized_pl": 0, "unrealized_plpc": 0}
             satellite_positions[sig.symbol] = positions[sig.symbol]
-            _record_position_strategy(sig.symbol, getattr(sig, "strategy", "momentum"))
+            _record_position_strategy(
+                sig.symbol, getattr(sig, "strategy", "momentum"),
+                stop_pct=entry_stop_pct or None,
+            )
+            available_funds -= qty * price
             bought_list.append((sig.symbol, qty, price, sig.score))
         except Exception as e:
             log.error("Buy order failed for %s: %s", sig.symbol, e)

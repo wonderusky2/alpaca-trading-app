@@ -35,6 +35,10 @@ MARKET_DOWN_BLOCK_PCT: float = -0.8
 BULL_TARGET_GROSS_PCT: float = 0.55
 ALPHA_MIN_ORDER_VALUE: float = 2_500.0
 ALPHA_MIN_ORDER_PCT: float = 0.025
+# Risk-based sizing: % of equity risked to the stop per trade. With a 2% stop
+# this yields ~17.5% notional (matches the old fixed sizing); tighter ATR stops
+# size up toward the notional cap, wider stops size down automatically.
+RISK_PER_TRADE_PCT: float = 0.35
 CORE_BENCHMARK_SYMBOL: str = "QQQ"
 CORE_BENCHMARK_TARGET_PCT: float = 1.00
 CORE_BENCHMARK_MAX_PCT: float = 1.00
@@ -154,7 +158,9 @@ OPTIONS_AUTOMATION_INTERVAL_SECONDS: int = 15 * 60
 OPTIONS_AUTOMATION_COOLDOWN_SECONDS: int = 60 * 60
 EDGE_GATE_MIN_CLOSED_TRADES: int = 20
 EDGE_GATE_MIN_EXPECTANCY: float = 0.0
-ALPHA_EXPERIMENT_ID: str = "alpha_v4_attributed"
+# v5: ATR stops + risk-based sizing + rebalanced exit R:R. New experiment ID so
+# the edge gate judges v5 on its own trades, not v4's negative-expectancy history.
+ALPHA_EXPERIMENT_ID: str = "alpha_v5_atr_risk"
 PROMOTION_MIN_PAPER_DAYS: int = 30
 PROMOTION_MIN_CLOSED_TRADES: int = 100
 
