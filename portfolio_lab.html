@@ -216,6 +216,32 @@ input{font:inherit}
 .bt-spinner{width:26px;height:26px;border:2px solid var(--border2);border-top-color:var(--blue);border-radius:50%;animation:spin .7s linear infinite;margin:20px auto}
 @keyframes spin{to{transform:rotate(360deg)}}
 
+/* ── SIGNALS STRIP ─────────────────────────────────────────────────────── */
+#sig-strip{display:flex;align-items:center;gap:8px;padding:5px 12px;border-top:1px solid var(--border);overflow-x:auto;scrollbar-width:none;min-height:30px}
+#sig-strip::-webkit-scrollbar{display:none}
+#sig-strip .sig-lbl{font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);flex-shrink:0}
+.sig-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border:1px solid var(--border2);border-radius:11px;font-family:var(--mono);font-size:11px;cursor:pointer;white-space:nowrap;flex-shrink:0;color:var(--text)}
+.sig-chip:hover{border-color:var(--blue)}
+.sig-chip .sc{font-weight:700}
+.sig-chip .sc.hi{color:var(--green)}
+.sig-chip .sc.mid{color:var(--amber)}
+.sig-chip .sc.lo{color:var(--muted)}
+.sig-chip.held{border-color:rgba(38,166,91,.4)}
+
+/* ── STATS PANEL ───────────────────────────────────────────────────────── */
+#stats-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:16px}
+.stat-card{border:1px solid var(--border2);border-radius:6px;padding:10px 12px}
+.stat-card .sc-lbl{font-size:9px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+.stat-card .sc-val{font-family:var(--mono);font-size:16px;font-weight:700}
+.stat-card .sc-sub{font-size:10px;color:var(--muted);margin-top:2px}
+.stats-tbl{width:100%;border-collapse:collapse;font-size:11px;margin-bottom:18px}
+.stats-tbl th{text-align:left;font-size:9px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);padding:5px 8px;border-bottom:1px solid var(--border)}
+.stats-tbl td{padding:5px 8px;border-bottom:1px solid var(--border);font-family:var(--mono)}
+.stats-tbl td:first-child{font-family:inherit;font-weight:600;color:var(--text)}
+.stats-sec-title{font-size:12px;font-weight:700;color:var(--text);margin:4px 0 8px}
+.bar-wrap{display:inline-block;width:70px;height:6px;background:var(--border);border-radius:3px;vertical-align:middle;margin-right:6px;overflow:hidden}
+.bar-fill{height:100%;border-radius:3px}
+
 @media(max-width:820px){
   .hide-sm{display:none!important}
   #pos-bar,.tag{font-size:9px}
@@ -223,6 +249,7 @@ input{font:inherit}
   #feed-hdr{padding:12px;gap:12px;flex-direction:column}
   #console-state{max-width:none;text-align:left}
   #console-bar{padding:12px}
+  #stats-cards{grid-template-columns:repeat(2,1fr)}
 }
 </style>
 </head>
@@ -241,6 +268,7 @@ input{font:inherit}
     <div class="tb-stat hide-sm"><span class="lbl" id="tb-qqq-lbl">Alpha vs QQQ</span><span class="val" id="tb-qqq">—</span></div>
     <div class="tb-stat hide-sm"><span class="lbl">Exposure</span><span class="val" id="tb-exp">—</span></div>
     <div class="tb-stat hide-sm"><span class="lbl">Cash</span><span class="val" id="tb-cash">—</span></div>
+    <button id="tb-stats" onclick="openStatsPanel()" style="padding:0 14px;border-left:1px solid var(--border);font-size:11px;font-weight:700;color:var(--muted)">Stats</button>
     <button id="tb-pause" onclick="toggleTrading()">Pause</button>
   </header>
 
@@ -258,14 +286,15 @@ input{font:inherit}
       <table id="pos-table">
         <thead>
           <tr>
-            <th>Symbol</th><th>Qty</th><th>Value</th><th>Weight</th><th>P&amp;L</th><th>Type</th><th>Note</th>
+            <th>Symbol</th><th>Qty</th><th>Value</th><th>Weight</th><th>P&amp;L</th><th class="hide-sm">Stop</th><th>Type</th><th>Note</th>
           </tr>
         </thead>
         <tbody id="pos-body">
-          <tr><td colspan="7" style="color:var(--muted);padding:14px 16px">Loading…</td></tr>
+          <tr><td colspan="8" style="color:var(--muted);padding:14px 16px">Loading…</td></tr>
         </tbody>
       </table>
     </section>
+    <div id="sig-strip"><span class="sig-lbl">Signals</span><span style="color:var(--dim);font-size:11px">waiting for scores…</span></div>
   </div>
 
   <!-- ACTIVITY FEED -->
@@ -311,6 +340,19 @@ input{font:inherit}
   </div>
 </div>
 
+<!-- Stats / performance modal -->
+<div id="stats-panel" onclick="if(event.target===this)closeStatsPanel()" style="display:none;position:fixed;inset:0;z-index:8500;background:rgba(0,0,0,.75);align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border2);border-radius:8px;width:min(760px,96vw);max-height:90vh;display:flex;flex-direction:column;overflow:hidden">
+    <div id="stats-hdr" style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--border)">
+      <span style="font-size:14px;font-weight:700">Performance — realized trades</span>
+      <button onclick="closeStatsPanel()" style="font-size:18px;color:var(--muted)">✕</button>
+    </div>
+    <div id="stats-content" style="flex:1;overflow-y:auto;min-height:200px;padding:16px 18px;font-size:12px;line-height:1.6;color:var(--muted)">
+      <div class="bt-spinner"></div>
+    </div>
+  </div>
+</div>
+
 <!-- Backtest modal -->
 <div id="bt-panel" onclick="if(event.target===this)closeBt()">
   <div id="bt-box">
@@ -348,6 +390,14 @@ let _latestOverview = {};
 let _dismissedAlerts = new Set();
 let _initialized = false;
 let _backendUnavailable = false;
+let _modelParams = {};   // strategy model (trailing_stop_pct etc.) — loaded once
+
+async function loadModelParams() {
+  try {
+    const d = await apiJson('/api/lab/model');
+    _modelParams = d.model || {};
+  } catch (e) { /* stop column degrades gracefully */ }
+}
 
 // ─── FORMATTERS ────────────────────────────────────────────────────────────
 const fmt$ = (n, d=0) => n==null||isNaN(n) ? '—' : '$'+Math.abs(+n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
@@ -437,9 +487,19 @@ function renderPositions(data) {
     : `next rebalance ${rDate||'—'}`;
 
   if (!allPositions.length) {
-    $('pos-body').innerHTML = '<tr><td colspan="7" style="color:var(--muted);padding:14px 16px">No open positions. System is in cash.</td></tr>';
+    $('pos-body').innerHTML = '<tr><td colspan="8" style="color:var(--muted);padding:14px 16px">No open positions. System is in cash.</td></tr>';
     return;
   }
+
+  // Distance to the hard loss stop: stop fires at pnl% <= -trailing_stop_pct.
+  const stopPct = +( _modelParams.trailing_stop_pct || 2.0 );
+  const stopCell = (pnlPct) => {
+    if (pnlPct==null || isNaN(pnlPct)) return '<td class="hide-sm mono" style="color:var(--dim)">—</td>';
+    const dist = pnlPct + stopPct;             // % of adverse move left before stop
+    const cls  = dist <= 0.5 ? 'pos-red' : dist <= 1.0 ? '' : '';
+    const col  = dist <= 0.5 ? 'var(--red)' : dist <= 1.0 ? 'var(--amber)' : 'var(--muted)';
+    return `<td class="hide-sm mono ${cls}" style="color:${col}" title="hard stop at −${stopPct.toFixed(1)}%">${dist.toFixed(1)}%</td>`;
+  };
 
   const rows = [];
 
@@ -461,6 +521,7 @@ function renderPositions(data) {
       <td class="mono">${fmt$(val)}</td>
       <td class="mono">${wt.toFixed(1)}%</td>
       <td class="mono ${pnl>=0?'pos-green':'pos-red'}">${fmtPnl(pnl)} <span style="font-size:10px;opacity:.7">${fmtPct(pnlPct,2)}</span></td>
+      ${stopCell(pnlPct)}
       <td>${legacy ? '<span class="tag warn">Legacy</span>' : '<span class="tag good">Stock</span>'}</td>
       <td style="font-size:11px;color:var(--muted)">${esc(note)}</td>
     </tr>`);
@@ -496,12 +557,34 @@ function renderPositions(data) {
       <td class="mono">${fmt$(val)}</td>
       <td class="mono">${wt>0?wt.toFixed(1)+'%':'—'}</td>
       <td class="mono ${pnl>=0?'pos-green':'pos-red'}">${fmtPnl(pnl)} <span style="font-size:10px;opacity:.7">${fmtPct(pnlPct,2)}</span></td>
+      <td class="hide-sm mono" style="color:var(--dim)">—</td>
       <td>${legacy ? '<span class="tag warn">Legacy</span>' : typeTag}</td>
       <td style="font-size:11px;color:var(--muted)">${esc(note)}</td>
     </tr>`);
   }
 
   $('pos-body').innerHTML = rows.join('');
+}
+
+// ─── SIGNALS STRIP ─────────────────────────────────────────────────────────
+function renderSignals(data) {
+  const strip = $('sig-strip');
+  if (!strip) return;
+  const ls = data.live_scores || {};
+  const signals = (ls.signals || []).slice(0, 8);
+  const held = new Set(((data.accounting||{}).positions||[]).map(p => String(p.symbol||'').toUpperCase()));
+  if (!signals.length) {
+    strip.innerHTML = '<span class="sig-lbl">Signals</span><span style="color:var(--dim);font-size:11px">no scored candidates yet</span>';
+    return;
+  }
+  const minConv = +(_modelParams.min_conviction || 78);
+  const chips = signals.map(s => {
+    const sym = esc(String(s.symbol||'').toUpperCase());
+    const sc  = Math.round(+s.score || 0);
+    const cls = sc >= minConv ? 'hi' : sc >= minConv - 10 ? 'mid' : 'lo';
+    return `<span class="sig-chip ${held.has(sym)?'held':''}" onclick="showStockDetail('${sym}')" title="${held.has(sym)?'currently held · ':''}entry threshold ${minConv}">${sym} <span class="sc ${cls}">${sc}</span></span>`;
+  }).join('');
+  strip.innerHTML = `<span class="sig-lbl">Signals</span>${chips}<span style="color:var(--dim);font-size:10px;flex-shrink:0;margin-left:auto">entry ≥ ${minConv}</span>`;
 }
 
 // ─── ALERT BANNER ──────────────────────────────────────────────────────────
@@ -710,6 +793,7 @@ async function poll() {
     renderConsoleReady();
     renderTopbar(data);
     renderPositions(data);
+    renderSignals(data);
     renderConsole(data);
     renderAlerts((data.alerts||[]));
     renderPerfBar(data);
@@ -927,6 +1011,91 @@ function showStockDetail(sym) {
 function openBacktestPanel() { $('bt-panel').classList.add('open'); }
 function closeBt() { $('bt-panel').classList.remove('open'); }
 
+// ─── STATS / PERFORMANCE PANEL ─────────────────────────────────────────────
+function closeStatsPanel() { $('stats-panel').style.display = 'none'; }
+
+async function openStatsPanel() {
+  const panel = $('stats-panel');
+  const box = $('stats-content');
+  panel.style.display = 'flex';
+  box.innerHTML = '<div class="bt-spinner"></div>';
+  try {
+    const d = await apiJson('/api/lab/ledger?limit=500');
+    renderStats(box, d);
+  } catch (e) {
+    box.innerHTML = `<div style="color:var(--red)">Could not load ledger: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderStats(box, d) {
+  const s = d.summary || {};
+  const exp = d.experiment || {};
+  const trades = (d.trades || []).filter(t => t.side === 'sell' && t.pnl != null);
+
+  const avgWin = +(s.avg_win || 0), avgLoss = Math.abs(+(s.avg_loss || 0));
+  const rrOk = avgLoss === 0 || avgWin >= avgLoss;
+  const expectancy = +(s.expectancy || 0);
+
+  const card = (lbl, val, sub='', color='') =>
+    `<div class="stat-card"><div class="sc-lbl">${lbl}</div><div class="sc-val" ${color?`style="color:${color}"`:''}>${val}</div>${sub?`<div class="sc-sub">${sub}</div>`:''}</div>`;
+
+  let html = '<div id="stats-cards">'
+    + card('Closed trades', s.trades ?? 0, `${exp.paper_days ?? 0} paper days`)
+    + card('Win rate', s.trades ? (s.win_rate_pct ?? 0)+'%' : '—', `${s.wins ?? 0}W / ${s.losses ?? 0}L`)
+    + card('Avg win', fmtPnl(avgWin), '', 'var(--green)')
+    + card('Avg loss', fmtPnl(-avgLoss), rrOk ? '' : 'losses outrun wins', rrOk ? 'var(--red)' : 'var(--red)')
+    + card('Expectancy / trade', fmtPnl(expectancy), expectancy > 0 ? 'positive edge' : 'no edge yet', expectancy > 0 ? 'var(--green)' : 'var(--red)')
+    + card('Realized P&L', fmtPnl(s.total_pnl ?? 0), '', (+(s.total_pnl||0) >= 0) ? 'var(--green)' : 'var(--red)')
+    + '</div>';
+
+  if (!rrOk && s.trades) {
+    html += `<div style="border:1px solid rgba(192,57,43,.3);background:rgba(192,57,43,.08);border-radius:6px;padding:8px 12px;margin-bottom:16px;color:var(--red);font-size:11px">
+      Risk/reward is inverted: average loss ${fmtPnl(-avgLoss)} exceeds average win ${fmtPnl(avgWin)}. No signal quality can outrun this — fix exits before sizing up.</div>`;
+  }
+
+  // ── Exit-reason breakdown (client-side aggregate of sell rows) ──
+  const byReason = {};
+  for (const t of trades) {
+    const r = String(t.exit_reason || t.intent || 'unknown');
+    const b = byReason[r] ??= {n:0, wins:0, pnl:0};
+    b.n++; if (+t.pnl > 0) b.wins++; b.pnl += +t.pnl;
+  }
+  const reasons = Object.entries(byReason).sort((a,b) => a[1].pnl - b[1].pnl);
+  if (reasons.length) {
+    const maxAbs = Math.max(...reasons.map(([,b]) => Math.abs(b.pnl))) || 1;
+    html += '<div class="stats-sec-title">Exit gates — where money leaks</div><table class="stats-tbl"><tr><th>Exit reason</th><th>Trades</th><th>Win%</th><th>Total P&L</th><th>Avg</th></tr>';
+    for (const [r, b] of reasons) {
+      const w = Math.round(Math.abs(b.pnl)/maxAbs*100);
+      const col = b.pnl >= 0 ? 'var(--green)' : 'var(--red)';
+      html += `<tr><td>${esc(r.replace(/_/g,' '))}</td><td>${b.n}</td><td>${Math.round(b.wins/b.n*100)}%</td>
+        <td><span class="bar-wrap"><span class="bar-fill" style="width:${w}%;background:${col}"></span></span><span style="color:${col}">${fmtPnl(b.pnl)}</span></td>
+        <td style="color:${col}">${fmtPnl(b.pnl/b.n)}</td></tr>`;
+    }
+    html += '</table>';
+  }
+
+  // ── Per-symbol realized P&L ──
+  const bySym = {};
+  for (const t of trades) {
+    const b = bySym[t.symbol] ??= {n:0, wins:0, pnl:0};
+    b.n++; if (+t.pnl > 0) b.wins++; b.pnl += +t.pnl;
+  }
+  const syms = Object.entries(bySym).sort((a,b) => b[1].pnl - a[1].pnl);
+  if (syms.length) {
+    html += '<div class="stats-sec-title">Per-symbol attribution</div><table class="stats-tbl"><tr><th>Symbol</th><th>Trades</th><th>Win%</th><th>Net P&L</th></tr>';
+    for (const [sym, b] of syms.slice(0, 15)) {
+      const col = b.pnl >= 0 ? 'var(--green)' : 'var(--red)';
+      html += `<tr><td>${esc(sym)}</td><td>${b.n}</td><td>${Math.round(b.wins/b.n*100)}%</td><td style="color:${col}">${fmtPnl(b.pnl)}</td></tr>`;
+    }
+    html += '</table>';
+  }
+
+  if (!trades.length) {
+    html += '<div style="color:var(--muted)">No closed trades in the ledger yet. Stats fill in as the engine trades.</div>';
+  }
+  box.innerHTML = html;
+}
+
 async function runBacktest() {
   $('bt-result').innerHTML = '<div class="bt-spinner"></div>';
   try {
@@ -938,6 +1107,7 @@ async function runBacktest() {
 
 // ─── POLL LOOP ─────────────────────────────────────────────────────────────
 restoreFeed();
+loadModelParams();   // trailing-stop / min-conviction for Stop column + signals strip
 poll();
 setInterval(poll, 20000);
 </script>
