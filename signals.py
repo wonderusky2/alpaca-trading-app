@@ -261,11 +261,13 @@ def enrich_quotes_with_indicators(
 
     bars_by_sym: dict[str, list[dict]] = {}   # sym → list of OHLCV row dicts
 
-    # ── 1. Alpaca bars — only useful on SIP feed; IEX returns ~1 symbol/batch ─
-    # Skip Alpaca bar fetching on IEX (free tier) and go straight to yfinance.
-    # Alpaca snapshots (price, change_pct, vwap, daily_open) still come from Alpaca.
-    _data_feed = str(getattr(config, "ALPACA_DATA_FEED", "iex") or "iex").lower()
-    if alpaca_client is not None and _data_feed != "iex":
+    # ── 1. Alpaca bars — primary source on ALL feeds, including free IEX. ─────
+    # The old "IEX returns ~1 symbol/batch" belief was a misdiagnosis: Alpaca's
+    # `limit` parameter is a TOTAL across symbols, so passing it starved every
+    # symbol after the first alphabetically. With that fixed in
+    # get_historical_bars, IEX returns full multi-symbol bars for free —
+    # yfinance below is a fallback only.
+    if alpaca_client is not None:
         import zoneinfo as _tz
         _et = _tz.ZoneInfo("America/New_York")
         now_et = __import__("datetime").datetime.now(_et)

@@ -690,8 +690,12 @@ class AlpacaClient:
         for i in range(0, len(clean), 50):
             batch = clean[i:i + 50]
             try:
-                # IEX free feed ignores `limit` without an explicit start date.
-                # Compute start from timeframe + limit so historical data is returned.
+                # IMPORTANT: Alpaca's `limit` is the TOTAL bar count across all
+                # symbols in the request, consumed alphabetically — passing it
+                # for a multi-symbol batch starves every symbol after the first
+                # (this was misdiagnosed for months as "IEX returns ~1 symbol
+                # per batch"). Omit limit, bound the window via `start`, let
+                # alpaca-py auto-paginate, and trim per symbol client-side.
                 import datetime as _dt
                 _mins_per_bar = {
                     "1min": 1, "5min": 5, "15min": 15, "1hour": 60, "1day": 390
@@ -703,7 +707,6 @@ class AlpacaClient:
                     symbol_or_symbols=batch,
                     timeframe=tf,
                     start=_bar_start,
-                    limit=limit,
                     feed=feed,
                     adjustment="raw",
                 )
@@ -714,7 +717,7 @@ class AlpacaClient:
                     if not bars:
                         continue
                     rows = []
-                    for b in bars:
+                    for b in bars[-limit:]:   # per-symbol trim (limit is per symbol here)
                         ts = getattr(b, "timestamp", None)
                         rows.append({
                             "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else ts,
