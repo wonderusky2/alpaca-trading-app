@@ -451,10 +451,29 @@ def chk_iex_fix():
     # without limit, free IEX serves full multi-symbol bars. The invariants
     # now are (1) no per-request limit in get_historical_bars, and (2) the
     # IEX skip is gone so Alpaca bars are the primary indicator source.
-    bad = _grep_file(APP_DIR / "alpaca_client.py", r"limit=limit,\s*$")
-    assert not bad, (
-        "get_historical_bars passes limit= to StockBarsRequest — Alpaca treats "
-        "it as TOTAL across symbols and starves all but the first symbol"
+    src = _file_text("alpaca_client.py")
+    offenders = []
+    idx = 0
+    while True:
+        idx = src.find("StockBarsRequest(", idx)
+        if idx < 0:
+            break
+        depth, j = 0, idx + len("StockBarsRequest")
+        while j < len(src):
+            if src[j] == "(":
+                depth += 1
+            elif src[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        block = src[idx:j]
+        if "limit=" in block:
+            offenders.append(block[:80].replace("\n", " "))
+        idx = j
+    assert not offenders, (
+        "StockBarsRequest passes limit= — Alpaca treats it as TOTAL across "
+        f"symbols and starves all but the first symbol: {offenders}"
     )
     skip = _grep_file(APP_DIR / "signals.py", r"_data_feed\s*!=\s*.iex.")
     assert not skip, "stale IEX skip returned to signals.py — Alpaca bars must be primary"
