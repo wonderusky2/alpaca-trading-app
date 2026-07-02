@@ -118,6 +118,57 @@ def write_report(report: dict) -> None:
     temporary.replace(REPORT_PATH)
 
 
+def _learning_digest() -> str:
+    """Plain-English summary of what the learning agent did in the last 24h.
+
+    Deterministic local string building — no LLM involved.
+    """
+    try:
+        import learning_agent
+    except Exception:
+        return ""
+
+    lines: list[str] = []
+    cutoff = datetime.now(timezone.utc).timestamp() - 24 * 3600
+    kind_text = {
+        "variant":   lambda d: f"switched signal variant {d.get('from')} → {d.get('to')}",
+        "params":    lambda d: "adjusted params: " + ", ".join(
+            f"{k} {v.get('from')}→{v.get('to')}" for k, v in (d.get("diff") or {}).items()) ,
+        "blocklist": lambda d: "blocked " + ", ".join(
+            f"{c.get('symbol')} ({c.get('trades')}t, ${c.get('total_pnl'):+,.0f})"
+            for c in (d.get("added") or [])),
+        "rollback":  lambda d: (f"ROLLED BACK last change (expectancy "
+                                f"${d.get('expectancy_before', 0):+.0f}→${d.get('expectancy_after', 0):+.0f}/trade)"),
+        "confirmed": lambda d: (f"confirmed last change (expectancy "
+                                f"${d.get('expectancy_before', 0):+.0f}→${d.get('expectancy_after', 0):+.0f}/trade)"),
+    }
+    try:
+        for entry in learning_agent.journal_entries(limit=20):
+            try:
+                at = datetime.fromisoformat(str(entry.get("at"))).timestamp()
+            except Exception:
+                continue
+            if at < cutoff:
+                continue
+            fn = kind_text.get(str(entry.get("kind")))
+            if fn:
+                try:
+                    lines.append("• " + fn(entry.get("detail") or {}))
+                except Exception:
+                    lines.append(f"• {entry.get('kind')}")
+        blocked = learning_agent.learned_blocked_symbols()
+        if blocked:
+            lines.append("Blocked: " + ", ".join(sorted(blocked.keys())))
+        if learning_agent.CHECKPOINT_PATH.exists():
+            lines.append("A recent change is still under evaluation (auto-rollback armed).")
+    except Exception:
+        return ""
+
+    if not lines:
+        return "Learning: no changes today (needs evidence or inside the weekly change window)."
+    return "Learning:\n" + "\n".join(lines)
+
+
 def main() -> None:
     client = AlpacaClient()
     reconciliation = trade_ledger.reconcile_broker_orders(client.get_recent_orders(limit=500))
@@ -128,13 +179,30 @@ def main() -> None:
     write_report(report)
     summary = report["summary"]
     print(json.dumps(report, sort_keys=True), flush=True)
+
+    equity = float(account.get("equity") or 0)
+    last_eq = float(account.get("adjusted_last_equity") or account.get("last_equity") or equity)
+    daily = equity - last_eq
+    daily_pct = (daily / last_eq * 100) if last_eq else 0.0
+
+    # Worst exit gate today (where the money leaked)
+    by_exit = report.get("by_exit_reason") or {}
+    worst_gate = min(by_exit.items(), key=lambda kv: kv[1]["pnl"], default=None)
+    worst_line = ""
+    if worst_gate and worst_gate[1]["pnl"] < 0:
+        worst_line = f"Worst gate: {worst_gate[0]} (${worst_gate[1]['pnl']:+,.0f} over {worst_gate[1]['trades']}t)\n"
+
+    learning = _learning_digest()
     notify.send(
         "Alpha experiment close\n"
         f"Status: {report['status']}\n"
+        f"Day: ${daily:+,.2f} ({daily_pct:+.2f}%) · Equity: ${equity:,.0f}\n"
         f"Closed: {summary.get('trades', 0)}/{report['minimum_closed_trades']} · "
         f"P&L: ${float(summary.get('total_pnl') or 0):+,.2f} · "
         f"Expectancy: ${float(summary.get('expectancy') or 0):+,.2f}\n"
-        f"Open positions: {len(report['open_positions'])}"
+        f"{worst_line}"
+        f"Open positions: {len(report['open_positions'])}\n"
+        + (learning if learning else "")
     )
 
 

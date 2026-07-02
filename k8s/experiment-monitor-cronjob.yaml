@@ -6,7 +6,10 @@ metadata:
   labels:
     app: alpaca-experiment-monitor
 spec:
-  schedule: "15 16 * * 1-5"
+  # 17:15 ET — after the close AND after the learning agent's first post-close
+  # cycle (hourly rate limit means it can run as late as ~17:00), so the daily
+  # digest includes what was learned/adjusted today.
+  schedule: "15 17 * * 1-5"
   timeZone: "America/New_York"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 5
