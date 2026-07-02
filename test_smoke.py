@@ -17,7 +17,7 @@ errors = []
 
 # ── 1. All modules import cleanly ─────────────────────────────────────────────
 modules = {}
-for mod in ["config", "logger", "notify", "signals", "strategy_model", "backtest"]:
+for mod in ["config", "logger", "notify", "signals", "strategy_model", "backtest", "learning_agent"]:
     try:
         modules[mod] = __import__(mod)
         print(f"  ✓ import {mod}")
@@ -141,6 +141,27 @@ if trader and hasattr(trader, "_entry_limit_block_status"):
         print("  ✓ same-day symbol entry cap blocks churn")
     finally:
         trader.trade_ledger.recent_trades = real_recent_trades
+
+# ── Learning agent guardrails ─────────────────────────────────────────────────
+la = modules.get("learning_agent")
+if la:
+    for attr in ["maybe_learn", "check_rollback", "is_symbol_blocked",
+                 "update_symbol_blocklist", "journal_entries", "learned_blocked_symbols"]:
+        if not hasattr(la, attr):
+            errors.append(f"learning_agent.{attr} — MISSING")
+            print(f"  ✗ learning_agent.{attr} missing")
+        else:
+            print(f"  ✓ learning_agent.{attr}")
+    assert la.is_symbol_blocked("NVDA") in (True, False)
+    assert isinstance(la.journal_entries(), list)
+    # With zero ledger evidence, the learning cycle must take no destructive action
+    real_recent = la.trade_ledger.recent_trades
+    try:
+        la.trade_ledger.recent_trades = lambda limit=500: []
+        assert la.update_symbol_blocklist() == [], "blocklist must not fire without evidence"
+        print("  ✓ learning agent takes no action without evidence")
+    finally:
+        la.trade_ledger.recent_trades = real_recent
 
 sm = modules.get("strategy_model")
 if sm:

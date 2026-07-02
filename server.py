@@ -3545,6 +3545,31 @@ def api_lab_model():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/lab/learning")
+@require_api_key
+def api_lab_learning():
+    """Self-learning audit trail: journal, learned blocklist, pending checkpoint."""
+    try:
+        import learning_agent
+        import json as _json
+        checkpoint = None
+        try:
+            if learning_agent.CHECKPOINT_PATH.exists():
+                checkpoint = _json.loads(learning_agent.CHECKPOINT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            checkpoint = None
+        return jsonify({
+            "ok": True,
+            "enabled": bool(getattr(config, "AUTO_LEARNING_ENABLED", False)),
+            "journal": learning_agent.journal_entries(limit=50),
+            "blocklist": learning_agent.learned_blocked_symbols(),
+            "pending_checkpoint": checkpoint,
+        })
+    except Exception as e:
+        log.error("learning status error: %s", e, exc_info=True)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/lab/backtest", methods=["POST"])
 @require_api_key
 def api_lab_backtest():

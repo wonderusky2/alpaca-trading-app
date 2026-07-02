@@ -30,6 +30,7 @@ COPY alpaca_client.py \
      backtest.py \
      config.py \
      experiment_monitor.py \
+     learning_agent.py \
      logger.py \
      notify.py \
      portfolio.py \

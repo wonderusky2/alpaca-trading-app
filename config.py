@@ -164,6 +164,17 @@ ALPHA_EXPERIMENT_ID: str = "alpha_v5_atr_risk"
 PROMOTION_MIN_PAPER_DAYS: int = 30
 PROMOTION_MIN_CLOSED_TRADES: int = 100
 
+# ── Self-learning loop (learning_agent.py) ────────────────────────────────────
+# Bounded auto-improvement: variant adoption, evidence-driven param nudges, and
+# a learned symbol blocklist — all journaled, all clamped by BOUNDS, all covered
+# by auto-rollback if live expectancy degrades after a change.
+AUTO_LEARNING_ENABLED: bool = True
+LEARNING_MIN_TRADES_FOR_NUDGE: int = 20    # live closed trades required before param nudges
+LEARNING_MIN_DAYS_BETWEEN_CHANGES: int = 7 # max one variant/param change per week
+LEARNING_ROLLBACK_MIN_TRADES: int = 10     # trades to evaluate a change before confirm/rollback
+LEARNING_BLOCK_MIN_TRADES: int = 5         # evidence needed to block a losing symbol
+LEARNING_BLOCK_DAYS: int = 30              # blocked symbols get a cooling-off period
+
 # ── Rebalancing ───────────────────────────────────────────────────────────────
 REBALANCE_DAYS: int = 1              # next rebalance window
 

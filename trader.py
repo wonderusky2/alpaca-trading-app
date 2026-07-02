@@ -14,6 +14,7 @@ import re
 
 import backtest as bt
 import config
+import learning_agent
 import signals as sg
 import notify
 import strategy_model
@@ -1308,6 +1309,18 @@ def main() -> None:
     # ── Daily variant optimization (once per day) ──────────────────────────
     _run_daily_optimization()
 
+    # ── Self-learning cycle (guardrailed, journaled, auto-rollback) ────────
+    try:
+        rollback = learning_agent.check_rollback()
+        if rollback:
+            model = _active_model()   # model changed — reload
+        learned = learning_agent.maybe_learn()
+        if learned.get("actions"):
+            log.info("Learning actions: %s", learned["actions"])
+            model = _active_model()   # pick up any applied changes this tick
+    except Exception as e:
+        log.warning("Learning cycle failed (non-fatal): %s", e)
+
     # Fetch quotes for full universe from Alpaca snapshots.
     quote_symbols = sorted(set(sg.ALL_SYMBOLS) | CORE_SYMBOLS)
     quotes = fetch_quotes(quote_symbols, client=client)
@@ -1422,12 +1435,19 @@ def main() -> None:
         log.info("BEAR regime alpha reset: stay in cash, no fresh longs.")
         return
 
+    # Active variant from the model actually drives signal weights now.
+    # Previously the optimizer could "win" a variant that live trading never
+    # used because get_signals() was always called with the default profile.
+    profile_name = str(model.get("active_variant") or "current")
+    if profile_name not in sg.VARIANT_PROFILES:
+        profile_name = "current"
+
     if regime == "CHOPPY" and not bool(getattr(config, "ALPHA_DISABLE_REVERSION", False)):
         trade_signals = sg.get_signals_reversion(quotes, min_conviction=min_conviction)
         log.info("CHOPPY → reversion strategy: %s", [(s.symbol, s.score) for s in trade_signals])
     else:
-        trade_signals = sg.get_signals(quotes, min_conviction=min_conviction, bear_etf_min_conviction=bear_etf_min_conviction)
-        log.info("Signals: %s", [(s.symbol, s.score) for s in trade_signals])
+        trade_signals = sg.get_signals(quotes, profile_name=profile_name, min_conviction=min_conviction, bear_etf_min_conviction=bear_etf_min_conviction)
+        log.info("Signals (variant=%s): %s", profile_name, [(s.symbol, s.score) for s in trade_signals])
 
     rotated_out = _rotate_stale_positions(client, positions, quotes, model, regime, trade_signals)
     if rotated_out:
@@ -1548,6 +1568,9 @@ def main() -> None:
             log.info("Max positions (%d) reached.", max_positions); break
         if sig.symbol in positions:
             continue  # already holding
+        if learning_agent.is_symbol_blocked(sig.symbol):
+            log.info("Learned blocklist: skipping %s (persistent negative expectancy).", sig.symbol)
+            continue
         blocked, cooldown_reason = _reentry_block_status(sig.symbol)
         if blocked:
             log.info("Re-entry blocked for %s: %s", sig.symbol, cooldown_reason)

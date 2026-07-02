@@ -83,7 +83,14 @@ if $APPLY; then
       --dry-run=client -o yaml | kubectl apply -f -
     echo "✓ Secret seeded."
   else
-    echo "⚠ Conjur dir not found — secret NOT updated. Run manually if keys changed."
+    echo "⚠ Conjur dir not found — secret NOT updated."
+    # Fail loudly if the cluster has no usable secret at all; otherwise the pod
+    # comes up with empty Alpaca keys and QA "passes" against a broker-less server.
+    if ! kubectl get secret alpaca-trader-secrets -n alpaca-trader >/dev/null 2>&1; then
+      echo "✗ Cluster secret 'alpaca-trader-secrets' missing and Conjur unavailable to seed it — aborting."
+      exit 1
+    fi
+    echo "  Existing cluster secret found — continuing with current keys. Re-seed manually if keys changed."
   fi
 
   # Wait for the server deployment to roll out
