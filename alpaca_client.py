@@ -550,6 +550,36 @@ class AlpacaClient:
             log.debug(f"{symbol}: latest trade lookup failed — {e}")
             return None
 
+    def get_market_movers(self, top: int = 25) -> list[dict]:
+        """Top % gainers today from Alpaca's screener endpoint.
+
+        Returns [{symbol, price, percent_change}] sorted by move size.
+        Fails open (empty list) — the trading loop must never depend on it.
+        """
+        try:
+            from alpaca.data.historical.screener import ScreenerClient
+            from alpaca.data.requests import MarketMoversRequest
+        except Exception as e:
+            log.debug("Screener API unavailable in this alpaca-py version: %s", e)
+            return []
+        try:
+            sc = ScreenerClient(config.ALPACA_API_KEY, config.ALPACA_API_SECRET)
+            resp = sc.get_market_movers(MarketMoversRequest(top=max(1, min(int(top), 50))))
+            out = []
+            for m in (getattr(resp, "gainers", None) or []):
+                sym = str(getattr(m, "symbol", "") or "").upper()
+                if not sym:
+                    continue
+                out.append({
+                    "symbol": sym,
+                    "price": float(getattr(m, "price", 0) or 0),
+                    "percent_change": float(getattr(m, "percent_change", 0) or 0),
+                })
+            return out
+        except Exception as e:
+            log.warning("get_market_movers failed: %s", e)
+            return []
+
     def get_snapshots(self, symbols: list[str]) -> dict[str, dict]:
         """Return {sym: {price, prev_close, change_pct, vwap}} for a symbol basket.
 

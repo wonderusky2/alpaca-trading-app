@@ -781,7 +781,15 @@ def _allowed_alpha_symbols() -> set[str]:
         for sym in getattr(config, "ALPHA_ALLOWED_SYMBOLS", ())
         if str(sym).strip()
     }
-    return allowed or set(sg.MOMENTUM_STOCKS)
+    allowed = allowed or set(sg.MOMENTUM_STOCKS)
+    # The dynamic momentum sleeve is part of the approved universe while its
+    # names are live (5-day retention), so the disallowed-inventory unwinder
+    # doesn't force-sell a position the day it drops off the movers list.
+    try:
+        allowed |= {str(s).upper() for s in sg.dynamic_universe_symbols()}
+    except Exception:
+        pass
+    return allowed
 
 
 def _blocked_alpha_symbols() -> set[str]:
@@ -1322,7 +1330,15 @@ def main() -> None:
         log.warning("Learning cycle failed (non-fatal): %s", e)
 
     # Fetch quotes for full universe from Alpaca snapshots.
-    quote_symbols = sorted(set(sg.ALL_SYMBOLS) | CORE_SYMBOLS)
+    # Refresh the dynamic momentum sleeve (daily, from Alpaca market movers)
+    # and make sure its names get quotes + indicators like everything else.
+    try:
+        dynamic_syms = set(sg.refresh_dynamic_universe(client))
+    except Exception as e:
+        log.warning("Dynamic universe refresh failed (non-fatal): %s", e)
+        dynamic_syms = set()
+
+    quote_symbols = sorted(set(sg.ALL_SYMBOLS) | CORE_SYMBOLS | dynamic_syms)
     quotes = fetch_quotes(quote_symbols, client=client)
     if not quotes:
         log.error("No quotes fetched — aborting."); return

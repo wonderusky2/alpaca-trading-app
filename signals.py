@@ -1385,44 +1385,112 @@ def scan_premarket_gaps(
         return []
 
 # ── Dynamic universe ───────────────────────────────────────────────────────────
-_dyn_universe_cache: tuple[list[str], float] | None = None
-_DYN_UNIVERSE_TTL = 4 * 3600  # refresh every 4 hours
+# The universe is the static allowed list PLUS a real dynamic sleeve refreshed
+# daily from Alpaca's market-movers screener. Names are retained for a few
+# trading days after they last appeared so a held position is not force-unwound
+# the day it drops off the movers list.
+from pathlib import Path as _Path
+_DYNAMIC_UNIVERSE_PATH = _Path(
+    os.environ.get("STATE_DIR") or (_Path.home() / ".robinhood-trader" / "state")
+) / "dynamic_universe.json"
+DYNAMIC_UNIVERSE_MAX = 8       # max dynamic names alongside the static list
+DYNAMIC_MIN_PRICE = 10.0       # no penny/low-priced movers
+DYNAMIC_RETENTION_DAYS = 5     # keep a name this long after it last appeared
 
 
-def scan_dynamic_universe(
-    alpaca_client=None,
-    max_add: int = 10,
-) -> list[str]:
+def _read_dynamic_state() -> dict:
+    try:
+        if _DYNAMIC_UNIVERSE_PATH.exists():
+            import json as _json
+            data = _json.loads(_DYNAMIC_UNIVERSE_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def dynamic_universe_symbols() -> list[str]:
+    """Non-expired dynamic momentum names, best (most recent) first."""
+    state = _read_dynamic_state()
+    entries = state.get("symbols") or {}
+    today = datetime.now(timezone.utc).date()
+    live: list[tuple[str, str]] = []
+    for sym, last_seen in entries.items():
+        try:
+            age = (today - datetime.fromisoformat(str(last_seen)[:10]).date()).days
+        except Exception:
+            continue
+        if age <= DYNAMIC_RETENTION_DAYS:
+            live.append((str(sym).upper(), str(last_seen)))
+    live.sort(key=lambda kv: kv[1], reverse=True)
+    return [sym for sym, _ in live[:DYNAMIC_UNIVERSE_MAX]]
+
+
+def refresh_dynamic_universe(alpaca_client=None) -> list[str]:
+    """Refresh the dynamic sleeve from Alpaca market movers (once per day).
+
+    Filters: price ≥ $10, plain equity ticker, not already in the static
+    universe, not on the config blocklist, not on the learned blocklist.
+    Fails open — on any error the existing state is kept.
     """
-    Expand the trading universe beyond the fixed MOMENTUM_STOCKS list by scanning
-    Alpaca snapshots for high-momentum movers.
+    import json as _json
+    state = _read_dynamic_state()
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state.get("refreshed") == today:
+        return dynamic_universe_symbols()
 
-    Criteria (all must pass):
-      - Volume ratio ≥ 1.5× 30-day average  (unusual activity)
-      - Price > $5 (avoid penny stocks)
-      - Not already in ALL_SYMBOLS (no duplicates)
-      - Not an ETF (avoid leveraged ETF double-counting)
+    try:
+        if alpaca_client is None:
+            from alpaca_client import AlpacaClient
+            alpaca_client = AlpacaClient()
+        movers = alpaca_client.get_market_movers(top=25)
+    except Exception as e:
+        log.warning("Dynamic universe refresh failed: %s", e)
+        return dynamic_universe_symbols()
 
-    Returns extended list: BULL_UNIVERSE + up to `max_add` dynamic names.
-    Caches result for 4 hours.
-    """
-    import time as _time
+    try:
+        import learning_agent as _la
+        learned_blocked = set(_la.learned_blocked_symbols().keys())
+    except Exception:
+        learned_blocked = set()
 
-    global _dyn_universe_cache
-    now = _time.time()
-    if _dyn_universe_cache is not None:
-        cached_list, expiry = _dyn_universe_cache
-        if now < expiry:
-            return cached_list
+    entries = dict(state.get("symbols") or {})
+    static = {s.upper() for s in ALL_SYMBOLS}
+    added = []
+    for m in movers:
+        sym = str(m.get("symbol") or "").upper()
+        price = float(m.get("price") or 0)
+        if (not sym or not sym.isalpha() or len(sym) > 5
+                or sym in static or sym in _BLOCKED_SYMBOLS or sym in learned_blocked
+                or price < DYNAMIC_MIN_PRICE):
+            continue
+        if sym not in entries:
+            added.append(sym)
+        entries[sym] = today
 
-    # NOTE: the previous implementation could never add a symbol — it only
-    # fetched snapshots for ALL_SYMBOLS and then excluded everything already
-    # in ALL_SYMBOLS, and it parsed a snapshot shape get_snapshots() does not
-    # return. Even if it had worked, additions outside ALPHA_ALLOWED_SYMBOLS
-    # would be bought and then force-liquidated by the alpha-universe guard on
-    # the next tick (pure churn). Until there is a real market-movers data
-    # source AND the allowed-universe policy permits dynamic names, the
-    # universe is the static allowed list.
-    result = list(BULL_UNIVERSE)
-    _dyn_universe_cache = (result, now + _DYN_UNIVERSE_TTL)
-    return result
+    # Drop expired names
+    today_d = datetime.now(timezone.utc).date()
+    entries = {
+        s: d for s, d in entries.items()
+        if (today_d - datetime.fromisoformat(str(d)[:10]).date()).days <= DYNAMIC_RETENTION_DAYS
+    }
+
+    try:
+        _DYNAMIC_UNIVERSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _DYNAMIC_UNIVERSE_PATH.write_text(
+            _json.dumps({"refreshed": today, "symbols": entries}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log.warning("Could not persist dynamic universe: %s", e)
+
+    live = dynamic_universe_symbols()
+    if added:
+        log.info("Dynamic universe: added %s (live sleeve: %s)", added, live)
+    return live
+
+
+def scan_dynamic_universe(alpaca_client=None, max_add: int = 10) -> list[str]:
+    """Scored universe = static momentum list + live dynamic sleeve."""
+    dynamic = [s for s in dynamic_universe_symbols() if s not in BULL_UNIVERSE]
+    return list(BULL_UNIVERSE) + dynamic[:max_add]
