@@ -41,10 +41,12 @@ COPY alpaca_client.py \
      trade_ledger.py \
      trader.py \
      test_smoke.py \
+     test_exit_stack.py \
      ./
 
-# ── Smoke test — fails the build if any import or attribute check blows up ────
-RUN python test_smoke.py
+# ── Build gates — imports/attrs smoke + exit-stack behavior tests ─────────────
+# A broken exit stack must never ship: these fail the image build.
+RUN python test_smoke.py && python test_exit_stack.py
 
 # State directory (override with STATE_DIR env var; mount a PVC here)
 RUN mkdir -p /data/state

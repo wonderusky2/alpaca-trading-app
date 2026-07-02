@@ -117,7 +117,14 @@ if [[ -f "${SCRIPT_DIR}/qa_agent.py" ]] && ( $APPLY || $RESTART ); then
   # kubectl rollout status goes green as soon as the container starts,
   # but Flask takes a few more seconds to bind its port.
   echo "→ Waiting for Flask to be ready..."
-  SERVER_URL="http://34.60.235.98:5001/api/lab/health"
+  # Derive the live LB IP instead of hardcoding it — survives IP changes.
+  SERVER_IP=$(kubectl get svc alpaca-server -n alpaca-trader \
+    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+  if [[ -z "${SERVER_IP}" ]]; then
+    echo "✗ Could not resolve alpaca-server LoadBalancer IP — skipping QA."
+    exit 1
+  fi
+  SERVER_URL="http://${SERVER_IP}:5001/api/lab/health"
   READY=false
   for i in $(seq 1 24); do            # up to 2 minutes (24 × 5s)
     if curl -sf --max-time 4 "${SERVER_URL}" > /dev/null 2>&1; then
@@ -137,7 +144,7 @@ if [[ -f "${SCRIPT_DIR}/qa_agent.py" ]] && ( $APPLY || $RESTART ); then
   echo "→ Running post-deploy QA suite..."
   # QA_SERVER_URL points qa_agent at the live pod — default is localhost which doesn't work in CI.
   # --fix is intentionally omitted: post-deploy QA must never mutate live pod state.
-  if QA_SERVER_URL="http://34.60.235.98:5001" python3 "${SCRIPT_DIR}/qa_agent.py" --pod; then
+  if QA_SERVER_URL="http://${SERVER_IP}:5001" python3 "${SCRIPT_DIR}/qa_agent.py" --pod; then
     echo "✓ QA passed."
   else
     echo ""
