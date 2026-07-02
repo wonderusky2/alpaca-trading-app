@@ -1458,13 +1458,34 @@ def refresh_dynamic_universe(alpaca_client=None) -> list[str]:
 
     entries = dict(state.get("symbols") or {})
     static = {s.upper() for s in ALL_SYMBOLS}
+    # 5-letter tickers ending in these are warrants/rights/units/when-issued/
+    # bankruptcy classes — the junk that dominates the raw gainers list.
+    _JUNK_5TH = ("W", "R", "U", "V", "Q")
+
+    def _eligible(sym: str) -> bool:
+        return (bool(sym) and sym.isalpha() and len(sym) <= 5
+                and not (len(sym) == 5 and sym.endswith(_JUNK_5TH))
+                and sym not in static and sym not in _BLOCKED_SYMBOLS
+                and sym not in learned_blocked)
+
+    candidates = [m for m in movers if _eligible(str(m.get("symbol") or "").upper())]
+    # Most-actives rows arrive without price/change — enrich via snapshots,
+    # then require a real move on real price for everything.
+    need = sorted({str(m["symbol"]).upper() for m in candidates})[:50]
+    snaps = {}
+    if need:
+        try:
+            snaps = alpaca_client.get_snapshots(need)
+        except Exception as e:
+            log.warning("Dynamic universe snapshot enrich failed: %s", e)
+
     added = []
-    for m in movers:
-        sym = str(m.get("symbol") or "").upper()
-        price = float(m.get("price") or 0)
-        if (not sym or not sym.isalpha() or len(sym) > 5
-                or sym in static or sym in _BLOCKED_SYMBOLS or sym in learned_blocked
-                or price < DYNAMIC_MIN_PRICE):
+    for m in candidates:
+        sym = str(m["symbol"]).upper()
+        snap = snaps.get(sym) or {}
+        price = float(snap.get("price") or m.get("price") or 0)
+        change = float(snap.get("change_pct") or m.get("percent_change") or 0)
+        if price < DYNAMIC_MIN_PRICE or change < 3.0:
             continue
         if sym not in entries:
             added.append(sym)

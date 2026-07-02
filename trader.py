@@ -1062,8 +1062,18 @@ def _record_trade_outcome(won: bool) -> int:
 
 
 def _consecutive_loss_halt() -> bool:
-    """Return True if we've hit CONSECUTIVE_LOSS_HALT losing trades in a row."""
-    count = int(_load_consec_losses().get("count") or 0)
+    """Return True if we've hit CONSECUTIVE_LOSS_HALT losing trades in a row.
+
+    The streak is SESSION-SCOPED: it resets each trading day. Without this,
+    a 3-loss day ending flat deadlocks the system permanently — the halt
+    blocks entries, no entries means no trades, and only a winning trade
+    could reset the counter.
+    """
+    data = _load_consec_losses()
+    last = _parse_trade_ts(str(data.get("last_reset") or ""))
+    if last is not None and not _is_same_trading_day(last):
+        return False   # new session — yesterday's streak doesn't carry over
+    count = int(data.get("count") or 0)
     if count >= CONSECUTIVE_LOSS_HALT:
         log.warning(
             "Consecutive-loss kill gate: %d losses in a row (limit=%d) — halting new entries.",

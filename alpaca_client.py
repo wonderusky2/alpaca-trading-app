@@ -564,17 +564,36 @@ class AlpacaClient:
             return []
         try:
             sc = ScreenerClient(config.ALPACA_API_KEY, config.ALPACA_API_SECRET)
-            resp = sc.get_market_movers(MarketMoversRequest(top=max(1, min(int(top), 50))))
-            out = []
-            for m in (getattr(resp, "gainers", None) or []):
-                sym = str(getattr(m, "symbol", "") or "").upper()
-                if not sym:
-                    continue
-                out.append({
-                    "symbol": sym,
-                    "price": float(getattr(m, "price", 0) or 0),
-                    "percent_change": float(getattr(m, "percent_change", 0) or 0),
-                })
+            out, seen = [], set()
+
+            def _add(sym, price=0.0, pct=0.0):
+                sym = str(sym or "").upper()
+                if sym and sym not in seen:
+                    seen.add(sym)
+                    out.append({"symbol": sym, "price": float(price or 0),
+                                "percent_change": float(pct or 0)})
+
+            # % gainers — dominated by warrant/penny junk, but catches real
+            # squeezes; the caller filters hard.
+            try:
+                resp = sc.get_market_movers(MarketMoversRequest(top=max(1, min(int(top), 50))))
+                for m in (getattr(resp, "gainers", None) or []):
+                    _add(getattr(m, "symbol", ""), getattr(m, "price", 0),
+                         getattr(m, "percent_change", 0))
+            except Exception as e:
+                log.debug("market movers fetch failed: %s", e)
+
+            # Most-actives by volume — surfaces real large/mid caps trading
+            # heavy paper. No price/change in this response; caller enriches
+            # via snapshots and applies the change threshold.
+            try:
+                from alpaca.data.requests import MostActivesRequest
+                act = sc.get_most_actives(MostActivesRequest(by="volume", top=max(1, min(int(top), 50))))
+                for m in (getattr(act, "most_actives", None) or []):
+                    _add(getattr(m, "symbol", ""))
+            except Exception as e:
+                log.debug("most actives fetch failed: %s", e)
+
             return out
         except Exception as e:
             log.warning("get_market_movers failed: %s", e)
