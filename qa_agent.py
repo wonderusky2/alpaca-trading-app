@@ -441,14 +441,24 @@ def chk_eod_flat():
 # ── CATEGORY: signals ─────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-@check("Signals: IEX feed guard present in signals.py", "signals")
+@check("Signals: Alpaca bars are primary; no total-limit starvation", "signals")
 def chk_iex_fix():
-    hits = _grep_file(APP_DIR / "signals.py", r"_data_feed.*!=.*iex|iex.*_data_feed")
-    assert hits, (
-        "IEX guard missing in signals.py — "
-        "Alpaca bar fetch will 403 with IEX feed"
+    # HISTORY: this check used to assert an IEX skip existed in signals.py
+    # ("Alpaca bar fetch will 403 with IEX feed"). That belief was a
+    # misdiagnosis: the real bug was passing `limit=` to a multi-symbol
+    # StockBarsRequest — Alpaca treats limit as TOTAL across symbols, so every
+    # symbol after the first alphabetically got zero bars. Verified live:
+    # without limit, free IEX serves full multi-symbol bars. The invariants
+    # now are (1) no per-request limit in get_historical_bars, and (2) the
+    # IEX skip is gone so Alpaca bars are the primary indicator source.
+    bad = _grep_file(APP_DIR / "alpaca_client.py", r"limit=limit,\s*$")
+    assert not bad, (
+        "get_historical_bars passes limit= to StockBarsRequest — Alpaca treats "
+        "it as TOTAL across symbols and starves all but the first symbol"
     )
-    return "IEX guard present"
+    skip = _grep_file(APP_DIR / "signals.py", r"_data_feed\s*!=\s*.iex.")
+    assert not skip, "stale IEX skip returned to signals.py — Alpaca bars must be primary"
+    return "Alpaca bars primary; limit-starvation absent"
 
 
 @check("Signals: live scores return valid regime", "signals")
